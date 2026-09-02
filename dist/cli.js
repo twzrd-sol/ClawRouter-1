@@ -227150,8 +227150,13 @@ function injectModelsConfig(logger48, options = {}) {
     }
   }
   const pluginEntries = config.plugins?.entries;
-  if (pluginEntries && pluginEntries.clawrouter && !pluginEntries["blockrun-clawrouter"]) {
-    pluginEntries["blockrun-clawrouter"] = pluginEntries.clawrouter;
+  const legacyPluginEntry = pluginEntries?.clawrouter;
+  if (pluginEntries && legacyPluginEntry) {
+    const newPluginEntry = pluginEntries["blockrun-clawrouter"];
+    const isInstallerDefault = newPluginEntry !== void 0 && newPluginEntry !== null && typeof newPluginEntry === "object" && !Array.isArray(newPluginEntry) && Object.keys(newPluginEntry).length === 1 && newPluginEntry.enabled === true;
+    if (!newPluginEntry || isInstallerDefault) {
+      pluginEntries["blockrun-clawrouter"] = legacyPluginEntry;
+    }
     delete pluginEntries.clawrouter;
     needsWrite = true;
     logger48.info(

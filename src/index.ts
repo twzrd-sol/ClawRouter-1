@@ -461,11 +461,28 @@ function injectModelsConfig(
   // provider, API key and endpoint) while ours silently loses its entry.
   //
   // Move it rather than delete it, so the user's enabled/disabled choice is
-  // preserved. Only when the new key is absent — never clobber a real one.
+  // preserved. The new key usually already exists by our first gateway-mode
+  // write: `openclaw plugins install` commits {enabled: true} for
+  // enabledByDefault plugins during the install transaction, and our own write
+  // is deferred to avoid the baseHash rollback. That installer-written shape is
+  // not a user choice — overwrite it with the legacy entry so a pre-rename
+  // opt-out wins and the stale legacy key stops disabling the BUNDLED router.
+  // Any other value under the new key is post-rename user state: keep it.
   const pluginEntries = (config.plugins as Record<string, unknown> | undefined)?.entries as
     Record<string, unknown> | undefined;
-  if (pluginEntries && pluginEntries.clawrouter && !pluginEntries["blockrun-clawrouter"]) {
-    pluginEntries["blockrun-clawrouter"] = pluginEntries.clawrouter;
+  const legacyPluginEntry = pluginEntries?.clawrouter;
+  if (pluginEntries && legacyPluginEntry) {
+    const newPluginEntry = pluginEntries["blockrun-clawrouter"];
+    const isInstallerDefault =
+      newPluginEntry !== undefined &&
+      newPluginEntry !== null &&
+      typeof newPluginEntry === "object" &&
+      !Array.isArray(newPluginEntry) &&
+      Object.keys(newPluginEntry).length === 1 &&
+      (newPluginEntry as { enabled?: unknown }).enabled === true;
+    if (!newPluginEntry || isInstallerDefault) {
+      pluginEntries["blockrun-clawrouter"] = legacyPluginEntry;
+    }
     delete pluginEntries.clawrouter;
     needsWrite = true;
     logger.info(

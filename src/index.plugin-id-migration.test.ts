@@ -64,4 +64,55 @@ describe("plugin id migration", () => {
     expect(out.plugins.entries["blockrun-clawrouter"]).toBeUndefined();
     expect(out.plugins.entries.other).toEqual({ enabled: true });
   });
+
+  // Real installer path (OpenClaw 2026.8.x): `openclaw plugins install` commits
+  // {enabled:true} for enabledByDefault plugins BEFORE our first gateway-mode
+  // write, so both keys coexist when the gateway first boots. The legacy key
+  // must still be retired — it re-targets the user's pre-rename choice at
+  // OpenClaw's BUNDLED router, which they never configured.
+  it("retires the legacy key when the installer already wrote {enabled:true}", async () => {
+    const out = await run({
+      plugins: {
+        entries: { clawrouter: { enabled: true }, "blockrun-clawrouter": { enabled: true } },
+      },
+    });
+    expect(out.plugins.entries.clawrouter).toBeUndefined();
+    expect(out.plugins.entries["blockrun-clawrouter"]).toEqual({ enabled: true });
+  });
+
+  it("restores a pre-rename opt-out over the installer's {enabled:true} default", async () => {
+    const out = await run({
+      plugins: {
+        entries: { clawrouter: { enabled: false }, "blockrun-clawrouter": { enabled: true } },
+      },
+    });
+    expect(out.plugins.entries.clawrouter).toBeUndefined();
+    expect(out.plugins.entries["blockrun-clawrouter"]).toEqual({ enabled: false });
+  });
+
+  it("keeps a post-rename user choice and only drops the legacy key", async () => {
+    const out = await run({
+      plugins: {
+        entries: { clawrouter: { enabled: true }, "blockrun-clawrouter": { enabled: false } },
+      },
+    });
+    expect(out.plugins.entries.clawrouter).toBeUndefined();
+    expect(out.plugins.entries["blockrun-clawrouter"]).toEqual({ enabled: false });
+  });
+
+  it("keeps a customized new entry (extra fields) and drops the legacy key", async () => {
+    const out = await run({
+      plugins: {
+        entries: {
+          clawrouter: { enabled: false },
+          "blockrun-clawrouter": { enabled: true, note: "user-tuned" } as PluginEntry,
+        },
+      },
+    });
+    expect(out.plugins.entries.clawrouter).toBeUndefined();
+    expect(out.plugins.entries["blockrun-clawrouter"]).toEqual({
+      enabled: true,
+      note: "user-tuned",
+    });
+  });
 });

@@ -2599,3 +2599,34 @@ export { ResponseCache } from "./response-cache.js";
 export type { CachedLLMResponse, ResponseCacheConfig } from "./response-cache.js";
 export { PARTNER_SERVICES, getPartnerService, buildPartnerTools } from "./partners/index.js";
 export type { PartnerServiceDefinition, PartnerToolDefinition } from "./partners/index.js";
+export {
+  A2A_X402_EXTENSION_URI,
+  A2A_PAYMENT_METADATA,
+  A2APaymentError,
+  A2AX402Client,
+  A2AX402Merchant,
+  createPaymentRequiredTask,
+  createPaymentSubmissionMessage,
+  getA2AExtensionDeclaration,
+  hasA2AExtension,
+  echoA2AExtension,
+  createHmacA2ASigner,
+  createHmacA2AVerifier,
+} from "./a2a-x402.js";
+export type {
+  A2APaymentStatus,
+  A2ATaskState,
+  A2AErrorCode,
+  A2APaymentRequirement,
+  A2APaymentRequiredResponse,
+  A2APaymentPayload,
+  A2ASignedPayment,
+  A2AMessage,
+  A2ATask,
+  A2AReceipt,
+  A2ASigningIntent,
+  A2ASigner,
+  A2AVerificationContext,
+  A2AVerifier,
+  A2ASettlement,
+} from "./a2a-x402.js";

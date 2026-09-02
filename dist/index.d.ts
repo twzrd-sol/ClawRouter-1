@@ -1601,6 +1601,157 @@ type PartnerToolDefinition = {
 declare function buildPartnerTools(proxyBaseUrl: string): PartnerToolDefinition[];
 
 /**
+ * A2A x402 compatibility primitives.
+ *
+ * This is deliberately transport- and chain-agnostic. It maps the A2A
+ * payment-required/payment-submitted/receipt lifecycle onto ClawRouter's
+ * existing policy-before-sign path. A real wallet/facilitator is injected by
+ * the caller; the HMAC helpers are only for hermetic integration tests and
+ * release-gate smoke runs.
+ */
+
+declare const A2A_X402_EXTENSION_URI = "https://github.com/google-a2a/a2a-x402/v0.1";
+declare const A2A_PAYMENT_METADATA: {
+    readonly status: "x402.payment.status";
+    readonly required: "x402.payment.required";
+    readonly payload: "x402.payment.payload";
+    readonly receipts: "x402.payment.receipts";
+    readonly error: "x402.payment.error";
+};
+type A2APaymentStatus = "payment-required" | "payment-submitted" | "payment-verified" | "payment-rejected" | "payment-completed" | "payment-failed";
+type A2ATaskState = "input-required" | "working" | "completed" | "failed";
+type A2AErrorCode = "TASK_NOT_FOUND" | "TASK_ID_MISMATCH" | "PAYMENT_REQUIRED" | "PAYMENT_REQUIREMENT_MISMATCH" | "DUPLICATE_NONCE" | "EXPIRED_PAYMENT" | "INVALID_SIGNATURE" | "NETWORK_MISMATCH" | "INVALID_AMOUNT" | "SETTLEMENT_FAILED";
+type A2APaymentRequirement = {
+    scheme: string;
+    network: string;
+    asset: string;
+    payTo: string;
+    amount?: string;
+    maxAmountRequired?: string;
+    resource?: string;
+    maxTimeoutSeconds?: number;
+    extra?: Record<string, unknown>;
+};
+type A2APaymentRequiredResponse = {
+    x402Version: number;
+    accepts: A2APaymentRequirement[];
+};
+type A2APaymentPayload = {
+    x402Version: number;
+    scheme: string;
+    network: string;
+    payload: Record<string, unknown>;
+};
+type A2ASignedPayment = {
+    taskId: string;
+    nonce: string;
+    requirementHash: string;
+    validBefore: number;
+    payment: A2APaymentPayload;
+    signature: string;
+};
+type A2AMessage = {
+    taskId?: string;
+    role: "agent" | "user";
+    parts: Array<{
+        kind: "text";
+        text: string;
+    }>;
+    metadata: Record<string, unknown>;
+};
+type A2ATask = {
+    id: string;
+    createdAt: number;
+    status: {
+        state: A2ATaskState;
+        message?: A2AMessage;
+    };
+    artifacts?: Array<Record<string, unknown>>;
+};
+type A2AReceipt = {
+    success: boolean;
+    network: string;
+    transaction?: string;
+    payer?: string;
+    errorReason?: string;
+};
+declare class A2APaymentError extends Error {
+    readonly code: A2AErrorCode;
+    constructor(code: A2AErrorCode, message: string);
+}
+type A2ASigningIntent = {
+    taskId: string;
+    nonce: string;
+    requirementHash: string;
+    validBefore: number;
+    x402Version: number;
+    requirement: A2APaymentRequirement;
+};
+type A2ASigner = (intent: A2ASigningIntent) => Promise<Pick<A2ASignedPayment, "payment" | "signature">>;
+type A2AVerificationContext = {
+    authorization: A2ASignedPayment;
+    requirement: A2APaymentRequirement;
+};
+type A2AVerifier = (context: A2AVerificationContext) => Promise<boolean>;
+type A2ASettlement = (context: A2AVerificationContext) => Promise<A2AReceipt>;
+/** Build an A2A `input-required` task containing x402 payment requirements. */
+declare function createPaymentRequiredTask(taskId: string, response: A2APaymentRequiredResponse, now?: number): A2ATask;
+/** Create the correlated A2A message carrying a signed payment payload. */
+declare function createPaymentSubmissionMessage(taskId: string, payment: A2ASignedPayment): A2AMessage;
+/** AgentCard declaration for the extension. */
+declare function getA2AExtensionDeclaration(required?: boolean): {
+    uri: string;
+    description: string;
+    required: boolean;
+};
+/** Request/response activation helpers required by the A2A extension. */
+declare function hasA2AExtension(headers: Record<string, string | undefined>): boolean;
+declare function echoA2AExtension(headers: Record<string, string>): Record<string, string>;
+/**
+ * Client-side policy gate. The signer is not called until SpendControl allows
+ * the exact A2A counterparty and quoted amount. Signed payments settle the
+ * existing reservation just like the HTTP x402 hook; signer failures release
+ * it without consuming budget.
+ */
+declare class A2AX402Client {
+    private readonly spendControl;
+    private readonly signer;
+    private readonly now;
+    private readonly nextNonce;
+    constructor(options: {
+        signer: A2ASigner;
+        spendControl?: SpendControl;
+        now?: () => number;
+        nonce?: () => string;
+    });
+    createPaymentSubmission(task: A2ATask, optionIndex?: number): Promise<A2AMessage>;
+}
+/**
+ * Minimal merchant-side state machine. It keeps the original requirements by
+ * taskId (the A2A spec's correlation invariant), verifies the signed payload,
+ * rejects expiry/replay/binding failures, and appends every receipt.
+ */
+declare class A2AX402Merchant {
+    private readonly tasks;
+    private readonly verifier;
+    private readonly settle;
+    private readonly now;
+    constructor(options: {
+        verifier: A2AVerifier;
+        settle?: A2ASettlement;
+        now?: () => number;
+    });
+    createTask(taskId: string, response: A2APaymentRequiredResponse): A2ATask;
+    receivePayment(message: A2AMessage): Promise<A2ATask>;
+    private fail;
+    private resultMessage;
+}
+/** Hermetic signer for tests/release gates; not a wallet or production signer. */
+declare function createHmacA2ASigner(secret: string): A2ASigner;
+/** Hermetic verifier paired with `createHmacA2ASigner`. */
+declare function createHmacA2AVerifier(secret: string): A2AVerifier;
+
+/**
  * @blockrun/clawrouter
  *
  * Smart LLM router for OpenClaw — 55+ models, x402 micropayments, 78% cost savings.
@@ -1731,4 +1882,4 @@ declare function parseCallArgs(raw: string): {
 declare function buildImageGenerationProvider(): ImageGenerationProviderPlugin;
 declare const plugin: OpenClawPluginDefinition;
 
-export { type AggregatedStats, BALANCE_THRESHOLDS, BLOCKRUN_MODELS, type BalanceInfo, BalanceMonitor, CAIP2_BASE, CAIP2_SOLANA_MAINNET, type CachedLLMResponse, type CachedResponse, type CheckResult, type CounterpartyInfo, DEFAULT_RETRY_CONFIG, DEFAULT_SESSION_CONFIG, type DailyStats, type DerivedKeys, EmptyWalletError, FileSpendControlStorage, InMemorySpendControlStorage, InsufficientFundsError, type InsufficientFundsInfo, type LowBalanceInfo, MODEL_ALIASES, MalformedSpendPolicyError, OPENCLAW_MODELS, PARTNER_SERVICES, type PartnerServiceDefinition, type PartnerToolDefinition, type PaymentChain, type PolicyList, type ProxyHandle, type ProxyOptions, RequestDeduplicator, ResponseCache, type ResponseCacheConfig, type RetryConfig, RpcError, type SessionConfig, type SessionEntry, SessionStore, type SolanaBalanceInfo, SolanaBalanceMonitor, SpendControl, type SpendControlOptions, type SpendControlStorage, type SpendLimits, SpendPolicyError, type SpendRecord, type SpendWindow, type SpendingStatus, type SufficiencyResult, type UsageEntry, VISIBLE_OPENCLAW_MODELS, type WalletConfig, type WalletResolution, blockrunProvider, buildImageGenerationProvider, buildPartnerTools, buildProviderModels, clearStats, plugin as default, deriveAllKeys, deriveEvmKey, deriveSolanaKeyBytes, fetchWithRetry, formatDuration, formatStatsAscii, generateWalletMnemonic, getAgenticModels, getModelContextWindow, getPartnerService, getProxyPort, getSessionId, getStats, hashRequestContent, injectAuthProfile, injectModelsConfig, isAgenticModel, isBalanceError, isBlockrunWebSearchDisabled, isEmptyWalletError, isInsufficientFundsError, isRetryable, isRpcError, isValidMnemonic, loadPaymentChain, logUsage, parseCallArgs, registerSpendPolicyHook, resolveModelAlias, resolvePaymentChain, savePaymentChain, setupSolana, startProxy, syncAgentModelCache };
+export { type A2AErrorCode, type A2AMessage, A2APaymentError, type A2APaymentPayload, type A2APaymentRequiredResponse, type A2APaymentRequirement, type A2APaymentStatus, type A2AReceipt, type A2ASettlement, type A2ASignedPayment, type A2ASigner, type A2ASigningIntent, type A2ATask, type A2ATaskState, type A2AVerificationContext, type A2AVerifier, A2AX402Client, A2AX402Merchant, A2A_PAYMENT_METADATA, A2A_X402_EXTENSION_URI, type AggregatedStats, BALANCE_THRESHOLDS, BLOCKRUN_MODELS, type BalanceInfo, BalanceMonitor, CAIP2_BASE, CAIP2_SOLANA_MAINNET, type CachedLLMResponse, type CachedResponse, type CheckResult, type CounterpartyInfo, DEFAULT_RETRY_CONFIG, DEFAULT_SESSION_CONFIG, type DailyStats, type DerivedKeys, EmptyWalletError, FileSpendControlStorage, InMemorySpendControlStorage, InsufficientFundsError, type InsufficientFundsInfo, type LowBalanceInfo, MODEL_ALIASES, MalformedSpendPolicyError, OPENCLAW_MODELS, PARTNER_SERVICES, type PartnerServiceDefinition, type PartnerToolDefinition, type PaymentChain, type PolicyList, type ProxyHandle, type ProxyOptions, RequestDeduplicator, ResponseCache, type ResponseCacheConfig, type RetryConfig, RpcError, type SessionConfig, type SessionEntry, SessionStore, type SolanaBalanceInfo, SolanaBalanceMonitor, SpendControl, type SpendControlOptions, type SpendControlStorage, type SpendLimits, SpendPolicyError, type SpendRecord, type SpendWindow, type SpendingStatus, type SufficiencyResult, type UsageEntry, VISIBLE_OPENCLAW_MODELS, type WalletConfig, type WalletResolution, blockrunProvider, buildImageGenerationProvider, buildPartnerTools, buildProviderModels, clearStats, createHmacA2ASigner, createHmacA2AVerifier, createPaymentRequiredTask, createPaymentSubmissionMessage, plugin as default, deriveAllKeys, deriveEvmKey, deriveSolanaKeyBytes, echoA2AExtension, fetchWithRetry, formatDuration, formatStatsAscii, generateWalletMnemonic, getA2AExtensionDeclaration, getAgenticModels, getModelContextWindow, getPartnerService, getProxyPort, getSessionId, getStats, hasA2AExtension, hashRequestContent, injectAuthProfile, injectModelsConfig, isAgenticModel, isBalanceError, isBlockrunWebSearchDisabled, isEmptyWalletError, isInsufficientFundsError, isRetryable, isRpcError, isValidMnemonic, loadPaymentChain, logUsage, parseCallArgs, registerSpendPolicyHook, resolveModelAlias, resolvePaymentChain, savePaymentChain, setupSolana, startProxy, syncAgentModelCache };

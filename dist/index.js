@@ -55492,7 +55492,7 @@ var require_websocket = __commonJS({
     var http5 = __require("http");
     var net3 = __require("net");
     var tls2 = __require("tls");
-    var { randomBytes: randomBytes9, createHash: createHash4 } = __require("crypto");
+    var { randomBytes: randomBytes9, createHash: createHash5 } = __require("crypto");
     var { Duplex, Readable: Readable2 } = __require("stream");
     var { URL: URL3 } = __require("url");
     var PerMessageDeflate2 = require_permessage_deflate();
@@ -56160,7 +56160,7 @@ var require_websocket = __commonJS({
           abortHandshake(websocket, socket, "Invalid Upgrade header");
           return;
         }
-        const digest = createHash4("sha1").update(key2 + GUID).digest("base64");
+        const digest = createHash5("sha1").update(key2 + GUID).digest("base64");
         if (res.headers["sec-websocket-accept"] !== digest) {
           abortHandshake(websocket, socket, "Invalid Sec-WebSocket-Accept header");
           return;
@@ -56529,7 +56529,7 @@ var require_websocket_server = __commonJS({
     var EventEmitter2 = __require("events");
     var http5 = __require("http");
     var { Duplex } = __require("stream");
-    var { createHash: createHash4 } = __require("crypto");
+    var { createHash: createHash5 } = __require("crypto");
     var extension2 = require_extension();
     var PerMessageDeflate2 = require_permessage_deflate();
     var subprotocol2 = require_subprotocol();
@@ -56836,7 +56836,7 @@ var require_websocket_server = __commonJS({
           );
         }
         if (this._state > RUNNING) return abortHandshake(socket, 503);
-        const digest = createHash4("sha1").update(key2 + GUID).digest("base64");
+        const digest = createHash5("sha1").update(key2 + GUID).digest("base64");
         const headers = [
           "HTTP/1.1 101 Switching Protocols",
           "Upgrade: websocket",
@@ -129594,11 +129594,11 @@ var require_Json = __commonJS({
   "node_modules/ox/_cjs/core/Json.js"(exports) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
-    exports.canonicalize = canonicalize3;
+    exports.canonicalize = canonicalize4;
     exports.parse = parse2;
     exports.stringify = stringify4;
     var bigIntSuffix2 = "#__bigint";
-    function canonicalize3(value) {
+    function canonicalize4(value) {
       if (value === null || typeof value === "boolean" || typeof value === "string")
         return JSON.stringify(value);
       if (typeof value === "number") {
@@ -129609,12 +129609,12 @@ var require_Json = __commonJS({
       if (typeof value === "bigint")
         throw new TypeError("Cannot canonicalize bigint");
       if (Array.isArray(value))
-        return `[${value.map((item) => canonicalize3(item)).join(",")}]`;
+        return `[${value.map((item) => canonicalize4(item)).join(",")}]`;
       if (typeof value === "object") {
         const entries = Object.keys(value).sort().reduce((acc, key2) => {
           const v = value[key2];
           if (v !== void 0)
-            acc.push(`${JSON.stringify(key2)}:${canonicalize3(v)}`);
+            acc.push(`${JSON.stringify(key2)}:${canonicalize4(v)}`);
           return acc;
         }, []);
         return `{${entries.join(",")}}`;
@@ -226649,6 +226649,336 @@ var init_retry = __esm({
   }
 });
 
+// src/a2a-x402.ts
+import { createHash as createHash4, createHmac, timingSafeEqual } from "crypto";
+function canonicalize3(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalize3).join(",")}]`;
+  const entries = Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key2, entry]) => `${JSON.stringify(key2)}:${canonicalize3(entry)}`);
+  return `{${entries.join(",")}}`;
+}
+function requirementHash(requirement) {
+  return createHash4("sha256").update(canonicalize3(requirement)).digest("hex");
+}
+function signingBytes(intent, payment) {
+  return canonicalize3({
+    taskId: intent.taskId,
+    nonce: intent.nonce,
+    requirementHash: intent.requirementHash,
+    validBefore: intent.validBefore,
+    x402Version: intent.x402Version,
+    payment
+  });
+}
+function amountQuote(requirement) {
+  return {
+    payTo: requirement.payTo,
+    network: requirement.network,
+    asset: requirement.asset,
+    amount: requirement.amount,
+    maxAmountRequired: requirement.maxAmountRequired
+  };
+}
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function paymentClaimsMatchRequirement(payment, requirement) {
+  const claims = payment.payload;
+  if (!isRecord2(claims)) return false;
+  const amount = requirement.amount ?? requirement.maxAmountRequired;
+  if (claims.payTo !== void 0 && claims.payTo !== requirement.payTo) return false;
+  if (claims.asset !== void 0 && claims.asset !== requirement.asset) return false;
+  if (amount !== void 0 && claims.amount !== void 0 && claims.amount !== amount) return false;
+  if (claims.requirementHash !== void 0 && (typeof claims.requirementHash !== "string" || claims.requirementHash !== requirementHash(requirement))) return false;
+  return true;
+}
+function requiredMessage(response) {
+  return {
+    role: "agent",
+    parts: [{ kind: "text", text: "Payment is required for this service." }],
+    metadata: {
+      [A2A_PAYMENT_METADATA.status]: "payment-required",
+      [A2A_PAYMENT_METADATA.required]: response
+    }
+  };
+}
+function createPaymentRequiredTask(taskId, response, now2 = Date.now()) {
+  if (!taskId) throw new Error("A2A taskId is required");
+  if (!Number.isInteger(response.x402Version) || response.accepts.length === 0) {
+    throw new Error("A2A payment requirements must include at least one payment option");
+  }
+  for (const requirement of response.accepts) {
+    if (!requirement.scheme || !requirement.network || !requirement.asset || !requirement.payTo) {
+      throw new Error("A2A payment requirements must include scheme, network, asset, and payTo");
+    }
+    if (requirement.maxTimeoutSeconds !== void 0 && (!Number.isFinite(requirement.maxTimeoutSeconds) || requirement.maxTimeoutSeconds <= 0)) {
+      throw new Error("A2A payment requirement timeout must be positive");
+    }
+  }
+  return {
+    id: taskId,
+    createdAt: now2,
+    status: { state: "input-required", message: requiredMessage(response) }
+  };
+}
+function createPaymentSubmissionMessage(taskId, payment) {
+  if (payment.taskId !== taskId) {
+    throw new A2APaymentError("TASK_ID_MISMATCH", "Payment taskId does not match the submission task");
+  }
+  return {
+    taskId,
+    role: "user",
+    parts: [{ kind: "text", text: "Payment authorization provided." }],
+    metadata: {
+      [A2A_PAYMENT_METADATA.status]: "payment-submitted",
+      [A2A_PAYMENT_METADATA.payload]: payment
+    }
+  };
+}
+function getA2AExtensionDeclaration(required = true) {
+  return {
+    uri: A2A_X402_EXTENSION_URI,
+    description: "Supports x402 payments for agent-to-agent services.",
+    required
+  };
+}
+function hasA2AExtension(headers) {
+  return (headers["X-A2A-Extensions"] ?? headers["x-a2a-extensions"] ?? "").split(",").map((value) => value.trim()).includes(A2A_X402_EXTENSION_URI);
+}
+function echoA2AExtension(headers) {
+  return { ...headers, "X-A2A-Extensions": A2A_X402_EXTENSION_URI };
+}
+function cryptoRandom() {
+  return createHash4("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 16);
+}
+function createHmacA2ASigner(secret) {
+  return async (intent) => {
+    const amount = intent.requirement.amount ?? intent.requirement.maxAmountRequired;
+    const payment = {
+      x402Version: intent.x402Version,
+      scheme: intent.requirement.scheme,
+      network: intent.requirement.network,
+      payload: {
+        taskId: intent.taskId,
+        nonce: intent.nonce,
+        requirementHash: intent.requirementHash,
+        payTo: intent.requirement.payTo,
+        asset: intent.requirement.asset,
+        ...amount !== void 0 ? { amount } : {}
+      }
+    };
+    const signature3 = createHmac("sha256", secret).update(signingBytes(intent, payment)).digest("hex");
+    return { payment, signature: signature3 };
+  };
+}
+function createHmacA2AVerifier(secret) {
+  return async ({ authorization, requirement }) => {
+    const intent = {
+      taskId: authorization.taskId,
+      nonce: authorization.nonce,
+      requirementHash: authorization.requirementHash,
+      validBefore: authorization.validBefore,
+      x402Version: authorization.payment.x402Version,
+      requirement
+    };
+    const expected = createHmac("sha256", secret).update(signingBytes(intent, authorization.payment)).digest("hex");
+    const actual = Buffer.from(authorization.signature, "utf8");
+    const wanted = Buffer.from(expected, "utf8");
+    return actual.length === wanted.length && timingSafeEqual(actual, wanted);
+  };
+}
+var A2A_X402_EXTENSION_URI, A2A_PAYMENT_METADATA, A2APaymentError, A2AX402Client, A2AX402Merchant;
+var init_a2a_x402 = __esm({
+  "src/a2a-x402.ts"() {
+    "use strict";
+    init_spend_control();
+    A2A_X402_EXTENSION_URI = "https://github.com/google-a2a/a2a-x402/v0.1";
+    A2A_PAYMENT_METADATA = {
+      status: "x402.payment.status",
+      required: "x402.payment.required",
+      payload: "x402.payment.payload",
+      receipts: "x402.payment.receipts",
+      error: "x402.payment.error"
+    };
+    A2APaymentError = class extends Error {
+      code;
+      constructor(code, message) {
+        super(message);
+        this.name = "A2APaymentError";
+        this.code = code;
+      }
+    };
+    A2AX402Client = class {
+      spendControl;
+      signer;
+      now;
+      nextNonce;
+      constructor(options) {
+        this.signer = options.signer;
+        this.spendControl = options.spendControl ?? new SpendControl();
+        this.now = options.now ?? (() => Date.now());
+        this.nextNonce = options.nonce ?? (() => `${this.now()}-${cryptoRandom()}`);
+      }
+      async createPaymentSubmission(task, optionIndex = 0) {
+        const message = task.status.message;
+        const response = message?.metadata[A2A_PAYMENT_METADATA.required];
+        if (!response || !Array.isArray(response.accepts)) {
+          throw new A2APaymentError("PAYMENT_REQUIRED", "Task does not contain A2A payment requirements");
+        }
+        if (task.status.state !== "input-required") {
+          throw new A2APaymentError("PAYMENT_REQUIRED", `Task ${task.id} is not awaiting payment`);
+        }
+        const requirement = response.accepts[optionIndex];
+        if (!requirement) throw new A2APaymentError("PAYMENT_REQUIRED", "Requested payment option does not exist");
+        const validBefore = task.createdAt + (requirement.maxTimeoutSeconds ?? 600) * 1e3;
+        if (this.now() >= validBefore) {
+          throw new A2APaymentError("EXPIRED_PAYMENT", "A2A payment requirements have expired");
+        }
+        const intent = {
+          taskId: task.id,
+          nonce: this.nextNonce(),
+          requirementHash: requirementHash(requirement),
+          validBefore,
+          x402Version: response.x402Version,
+          requirement
+        };
+        const reservation = assertSpendPolicyAllows(this.spendControl, amountQuote(requirement));
+        try {
+          const signed2 = await this.signer(intent);
+          if (typeof signed2.signature !== "string" || !signed2.signature || !signed2.payment || signed2.payment.network !== requirement.network) {
+            throw new A2APaymentError("NETWORK_MISMATCH", "Signer returned a payment bound to the wrong network");
+          }
+          if (reservation !== void 0) {
+            this.spendControl.settleReservation(reservation, { action: "a2a x402 payment" });
+          }
+          return createPaymentSubmissionMessage(task.id, {
+            ...signed2,
+            taskId: task.id,
+            nonce: intent.nonce,
+            requirementHash: intent.requirementHash,
+            validBefore
+          });
+        } catch (error) {
+          if (reservation !== void 0) this.spendControl.releaseReservation(reservation);
+          throw error;
+        }
+      }
+    };
+    A2AX402Merchant = class {
+      tasks = /* @__PURE__ */ new Map();
+      verifier;
+      settle;
+      now;
+      constructor(options) {
+        this.verifier = options.verifier;
+        this.settle = options.settle ?? (async ({ requirement, authorization }) => ({
+          success: true,
+          network: requirement.network,
+          transaction: `a2a-memory-${authorization.nonce}`
+        }));
+        this.now = options.now ?? (() => Date.now());
+      }
+      createTask(taskId, response) {
+        const task = createPaymentRequiredTask(taskId, response, this.now());
+        this.tasks.set(taskId, {
+          task,
+          requirements: [...response.accepts],
+          x402Version: response.x402Version,
+          usedNonces: /* @__PURE__ */ new Set(),
+          receipts: []
+        });
+        return task;
+      }
+      async receivePayment(message) {
+        if (!message.taskId) throw new A2APaymentError("TASK_ID_MISMATCH", "Payment submission must include taskId");
+        const record = this.tasks.get(message.taskId);
+        if (!record) throw new A2APaymentError("TASK_NOT_FOUND", `Unknown A2A task ${message.taskId}`);
+        if (message.metadata[A2A_PAYMENT_METADATA.status] !== "payment-submitted") {
+          return this.fail(record, "PAYMENT_REQUIRED", "Payment submission has an invalid A2A payment status");
+        }
+        const authorization = message.metadata[A2A_PAYMENT_METADATA.payload];
+        if (!authorization || typeof authorization !== "object" || authorization.taskId !== message.taskId || typeof authorization.nonce !== "string" || typeof authorization.signature !== "string" || !authorization.payment || !isRecord2(authorization.payment.payload)) {
+          return this.fail(record, "TASK_ID_MISMATCH", "Payment payload taskId does not match the task");
+        }
+        const requirement = record.requirements.find((candidate) => requirementHash(candidate) === authorization.requirementHash);
+        if (!requirement) {
+          return this.fail(record, "PAYMENT_REQUIREMENT_MISMATCH", "Payment is not bound to the task requirements");
+        }
+        if (this.now() >= authorization.validBefore) {
+          return this.fail(record, "EXPIRED_PAYMENT", "Payment authorization expired before submission", requirement.network);
+        }
+        const expectedValidBefore = record.task.createdAt + (requirement.maxTimeoutSeconds ?? 600) * 1e3;
+        if (authorization.validBefore !== expectedValidBefore) {
+          return this.fail(record, "PAYMENT_REQUIREMENT_MISMATCH", "Payment expiry is not bound to the task requirements", requirement.network);
+        }
+        if (authorization.payment.x402Version !== record.x402Version || authorization.payment.scheme !== requirement.scheme) {
+          return this.fail(record, "PAYMENT_REQUIREMENT_MISMATCH", "Payment version or scheme does not match the task requirements", requirement.network);
+        }
+        if (authorization.payment.network !== requirement.network) {
+          return this.fail(record, "NETWORK_MISMATCH", "Payment network does not match the task requirements", requirement.network);
+        }
+        if (!paymentClaimsMatchRequirement(authorization.payment, requirement)) {
+          return this.fail(record, "PAYMENT_REQUIREMENT_MISMATCH", "Payment claims do not match the task requirements", requirement.network);
+        }
+        if (record.usedNonces.has(authorization.nonce)) {
+          return this.fail(record, "DUPLICATE_NONCE", "Payment nonce has already been used", requirement.network);
+        }
+        const valid = await this.verifier({ authorization, requirement });
+        if (!valid) return this.fail(record, "INVALID_SIGNATURE", "Payment signature failed verification", requirement.network);
+        record.usedNonces.add(authorization.nonce);
+        record.task.status = { state: "working" };
+        let receipt;
+        try {
+          receipt = await this.settle({ authorization, requirement });
+        } catch (error) {
+          receipt = {
+            success: false,
+            network: requirement.network,
+            errorReason: error instanceof Error ? error.message : "Settlement failed"
+          };
+        }
+        record.receipts.push(receipt);
+        if (receipt.success) {
+          record.task.status = {
+            state: "completed",
+            message: this.resultMessage("payment-completed", record.receipts)
+          };
+        } else {
+          record.task.status = {
+            state: "failed",
+            message: this.resultMessage("payment-failed", record.receipts, "SETTLEMENT_FAILED")
+          };
+        }
+        return record.task;
+      }
+      fail(record, code, reason, network) {
+        const receipt = {
+          success: false,
+          network: network ?? record.requirements[0]?.network ?? "unknown",
+          errorReason: reason
+        };
+        record.receipts.push(receipt);
+        record.task.status = {
+          state: "failed",
+          message: this.resultMessage("payment-failed", record.receipts, code)
+        };
+        return record.task;
+      }
+      resultMessage(status, receipts, error) {
+        return {
+          role: "agent",
+          parts: [{ kind: "text", text: status === "payment-completed" ? "Payment completed." : "Payment failed." }],
+          metadata: {
+            [A2A_PAYMENT_METADATA.status]: status,
+            [A2A_PAYMENT_METADATA.receipts]: [...receipts],
+            ...error ? { [A2A_PAYMENT_METADATA.error]: error } : {}
+          }
+        };
+      }
+    };
+  }
+});
+
 // src/index.ts
 import {
   writeFileSync as writeFileSync3,
@@ -227933,6 +228263,7 @@ var init_index = __esm({
     init_session();
     init_response_cache();
     init_partners();
+    init_a2a_x402();
     activeProxyHandle = null;
     pendingConfiguredStartupApi = null;
     IMAGE_DIR2 = join16(homedir13(), ".openclaw", "blockrun", "images");
@@ -228415,6 +228746,11 @@ ${errText}`
 });
 init_index();
 export {
+  A2APaymentError,
+  A2AX402Client,
+  A2AX402Merchant,
+  A2A_PAYMENT_METADATA,
+  A2A_X402_EXTENSION_URI,
   BALANCE_THRESHOLDS,
   BLOCKRUN_MODELS,
   BalanceMonitor,
@@ -228445,15 +228781,21 @@ export {
   buildProviderModels,
   calculateModelCost,
   clearStats,
+  createHmacA2ASigner,
+  createHmacA2AVerifier,
+  createPaymentRequiredTask,
+  createPaymentSubmissionMessage,
   index_default2 as default,
   deriveAllKeys,
   deriveEvmKey,
   deriveSolanaKeyBytes,
+  echoA2AExtension,
   fetchWithRetry,
   filterCandidatesByCapacity,
   formatDuration,
   formatStatsAscii,
   generateWalletMnemonic,
+  getA2AExtensionDeclaration,
   getAgenticModels,
   getFallbackChain,
   getFallbackChainFiltered,
@@ -228462,6 +228804,7 @@ export {
   getProxyPort,
   getSessionId,
   getStats,
+  hasA2AExtension,
   hashRequestContent,
   inferToolRequirement,
   injectAuthProfile,

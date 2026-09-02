@@ -15,6 +15,7 @@ npm run format           # prettier
 npm run test:resilience:quick   # error + lifecycle resilience tests
 npm run test:resilience:full    # full resilience suite (4hr stability)
 npm run test:e2e:tool-ids       # end-to-end tool ID sanitization
+npm run test:e2e:openclaw-collision  # release gate: OpenClaw plugin collision/migration (real installer, ~3 min)
 npm run test:docker:install     # Docker install test
 npm run test:docker:edge-cases  # Docker edge case tests
 npm run test:docker:integration # Docker integration tests

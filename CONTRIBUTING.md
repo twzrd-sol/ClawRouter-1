@@ -24,6 +24,7 @@ npm run format           # Format code
 ```bash
 npm test                           # Unit tests
 npm run test:resilience:quick      # Error + lifecycle tests
+npm run test:e2e:openclaw-collision  # OpenClaw plugin collision/migration gate (real openclaw CLI, isolated sandbox)
 npm run test:docker:install        # Docker install test
 npm run test:docker:edge-cases     # Edge case tests
 npm run test:docker:integration    # Integration tests

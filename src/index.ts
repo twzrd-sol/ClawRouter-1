@@ -2262,7 +2262,12 @@ const plugin: OpenClawPluginDefinition = {
     }
     api.registerCommand(createStatsCommand());
     api.registerCommand(createExcludeCommand());
-    api.registerCommand(createPolicyCommand({ liveControl: getSharedSpendControl }));
+    api.registerCommand(
+      createPolicyCommand({
+        // The singleton always exists; "live" means a proxy is actually enforcing it.
+        liveControl: () => (activeProxyHandle ? getSharedSpendControl() : undefined),
+      }),
+    );
     if (shouldLogRegistration) {
       api.logger.info(
         "Commands registered: /wallet, /blockrun, /stats, /exclude, /policy, /partners, /cr-imagegen, /videogen, /cr-call",

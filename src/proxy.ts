@@ -78,7 +78,12 @@ import type { SolanaBalanceMonitor } from "./solana-balance.js";
 /** Union type for chain-agnostic balance monitoring */
 type AnyBalanceMonitor = BalanceMonitor | SolanaBalanceMonitor;
 import { resolvePaymentChain } from "./auth.js";
-import { registerSpendPolicyHook, SpendControl, SpendPolicyError } from "./spend-control.js";
+import {
+  getSharedSpendControl,
+  registerSpendPolicyHook,
+  SpendControl,
+  SpendPolicyError,
+} from "./spend-control.js";
 import { compressContext, shouldCompress, type NormalizedMessage } from "./compression/index.js";
 // Error classes available for programmatic use but not used in proxy
 // (universal free fallback means we don't throw balance errors anymore)
@@ -2321,7 +2326,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const evmPublicClient = createPublicClient({ chain: base, transport: http() });
   const evmSigner = toClientEvmSigner(account, evmPublicClient);
   const x402 = new x402Client();
-  const spendControl = options.spendControl ?? new SpendControl();
+  const spendControl = options.spendControl ?? getSharedSpendControl();
   registerSpendPolicyHook(x402, spendControl);
   registerExactEvmScheme(x402, { signer: evmSigner });
 

@@ -2556,6 +2556,7 @@ export {
   MalformedSpendPolicyError,
   CAIP2_BASE,
   CAIP2_SOLANA_MAINNET,
+  PAYABLE_NETWORKS,
 } from "./spend-control.js";
 export type {
   SpendWindow,

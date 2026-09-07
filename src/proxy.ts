@@ -20,13 +20,18 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHmac } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 // Per-request payment tracking via AsyncLocalStorage (safe for concurrent requests).
 // The x402 onAfterPaymentCreation hook writes the actual payment amount into the
 // request-scoped store, and the logging code reads it after payFetch completes.
-const paymentStore = new AsyncLocalStorage<{ amountUsd: number }>();
-import { finished } from "node:stream";
+// `amountUsd` is what an x402 payment actually signed for; `estimatedUsd` is
+// what THIS attempt is expected to cost, published for the API-key rail's
+// spend-window check, which has no 402 quote to read (#329).
+const paymentStore = new AsyncLocalStorage<{ amountUsd: number; estimatedUsd?: number }>();
+import { finished, Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -43,43 +48,67 @@ import { toClientEvmSigner } from "@x402/evm";
 import {
   route,
   getFallbackChain,
-  getFallbackChainFiltered,
+  filterCandidatesByCapacity,
   filterByToolCalling,
   filterByVision,
   filterByExcludeList,
   calculateModelCost,
   DEFAULT_ROUTING_CONFIG,
+  inferToolRequirement,
   type RouterOptions,
   type RoutingDecision,
   type RoutingConfig,
   type ModelPricing,
+  type ModelCapabilities,
   type Tier,
 } from "./router/index.js";
-import { classifyByRules } from "./router/rules.js";
+import { classifyByRules } from "./router/index.js";
 import {
   BLOCKRUN_MODELS,
+  MODEL_ALIASES,
   OPENCLAW_MODELS,
   resolveModelAlias,
-  getModelContextWindow,
   isReasoningModel,
   supportsToolCalling,
   supportsVision,
   getActivePromoPrice,
 } from "./models.js";
+import { DEFAULT_MAX_TOKENS, resolveMaxTokens } from "./max-tokens.js";
 import { logUsage, type UsageEntry } from "./logger.js";
-import { getStats, clearStats } from "./stats.js";
+import { getStats, clearStats, resolveStatsDays } from "./stats.js";
 import { RequestDeduplicator } from "./dedup.js";
 import { ResponseCache, type ResponseCacheConfig } from "./response-cache.js";
-import { BalanceMonitor } from "./balance.js";
+import { BalanceMonitor, ApiKeyBalanceMonitor } from "./balance.js";
 import type { SolanaBalanceMonitor } from "./solana-balance.js";
 
-/** Union type for chain-agnostic balance monitoring */
-type AnyBalanceMonitor = BalanceMonitor | SolanaBalanceMonitor;
+/** Union type for chain- and auth-agnostic balance monitoring */
+type AnyBalanceMonitor = BalanceMonitor | SolanaBalanceMonitor | ApiKeyBalanceMonitor;
 import { resolvePaymentChain } from "./auth.js";
+import {
+  BLOCKRUN_API_KEY_API,
+  PORTAL_CREDITS_URL,
+  createApiKeyFetch,
+  normalizeApiKeyBase,
+  pollApiKeyJob,
+  fetchCreditBalance,
+  formatCreditBalance,
+  isValidApiKey,
+  maskApiKey,
+} from "./api-key.js";
+import {
+  getSharedSpendControl,
+  registerSpendPolicyHook,
+  withSpendPolicy,
+  POLICY_LISTS,
+  SpendControl,
+  SpendPolicyError,
+} from "./spend-control.js";
+import { maybeComposeTwzrdAutoGate } from "./twzrd-autogate.js";
 import { compressContext, shouldCompress, type NormalizedMessage } from "./compression/index.js";
-// Error classes available for programmatic use but not used in proxy
-// (universal free fallback means we don't throw balance errors anymore)
+// Balance error classes are available for programmatic use but not used in the
+// proxy (universal free fallback means we don't throw balance errors anymore):
 // import { InsufficientFundsError, EmptyWalletError } from "./errors.js";
+import { describeFetchError } from "./errors.js";
 import { USER_AGENT, VERSION } from "./version.js";
 import {
   SessionStore,
@@ -105,6 +134,9 @@ import { isSharePreset, transform } from "./share-formatters.js";
 
 const BLOCKRUN_API = "https://blockrun.ai/api";
 const BLOCKRUN_SOLANA_API = "https://sol.blockrun.ai/api";
+const DESKTOP_SERVICE_TOKEN_FILE =
+  process.env.CLAWROUTER_DESKTOP_TOKEN_FILE ??
+  join(homedir(), ".clawrouter-desktop", "service-token");
 const IMAGE_DIR = join(homedir(), ".openclaw", "blockrun", "images");
 const AUDIO_DIR = join(homedir(), ".openclaw", "blockrun", "audio");
 const VIDEO_DIR = join(homedir(), ".openclaw", "blockrun", "videos");
@@ -132,38 +164,160 @@ const ROUTING_PROFILES = new Set([
 // flagships (mistral-large-3-675b, qwen3.5-122b). deepseek-v4-flash dropped from
 // auto-pick (BlockRun hid it) but stays catalog-routable for direct calls.
 // Auto-pick cascade (order = priority for pickFreeModel) + free cost-classification
-// set. Refreshed 2026-06-16 for BlockRun's 2026-06-14 free-tier sweep: gpt-oss stays
-// head (heavy-user red line), qwen3-coder-480b dropped (NVIDIA EOL → redirects to
-// seed-oss-36b server-side), live probe-verified models added behind the flagships.
+// set. Refreshed 2026-07-17 for blockrun's live re-probe (PR #257): gpt-oss stays
+// head (heavy-user red line); qwen3.5-122b, qwen3-next-80b and llama-4-maverick
+// dropped (all hidden + server-redirected to gpt-oss-120b upstream, so keeping
+// them here would silently defeat /exclude); deepseek-v4-flash recovered.
+// 2026-08-02, following blockrun's 07-28 re-probe (baa967b): mistral-large-3-675b
+// is HTTP 410 Gone at NVIDIA (EOL, redirected to gpt-oss-120b) — dropped for the
+// same /exclude reason.
+// 2026-08-12: deepseek-v4-flash EOL'd too (blockrun #367 — published 410 on both
+// probe passes, prod gate fired kind=gone; server-redirected to gpt-oss-120b) —
+// dropped for the same /exclude reason. That was the last 1M-ctx free model.
+// Insertion order IS the cascade order (pickFreeModel walks it). The head must
+// match router-core's ecoTiers.SIMPLE primary and the `free` alias in models.ts.
+// gpt-oss-120b/20b were dropped 2026-08-29: dead upstream since 2026-08-16 (a
+// completion hangs; the gateway 400s the `free/` id) and hidden from the
+// public catalog over NVIDIA's prompt-retention terms since 2026-04-28.
+// (They RECOVERED on blockrun's 2026-08-30 probe, but stay withheld from the
+// public catalog over those same terms — so they stay off this cascade and only
+// remain reachable through the pins that name them.)
+//
+// 2026-08-30 REBUILD (blockrun #448). NVIDIA retired FOUR of the five visible
+// free models in one sweep — step-3.7-flash (the head), nemotron-nano-9b-v2 and
+// nemotron-nano-12b-v2-vl published 410 Gone; mistral-nemotron went the quiet
+// way, still listed but >150s and zero bytes. Only nano-omni survived. Nothing
+// looked broken because blockrun server-redirects retired free ids: the caller
+// kept getting answers, from a different model — which is exactly the shape that
+// silently defeats /exclude.
+//
+// Order below is deliberate, from blockrun's measurements plus a 2026-08-30
+// gateway probe of every rung:
+//   1. lightning  — blockrun's own retarget of the old head, so the proxy and
+//                   the gateway name the same model. 1M ctx, 1.3s with tools.
+//   2. nano-30b   — fastest in the tier (~121 tok/s).
+//   3/4. laguna + north-mini — both sub-second coders, and deliberately adjacent
+//                   because they sit on DIFFERENT capacity pools (our NVIDIA key
+//                   vs OpenRouter's $0 pool), so one pool's outage does not take
+//                   both rungs.
+//   5. nano-omni  — the only vision-capable free model left.
+//   6. ultra-550b — 1M ctx and the largest we list, but 16.8s and blockrun
+//                   measured 3 of 15 calls returning an HTTP 200 that carried an
+//                   upstream 502/503 error object instead of choices.
+//   7. llama-vision — slowest (~18 tok/s), so last; it is here because it is the
+//                   only free Llama NVIDIA still serves.
 const FREE_MODELS = new Set([
-  "free/gpt-oss-120b",
-  "free/gpt-oss-20b",
-  "free/mistral-large-3-675b", // 675B general flagship (re-featured 2026-06-14)
-  "free/qwen3.5-122b-a10b", // newest-gen Qwen, strong general
-  "free/qwen3-next-80b-a3b-instruct", // 262K ctx, strong reasoning + coding
-  "free/llama-4-maverick", // BlockRun's primary free fallback
-  "free/seed-oss-36b", // live coder (successor to retired qwen3-coder-480b)
-  "free/mistral-nemotron", // strong instruction following
-  "free/step-3.7-flash", // reasoning-focused
-  "free/nemotron-nano-9b-v2", // fast lightweight generalist
+  "free/nemotron-3.5-lightning", // free-tier default — 1M ctx, thinking mode
+  "free/nemotron-3-nano-30b", // fastest free model (~121 tok/s)
+  "free/laguna-xs-2.1", // coding, ~161 tok/s — on our NVIDIA key
+  "free/north-mini-code", // coding, 607ms median — OpenRouter $0 pool
   "free/nemotron-3-nano-omni-30b-a3b-reasoning", // vision (text/image/video/audio)
-  "free/nemotron-nano-12b-v2-vl", // vision-language (text + image)
+  "free/nemotron-3-ultra-550b", // largest free model, 1M ctx — but slow + flaky
+  "free/llama-3.2-11b-vision", // only free Llama left; slowest, so last
 ]);
+/**
+ * Upstream ids the ACTIVE chain's gateway actually lists, or `undefined` while
+ * unknown. Populated once at startup by `loadGatewayCatalog()`.
+ *
+ * This exists because the two gateways do NOT carry the same free tier. BlockRun
+ * on Base rebuilt to seven free models on 2026-08-30; sol.blockrun.ai carries one
+ * of them, and answers HTTP 400 "Unknown model" for the other six. Solana has
+ * been the default chain for new installs since v0.12.246, so a fresh install
+ * would walk four hard 400s before reaching a rung its own gateway serves.
+ *
+ * Note these ids are NOT covered by the gateways' never-retire redirect rule —
+ * that only protects ids a gateway once shipped. A model that never existed on a
+ * chain hard-400s there, so this cannot be left to the fallback chain to absorb.
+ */
+let gatewayModelIds: Set<string> | undefined;
+
+/**
+ * Fetch the active gateway's catalog once, so the free cascade can skip rungs
+ * this chain does not serve.
+ *
+ * Deliberately advisory: it filters, it never *chooses*. The cascade head stays
+ * a committed literal because `free` in the alias map, `FREE_MODELS[0]`,
+ * `FREE_MODEL` and router-core's `ecoTiers.SIMPLE.primary` must agree, and
+ * `free-model-liveness.test.ts` checks that at build time — a runtime-derived
+ * head would make the invariant unverifiable. Any failure here leaves
+ * `gatewayModelIds` unset and every rung eligible, which is the pre-existing
+ * behaviour: a catalog we could not read must never disable the free tier.
+ */
+async function loadGatewayCatalog(apiBase: string, apiKey?: string): Promise<void> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GATEWAY_CATALOG_TIMEOUT_MS);
+    // api.blockrun.ai authenticates its catalog too; an unauthenticated read
+    // there is a 401, which would leave every free rung eligible forever.
+    const res = await (apiKey ? createApiKeyFetch(apiKey, fetch, apiBase) : fetch)(
+      `${apiBase}/v1/models`,
+      { signal: controller.signal },
+    );
+    clearTimeout(timer);
+    if (!res.ok) return;
+    const body = (await res.json()) as { data?: Array<{ id?: string }> };
+    const ids = (body.data ?? []).map((m) => m.id).filter((id): id is string => !!id);
+    if (ids.length === 0) return; // an empty catalog is a bad read, not a bare gateway
+    gatewayModelIds = new Set(ids);
+
+    const unserved = [...FREE_MODELS].filter((m) => !gatewayModelIds!.has(toUpstreamModelId(m)));
+    if (unserved.length > 0) {
+      console.log(
+        `[ClawRouter] Free models not served by this gateway (skipped in the cascade): ${unserved.join(", ")}`,
+      );
+    }
+  } catch {
+    // Offline, slow, or an unexpected shape — stay permissive.
+  }
+}
+
+/** Does the active gateway list this model? Permissive while the catalog is unknown. */
+function isServedByGateway(modelId: string): boolean {
+  if (!gatewayModelIds) return true;
+  return gatewayModelIds.has(toUpstreamModelId(modelId));
+}
+
 /** Pick the best available free model that isn't excluded. */
 function pickFreeModel(excludeList?: Set<string>): string | undefined {
+  for (const m of FREE_MODELS) {
+    if (excludeList?.has(m)) continue;
+    if (!isServedByGateway(m)) continue;
+    return m;
+  }
+  // Every rung was filtered out by the catalog. Fall back to the unfiltered walk:
+  // a stale or wrong catalog read must not be able to turn the free tier off.
   for (const m of FREE_MODELS) {
     if (!excludeList?.has(m)) return m;
   }
   return undefined; // all free models excluded
 }
 // Keep backward-compat constant for places that don't have excludeList in scope
-const FREE_MODEL = "free/gpt-oss-120b";
+const FREE_MODEL = "free/nemotron-3.5-lightning";
 /**
- * Map free/xxx model IDs to nvidia/xxx for upstream BlockRun API.
- * The "free/" prefix is a ClawRouter convention for the /model picker;
- * BlockRun server expects "nvidia/" prefix.
+ * Free models whose upstream id is NOT `nvidia/<basename>`.
+ *
+ * The free tier stopped being NVIDIA-only on 2026-08-30 (blockrun #448): two of
+ * the seven are hosted under their own maker's namespace upstream. The `free/`
+ * prefix stays ClawRouter's picker convention for all of them — a picker row
+ * reading `cohere/north-mini-code` gives a user no way to tell it is free — so
+ * the exceptions are named here instead of leaking into the id.
+ *
+ * A wrong value here is a 400 on every request to that model, so each one is
+ * covered by a unit test.
  */
-function toUpstreamModelId(modelId: string): string {
+const FREE_UPSTREAM_OVERRIDES: Record<string, string> = {
+  "free/north-mini-code": "cohere/north-mini-code",
+  "free/laguna-xs-2.1": "poolside/laguna-xs-2.1",
+};
+
+/**
+ * Map free/xxx model IDs to their upstream BlockRun ID.
+ * The "free/" prefix is a ClawRouter convention for the /model picker; upstream
+ * they are `nvidia/xxx` by default, or whatever FREE_UPSTREAM_OVERRIDES says.
+ */
+export function toUpstreamModelId(modelId: string): string {
+  const override = FREE_UPSTREAM_OVERRIDES[modelId];
+  if (override) return override;
   if (modelId.startsWith("free/")) {
     return "nvidia/" + modelId.slice("free/".length);
   }
@@ -176,6 +330,8 @@ const HEARTBEAT_INTERVAL_MS = 2_000;
 // are flushed, so a slow RPC must not eat into OpenClaw's ~10-15s silence
 // timeout. On expiry the request proceeds optimistically.
 const BALANCE_CHECK_TIMEOUT_MS = 2_500;
+// Startup catalog read. Advisory only — see loadGatewayCatalog().
+const GATEWAY_CATALOG_TIMEOUT_MS = 5_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300_000; // 5 minutes (allows reasoning model first-attempt + non-reasoning fallback)
 const PER_MODEL_TIMEOUT_MS = 60_000; // 60s per non-reasoning model attempt (fallback to next on exceed)
 const REASONING_MODEL_TIMEOUT_MS = 180_000; // 3min per reasoning model attempt — first-token cold-start can take 60-120s on V4 Pro / Claude opus thinking / GPT-5 reasoning_effort=high
@@ -195,6 +351,14 @@ const PORT_RETRY_ATTEMPTS = 5; // Max attempts to bind port (handles TIME_WAIT)
 const PORT_RETRY_DELAY_MS = 1_000; // Delay between retry attempts
 const MODEL_BODY_READ_TIMEOUT_MS = 300_000; // 5 minutes for model responses (reasoning models are slow)
 const ERROR_BODY_READ_TIMEOUT_MS = 30_000; // 30 seconds for error/partner body reads
+
+/** Thrown inside proxyRequest when the upstream was aborted because the client hung up. */
+class ClientDisconnectedError extends Error {
+  constructor() {
+    super("Client disconnected");
+    this.name = "ClientDisconnectedError";
+  }
+}
 
 async function readBodyWithTimeout(
   body: ReadableStream<Uint8Array> | null,
@@ -585,6 +749,7 @@ function safeWrite(res: ServerResponse, data: string | Buffer): boolean {
 // This prevents x402 payment failures after streaming headers are sent,
 // which would trigger OpenClaw's 5-24 hour billing cooldown.
 const BALANCE_CHECK_BUFFER = 1.5;
+const BALANCE_PREFLIGHT_OUTPUT_TOKEN_CAP = 4096;
 
 /**
  * Make a string safe for use as an HTTP header value.
@@ -636,7 +801,9 @@ export function getProxyPort(): number {
  */
 async function checkExistingProxy(
   port: number,
-): Promise<{ wallet: string; paymentChain?: string } | undefined> {
+): Promise<
+  { wallet: string; paymentChain?: string; authMode: AuthMode; apiKeyLabel?: string } | undefined
+> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
 
@@ -651,9 +818,20 @@ async function checkExistingProxy(
         status?: string;
         wallet?: string;
         paymentChain?: string;
+        authMode?: string;
+        apiKey?: string;
       };
-      if (data.status === "ok" && data.wallet) {
-        return { wallet: data.wallet, paymentChain: data.paymentChain };
+      // An API-key proxy has no wallet to report, so `wallet` alone can no
+      // longer be the liveness signal. Anything that does not name its mode is
+      // a pre-v0.12.268 instance, which could only have been a wallet proxy.
+      const authMode: AuthMode = data.authMode === "api-key" ? "api-key" : "wallet";
+      if (data.status === "ok" && (data.wallet || authMode === "api-key")) {
+        return {
+          wallet: data.wallet ?? "",
+          paymentChain: data.paymentChain,
+          authMode,
+          apiKeyLabel: typeof data.apiKey === "string" ? data.apiKey : undefined,
+        };
       }
     }
     return undefined;
@@ -793,6 +971,16 @@ export function detectDegradedSuccessResponse(body: string): string | undefined 
     // Happens when models like gemini-3.1-flash-lite receive complex agentic requests
     // (e.g. Roo Code tool schemas) and produce zero output instead of refusing.
     const choices = parsed.choices;
+    // A 200 whose `choices` array is EMPTY carries no answer at all. Distinct
+    // from the empty-turn case below (which has a choice whose content is
+    // blank), and previously passed straight through to the caller as a
+    // success. Seen when a relay reports upstream congestion in the envelope
+    // rather than the body — the shape blockrun #448 hit on
+    // nemotron-3-ultra-550b at ~3 in 15 calls. Guarded on the key being present
+    // so a non-chat response (images, audio, embeddings) is untouched.
+    if (Array.isArray(choices) && choices.length === 0) {
+      return "degraded response: no choices returned";
+    }
     if (Array.isArray(choices) && choices.length > 0) {
       const choice = choices[0] as Record<string, unknown>;
       const msg = (choice.message ?? choice.delta) as Record<string, unknown> | undefined;
@@ -1140,11 +1328,27 @@ type TruncationResult<T> = {
 };
 
 /**
+ * True for a message that answers a prior assistant tool call and therefore
+ * cannot stand alone at the head of a conversation: OpenAI-style
+ * `role: "tool"`, or an Anthropic-in-OpenAI-wrapper `user` turn whose content
+ * blocks are `tool_result`s.
+ */
+function isToolResultMessage(msg: { role: string; content?: unknown }): boolean {
+  if (msg.role === "tool") return true;
+  if (Array.isArray(msg.content)) {
+    return (msg.content as ContentBlock[]).some(
+      (b) => b && typeof b === "object" && b.type === "tool_result",
+    );
+  }
+  return false;
+}
+
+/**
  * Truncate messages to stay under BlockRun's MAX_MESSAGES limit.
  * Keeps all system messages and the most recent conversation history.
  * Returns the messages and whether truncation occurred.
  */
-function truncateMessages<T extends { role: string }>(messages: T[]): TruncationResult<T> {
+export function truncateMessages<T extends { role: string }>(messages: T[]): TruncationResult<T> {
   if (!messages || messages.length <= MAX_MESSAGES) {
     return {
       messages,
@@ -1160,7 +1364,20 @@ function truncateMessages<T extends { role: string }>(messages: T[]): Truncation
 
   // Keep all system messages + most recent conversation messages
   const maxConversation = MAX_MESSAGES - systemMsgs.length;
-  const truncatedConversation = conversationMsgs.slice(-maxConversation);
+  let start = Math.max(0, conversationMsgs.length - maxConversation);
+
+  // #252: never open the kept window on a tool result whose parent assistant
+  // `tool_calls` turn was just dropped — providers 400 on the orphan
+  // (Anthropic: "tool_use block without matching tool_result"; OpenAI:
+  // "tool_calls referenced but tool response missing"). Walk the boundary
+  // FORWARD past the orphaned results so the whole exchange is dropped
+  // together; walking backward could exceed MAX_MESSAGES. A parallel tool
+  // call's results are contiguous, so this also handles the multi-result
+  // case where the slice landed mid-exchange.
+  while (start < conversationMsgs.length && isToolResultMessage(conversationMsgs[start])) {
+    start++;
+  }
+  const truncatedConversation = conversationMsgs.slice(start);
 
   const result = [...systemMsgs, ...truncatedConversation];
 
@@ -1214,6 +1431,20 @@ function stripThinkingTokens(content: string): string {
   return cleaned;
 }
 
+/**
+ * Whether a turn that carries `tool_calls` may also carry prose to the user.
+ *
+ * Models routinely address the user on the same turn they call a tool ("not
+ * sent yet, checking first"), and OpenAI-compatible clients expect that text
+ * in `content` alongside `tool_calls`. Suppressing it mutes the agent for the
+ * whole tool-using stretch of a conversation. Set
+ * CLAWROUTER_TOOL_CALL_PROSE=off for models that dump untagged
+ * chain-of-thought into `content` rather than into a thinking block.
+ */
+function forwardToolCallProse(): boolean {
+  return process.env.CLAWROUTER_TOOL_CALL_PROSE?.trim().toLowerCase() !== "off";
+}
+
 /** Callback info for low balance warning */
 export type LowBalanceInfo = {
   balanceUSD: string;
@@ -1237,13 +1468,42 @@ export type WalletConfig = string | { key: string; solanaPrivateKeyBytes?: Uint8
 
 export type PaymentChain = "base" | "solana";
 
+/**
+ * How this proxy pays BlockRun.
+ * - "wallet"  — x402 micropayments signed per call from a local USDC wallet.
+ * - "api-key" — a `brk_…` bearer token drawing on account credit topped up by
+ *               card at https://user.blockrun.ai. No wallet, no chain, no gas.
+ */
+export type AuthMode = "wallet" | "api-key";
+
 export type ProxyOptions = {
-  wallet: WalletConfig;
+  /**
+   * Wallet material for x402 mode. Optional only when `apiKey` is set — one of
+   * the two must be present or the proxy has no way to pay for anything.
+   */
+  wallet?: WalletConfig;
+  /**
+   * BlockRun API key (`brk_…`). When present it wins over `wallet`: the proxy
+   * talks to api.blockrun.ai with a bearer token and signs no payments at all.
+   * Also readable from BLOCKRUN_API_KEY / ~/.blockrun/.api-key via
+   * resolveApiKey(); callers resolve it and pass it in.
+   */
+  apiKey?: string;
   apiBase?: string;
-  /** Payment chain: "base" (default) or "solana". Can also be set via CLAWROUTER_PAYMENT_CHAIN env var. */
+  /**
+   * Payment chain: "base" or "solana". New installs persist "solana" at wallet
+   * generation; absent config resolves to "base" for pre-existing installs.
+   * Can also be set via CLAWROUTER_PAYMENT_CHAIN env var.
+   */
   paymentChain?: PaymentChain;
   /** Port to listen on (default: 8402) */
   port?: number;
+  /**
+   * Reuse a compatible process already listening on the requested port.
+   * Desktop disables this because it must only configure agents against a
+   * process whose lifecycle it owns.
+   */
+  allowExistingProxy?: boolean;
   routingConfig?: Partial<RoutingConfig>;
   /** Request timeout in ms (default: 180000 = 3 minutes). Covers on-chain tx + LLM response. */
   requestTimeoutMs?: number;
@@ -1297,10 +1557,24 @@ export type ProxyOptions = {
   onError?: (error: Error) => void;
   onPayment?: (info: { model: string; amount: string; network: string }) => void;
   onRouted?: (decision: RoutingDecision) => void;
+  /** Local comparison only; it never changes the serving request or sends another completion. */
+  onShadowRouted?: (comparison: {
+    executed: RoutingDecision;
+    shadow: RoutingDecision;
+    sameModel: boolean;
+    hasTools: boolean;
+    hasVision: boolean;
+    requiresStructuredOutput: boolean;
+  }) => void;
   /** Called when balance drops below $1.00 (warning, request still proceeds) */
   onLowBalance?: (info: LowBalanceInfo) => void;
   /** Called when balance is insufficient for a request (request fails) */
   onInsufficientFunds?: (info: InsufficientFundsInfo) => void;
+  /**
+   * Spend / counterparty policy. Default: FileSpendControlStorage at
+   * ~/.openclaw/blockrun/spending.json. Inject in tests.
+   */
+  spendControl?: SpendControl;
   /**
    * Upstream proxy URL for all outgoing requests.
    * Supports http://, https://, and socks5:// schemes.
@@ -1313,8 +1587,13 @@ export type ProxyOptions = {
 export type ProxyHandle = {
   port: number;
   baseUrl: string;
+  /** The x402 signer's address, or "" in API-key mode (there is no wallet). */
   walletAddress: string;
   solanaAddress?: string;
+  /** Which credential this proxy is paying with. */
+  authMode: AuthMode;
+  /** Masked API key, for status display. Only set in API-key mode. */
+  apiKeyLabel?: string;
   balanceMonitor: AnyBalanceMonitor;
   close: () => Promise<void>;
 };
@@ -1336,11 +1615,34 @@ function buildModelPricing(): Map<string, ModelPricing> {
   return map;
 }
 
+function buildModelCapabilities(): Record<string, ModelCapabilities> {
+  return Object.fromEntries(
+    BLOCKRUN_MODELS.map((model) => [
+      model.id,
+      {
+        contextWindow: model.contextWindow,
+        maxOutputTokens: model.maxOutput,
+        supportsTools: model.toolCalling === true,
+        supportsVision: model.vision === true,
+      },
+    ]),
+  );
+}
+
 type ModelListEntry = {
   id: string;
   object: "model";
   created: number;
   owned_by: string;
+  name: string;
+  context_window: number;
+  max_output: number;
+  input_price: number;
+  output_price: number;
+  reasoning: boolean;
+  vision: boolean;
+  agentic: boolean;
+  tool_calling: boolean;
 };
 
 /**
@@ -1357,12 +1659,25 @@ export function buildProxyModelList(
     if (seen.has(model.id)) return false;
     seen.add(model.id);
     return true;
-  }).map((model) => ({
-    id: model.id,
-    object: "model",
-    created: createdAt,
-    owned_by: model.id.includes("/") ? (model.id.split("/")[0] ?? "blockrun") : "blockrun",
-  }));
+  }).map((model) => {
+    const targetId = MODEL_ALIASES[model.id] ?? model.id;
+    const canonical = BLOCKRUN_MODELS.find((entry) => entry.id === targetId);
+    return {
+      id: model.id,
+      object: "model",
+      created: createdAt,
+      owned_by: targetId.includes("/") ? (targetId.split("/")[0] ?? "blockrun") : "blockrun",
+      name: model.name,
+      context_window: model.contextWindow,
+      max_output: model.maxTokens,
+      input_price: model.cost.input,
+      output_price: model.cost.output,
+      reasoning: model.reasoning,
+      vision: model.input.includes("image"),
+      agentic: canonical?.agentic ?? false,
+      tool_calling: canonical?.toolCalling ?? false,
+    };
+  });
 }
 
 /**
@@ -1486,11 +1801,14 @@ export function buildCostBreakdown(params: {
  *  pre-check scans every model), so a linear find would be O(n²) per request. */
 const BLOCKRUN_MODEL_BY_ID = new Map(BLOCKRUN_MODELS.map((m) => [m.id, m]));
 
+// Re-exported so `proxy.js` stays the single import surface for proxy internals.
+export { DEFAULT_MAX_TOKENS, resolveMaxTokens } from "./max-tokens.js";
+
 /**
  * Estimate USDC cost for a request based on model pricing.
  * Returns amount string in USDC smallest unit (6 decimals) or undefined if unknown.
  */
-function estimateAmount(
+export function estimateAmount(
   modelId: string,
   bodyLength: number,
   maxTokens: number,
@@ -1512,19 +1830,38 @@ function estimateAmount(
       (estimatedOutputTokens / 1_000_000) * model.outputPrice;
   }
 
+  // blockrun charges a flat $0.001 per-transaction fee on every PAID product
+  // (covers gas; included in the server's 402 quote). Introduced at $0.002 on
+  // 2026-07-14, reverted to $0.001 on 2026-07-29 (blockrun #319). Mirror it so
+  // balance pre-checks and usage logs track what the gateway actually charges.
+  // Free models ($0 estimate) never pay it.
+  if (costUsd > 0) costUsd += 0.001;
+
   // Convert to USDC 6-decimal integer, add 20% buffer for estimation error
   // Minimum 1000 ($0.001) to match CDP Facilitator's enforced minimum payment
   const amountMicros = Math.max(1000, Math.ceil(costUsd * 1.2 * 1_000_000));
   return amountMicros.toString();
 }
 
+export function estimateBalancePreflightAmount(
+  modelId: string,
+  bodyLength: number,
+  maxTokens: number,
+): string | undefined {
+  // Clients like OpenClaw may send the model's huge default max output
+  // (for example 128k) even when the user did not request that much output.
+  // Keep this as a preflight-only spend estimate; the real request is unchanged
+  // and x402 still enforces the actual server quote.
+  const preflightMaxTokens = Math.min(
+    maxTokens || BALANCE_PREFLIGHT_OUTPUT_TOKEN_CAP,
+    BALANCE_PREFLIGHT_OUTPUT_TOKEN_CAP,
+  );
+  return estimateAmount(modelId, bodyLength, preflightMaxTokens);
+}
+
 // Image pricing table (must match server's IMAGE_MODELS in blockrun/src/lib/models.ts)
 // Server applies 5% margin on top of these prices.
 const IMAGE_PRICING: Record<string, { default: number; sizes?: Record<string, number> }> = {
-  "openai/dall-e-3": {
-    default: 0.04,
-    sizes: { "1024x1024": 0.04, "1792x1024": 0.08, "1024x1792": 0.08 },
-  },
   "openai/gpt-image-1": {
     default: 0.02,
     sizes: { "1024x1024": 0.02, "1536x1024": 0.04, "1024x1536": 0.04 },
@@ -1533,8 +1870,24 @@ const IMAGE_PRICING: Record<string, { default: number; sizes?: Record<string, nu
     default: 0.06,
     sizes: { "1024x1024": 0.06, "1536x1024": 0.12, "1024x1536": 0.12 },
   },
-  "black-forest/flux-1.1-pro": { default: 0.04 },
-  "google/nano-banana": { default: 0.05 },
+  "bytedance/seedream-5-pro": {
+    default: 0.045,
+    // Full size list live-probed 2026-08-23 (gateway 402 quotes, base price):
+    // the 2K portrait/landscape tiers bill at the 2048x2048 rate.
+    sizes: {
+      "1024x1024": 0.045,
+      "1280x720": 0.045,
+      "2048x1024": 0.045,
+      "2048x2048": 0.09,
+      "2304x1728": 0.09,
+      "1728x2304": 0.09,
+      "2848x1600": 0.09,
+      "1600x2848": 0.09,
+    },
+  },
+  "google/nano-banana": { default: 0.05, sizes: { "1024x1024": 0.05 } },
+  // Nano Banana 2 (Gemini 3.1 Flash imagegen, blockrun #329): $0.09/image at 1K.
+  "google/nano-banana-2": { default: 0.09, sizes: { "1024x1024": 0.09 } },
   "google/nano-banana-pro": {
     default: 0.1,
     sizes: { "1024x1024": 0.1, "2048x2048": 0.1, "4096x4096": 0.15 },
@@ -1553,6 +1906,58 @@ const IMAGE_PRICING: Record<string, { default: number; sizes?: Record<string, nu
     },
   },
 };
+
+/**
+ * Image model ids the gateway can actually serve, in IMAGE_PRICING declaration
+ * order (the picker in index.ts curates its own order — default model first —
+ * so the pinning test compares sorted copies).
+ *
+ * Derived from IMAGE_PRICING, which v0.12.227 re-synced against blockrun's
+ * IMAGE_MODELS — so an id missing here is an id the gateway will reject.
+ * Exported so the image picker advertised by buildImageGenerationProvider
+ * (index.ts) can be pinned against it: the picked id is forwarded to
+ * /v1/images/generations verbatim, with no alias resolution in between.
+ */
+export const IMAGE_MODEL_IDS: readonly string[] = Object.freeze(Object.keys(IMAGE_PRICING));
+
+/**
+ * Union of every size the gateway accepts across all image models, live-probed
+ * 2026-08-23 (the gateway rejects invalid sizes pre-payment with the model's
+ * accepted list). Derived from the per-model `sizes` maps above, which mirror
+ * those probes — every model entry now carries its full accepted-size map.
+ * Pins the `geometry.sizes` list advertised by buildImageGenerationProvider
+ * (index.ts): a size listed there that no model accepts is a guaranteed 400.
+ */
+export const IMAGE_MODEL_SIZES: readonly string[] = Object.freeze(
+  [...new Set(Object.values(IMAGE_PRICING).flatMap((p) => Object.keys(p.sizes ?? {})))].sort(),
+);
+
+/**
+ * Shorthand → full-id aliases for the `/cr-imagegen` chat command. Module-scope
+ * and exported so tests can pin every target against IMAGE_MODEL_IDS — an alias
+ * pointing at a delisted id is the same guaranteed-400 drift class the picker
+ * test guards against.
+ */
+export const IMAGE_MODEL_ALIASES: Record<string, string> = Object.freeze({
+  // dall-e-3 delisted upstream 2026-05-25 — legacy aliases route to
+  // the OpenAI successor instead of a guaranteed 400.
+  "dall-e-3": "openai/gpt-image-2",
+  dalle3: "openai/gpt-image-2",
+  dalle: "openai/gpt-image-2",
+  "gpt-image": "openai/gpt-image-1",
+  "gpt-image-1": "openai/gpt-image-1",
+  "gpt-image-2": "openai/gpt-image-2",
+  seedream: "bytedance/seedream-5-pro",
+  banana: "google/nano-banana",
+  "nano-banana": "google/nano-banana",
+  "banana-2": "google/nano-banana-2",
+  "nano-banana-2": "google/nano-banana-2",
+  "banana-pro": "google/nano-banana-pro",
+  "nano-banana-pro": "google/nano-banana-pro",
+  "grok-imagine": "xai/grok-imagine-image",
+  "grok-imagine-pro": "xai/grok-imagine-image-pro",
+  cogview: "zai/cogview-4",
+});
 
 // Video pricing (must match server's VIDEO_MODELS in blockrun/src/lib/models.ts).
 // pricePerSecond is the BASE rate (no margin). estimateVideoCost applies the
@@ -1575,13 +1980,32 @@ const VIDEO_PRICING: Record<
   }
 > = {
   "xai/grok-imagine-video": { pricePerSecond: 0.05, defaultDurationSeconds: 8 },
-  "bytedance/seedance-1.5-pro": { pricePerSecond: 0.0875, defaultDurationSeconds: 5 },
+  // Seedance rates re-synced 2026-08-08 from blockrun's models.ts after the
+  // family reprice (blockrun #351/#354). All three were carrying pre-reprice
+  // numbers, which only ever skewed the usage log — the charge comes from the
+  // x402 header, and estimateVideoCost is the fallback for when it is absent.
+  "bytedance/seedance-1.5-pro": { pricePerSecond: 0.07, defaultDurationSeconds: 5 },
   "bytedance/seedance-2.0-fast": {
-    pricePerSecond: 0.22687,
+    pricePerSecond: 0.165,
     defaultDurationSeconds: 5,
   },
   "bytedance/seedance-2.0": {
-    pricePerSecond: 0.28358,
+    pricePerSecond: 0.227,
+    defaultDurationSeconds: 5,
+  },
+  // Seedance 2.0 Mini (blockrun #366/#368, 2026-08-12): 720p + synced audio at
+  // half the flagship rate, 480p/720p only, 4–15s. blockrun signs the 3dp-floored
+  // per-second value (0.079, not the raw 0.0797) — mirror the signed number.
+  "bytedance/seedance-2.0-mini": {
+    pricePerSecond: 0.079,
+    defaultDurationSeconds: 5,
+  },
+  // Seedance 2.5: 720p with synced audio, up to 30s. Not a replacement for 2.0
+  // Pro — that is still the one for 1080p/4K. No OpenRouter failover exists for
+  // 2.5, so a token360 outage surfaces as an error instead of quietly rendering
+  // on another model.
+  "bytedance/seedance-2.5": {
+    pricePerSecond: 0.315,
     defaultDurationSeconds: 5,
   },
   // Sora 2 via Azure AI Foundry — flat $0.10/s for both t2v and i2v.
@@ -1686,12 +2110,174 @@ function estimateImageCost(model: string, size?: string, n: number = 1): number 
  * or sessions — just collect body, forward via payFetch (which handles 402
  * automatically), and stream back.
  */
+/**
+ * The gateway's id for a response, from `x-blockrun-request-id`.
+ *
+ * Undefined when the response never came from BlockRun (a locally served cache
+ * hit, a refusal) — recorded in the usage journal as the join key for billing
+ * reconciliation. See UsageEntry.requestId.
+ */
+function blockrunRequestId(response: Response | undefined): string | undefined {
+  if (!response) return undefined;
+  // The three gateways do NOT agree on the header name, and reading only the
+  // BlockRun-prefixed one meant this returned undefined on both wallet rails —
+  // so the reconciliation join key was always empty in wallet mode, and a
+  // failing paid call on Solana had no id to report (ClawRouter-Hermes#38).
+  // Measured 2026-09-05:
+  //   api.blockrun.ai   x-blockrun-request-id, x-request-id, request-id
+  //   sol.blockrun.ai   x-request-id only
+  //   blockrun.ai       none at all — Base publishes no id, so undefined here
+  //                     is the honest answer rather than a bug to work around.
+  for (const name of ["x-blockrun-request-id", "x-request-id", "request-id"]) {
+    const value = response.headers.get(name)?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+/**
+ * Remaining account credit, from `x-blockrun-credit-remaining-usd`.
+ *
+ * Same contract as the cost header: absent means "nothing to report", never
+ * zero. The gateway omits it entirely on ungated accounts — which have no
+ * allowance to run down — and a genuine zero balance is written "0.000000". A
+ * client that read absence as 0 would refuse to call on behalf of an account
+ * with no limit at all, which is the failure this header exists to prevent,
+ * inverted. So this returns `number | undefined`, like its sibling.
+ *
+ * The gateway derives it net of every concurrent in-flight hold, so it can
+ * understate what is left but never overstate it. For a warning that is the
+ * right error direction: warn slightly early under concurrency, never too late.
+ */
+function gatewayRemainingCreditUsd(response: Response | undefined): number | undefined {
+  const raw = response?.headers.get("x-blockrun-credit-remaining-usd");
+  if (raw === null || raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined; // Number("") is 0, not NaN
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || value < 0) return undefined;
+  return value;
+}
+
+/**
+ * What a MEDIA call actually cost, in priority order.
+ *
+ * The media branches used `paymentStore.getStore()?.amountUsd ?? <estimate>`,
+ * and `??` does not catch 0. On the API-key rail no x402 payment happens, the
+ * store reports 0, and `0 ?? estimate` is 0 — so every image, img2img, audio and
+ * video call was journaled at $0 and `/stats` showed `IMAGE: {count: 4, cost: 0}`
+ * while the account was really charged $0.0525 each. Same shape as the 152x
+ * chat bug in the other direction: spend that silently is not there.
+ *
+ * These routes are luckier than the rest: the gateway puts the settled amount in
+ * the response body as `price.amount`, so the true figure is available even
+ * where the cost header is not.
+ *
+ *   1. `x-blockrun-cost-usd` — the gateway's settled charge
+ *   2. `price.amount` in the response body — same number, media routes carry it
+ *   3. a non-zero x402 payment — the wallet rail's real amount
+ *   4. the local estimate — last resort, and the only one that can be wrong
+ */
+function settledMediaCostUsd(
+  upstream: Response | undefined,
+  body: unknown,
+  x402AmountUsd: number | undefined,
+  estimate: number,
+): number {
+  const header = gatewaySettledCostUsd(upstream);
+  if (header !== undefined) return header;
+  const price = (body as { price?: { amount?: unknown } } | undefined)?.price?.amount;
+  if (typeof price === "string" || typeof price === "number") {
+    const parsed = Number(price);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  if (typeof x402AmountUsd === "number" && x402AmountUsd > 0) return x402AmountUsd;
+  return estimate;
+}
+
+/**
+ * Declare what the dispatch about to happen is expected to cost, in USD.
+ *
+ * Read and cleared by the API-key rail's spend-window wrapper (`withSpendPolicy`),
+ * so it must be published immediately before a BILLABLE upstream call and never
+ * before a status poll — an unpublished dispatch is treated as free, which is
+ * what keeps an async media job from being charged once at submit and again on
+ * the poll that completes it. Pass 0 for routes ClawRouter cannot price locally
+ * (flat-priced partner endpoints); the gateway's settled charge then governs.
+ *
+ * A no-op on the wallet rail, where the 402 quote is the authority.
+ */
+function publishDispatchCost(usd: number): void {
+  const store = paymentStore.getStore();
+  if (store) store.estimatedUsd = Number.isFinite(usd) && usd > 0 ? usd : 0;
+}
+
+/** $1.00, matching the wallet rail's low-balance threshold. */
+const LOW_CREDIT_USD = 1.0;
+/** Warn on a threshold crossing, not per call; re-arms when credit goes back up. */
+let lowCreditWarned = false;
+
+/**
+ * Warn before the account runs out, rather than after.
+ *
+ * Until the gateway published a remaining figure a card-paying user had no
+ * warning at all: the first sign of trouble was a request failing with 402.
+ * Wallet users have had a live balance all along. Fires once per crossing so a
+ * busy agent does not get the same line on every call, and re-arms after a
+ * top-up so the next drop is reported.
+ */
+function noteRemainingCredit(response: Response | undefined): void {
+  const remaining = gatewayRemainingCreditUsd(response);
+  if (remaining === undefined) return; // ungated account, or nothing to report
+  if (remaining > LOW_CREDIT_USD) {
+    lowCreditWarned = false;
+    return;
+  }
+  if (lowCreditWarned) return;
+  lowCreditWarned = true;
+  console.warn(
+    remaining <= 0
+      ? `[ClawRouter] ⚠ BlockRun account credit is exhausted — calls will fail with 402. Top up: ${PORTAL_CREDITS_URL}`
+      : `[ClawRouter] ⚠ BlockRun account credit low: $${remaining.toFixed(2)} remaining. Top up: ${PORTAL_CREDITS_URL}`,
+  );
+}
+
+/**
+ * The amount BlockRun actually settled for this response, from
+ * `x-blockrun-cost-usd`, or undefined when the header is absent.
+ *
+ * Absent is NOT zero — the gateway writes a genuine zero charge as "0.000000"
+ * and omits the header when nothing settled at response time (the chat path,
+ * where the charge commits after the response, and async media billed on a
+ * later settlement). Callers must fall back rather than record $0, so a value
+ * of exactly 0 has to stay distinguishable from a missing header; that is why
+ * this returns `number | undefined` and not a defaulted number.
+ *
+ * A malformed or negative value is treated as absent: an unparseable charge is
+ * not evidence of a free call, and letting NaN through would poison every
+ * total computed from the journal.
+ */
+function gatewaySettledCostUsd(response: Response | undefined): number | undefined {
+  const raw = response?.headers.get("x-blockrun-cost-usd");
+  if (raw === null || raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  // Number("") is 0, not NaN — an empty header would otherwise read as a
+  // settled zero charge, which is the exact confusion this header exists to
+  // avoid, and would record $0 against a call that really was billed.
+  if (trimmed === "") return undefined;
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || value < 0) return undefined;
+  return value;
+}
+
 async function proxyPaidApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
   apiBase: string,
   payFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
   getActualPaymentUsd: () => number,
+  accountPassthrough = false,
+  authMode: AuthMode = "wallet",
 ): Promise<void> {
   const startTime = Date.now();
   const upstreamUrl = `${apiBase}${req.url}`;
@@ -1741,6 +2327,9 @@ async function proxyPaidApiRequest(
     if (!res.writableEnded) clientAbort.abort();
   });
 
+  // Billable, but ClawRouter has no local price for partner endpoints — publish
+  // 0 and let the gateway's settled charge feed the windows.
+  publishDispatchCost(0);
   const upstream = await payFetch(upstreamUrl, {
     method: req.method ?? "POST",
     headers,
@@ -1764,33 +2353,87 @@ async function proxyPaidApiRequest(
     responseHeaders[key] = value;
   });
 
+  // An authenticated account response must never be cached: caches downstream
+  // key on the URL, not the credential, so switching API keys on one proxy port
+  // could otherwise serve one account's data to another — `/v1/phone/numbers`
+  // answers "which numbers do I own", and upstream marks it public/max-age.
+  //
+  // Keyed on the CREDENTIAL, not on which route handled the request. The
+  // partner prefixes (/v1/phone, /v1/surf, /v1/pm, ...) are matched before the
+  // generic account passthrough and would otherwise keep the upstream's caching
+  // headers while still being account-authenticated.
+  if (accountPassthrough || authMode === "api-key") {
+    responseHeaders["cache-control"] = "no-store";
+  }
   res.writeHead(upstream.status, responseHeaders);
 
-  // Stream response body
-  if (upstream.body) {
-    const chunks = await readBodyWithTimeout(upstream.body, ERROR_BODY_READ_TIMEOUT_MS);
-    for (const chunk of chunks) {
-      safeWrite(res, Buffer.from(chunk));
+  if (accountPassthrough) {
+    // Stream rather than buffer, so these routes keep their native payload,
+    // status and SSE contract instead of arriving all at once.
+    //
+    // NOTE: this deliberately does NOT skip the usage log below. Account billing
+    // is authoritative in the portal, but a local journal that silently omits
+    // paid calls is how Surf/Exa/prediction-market spend became invisible in
+    // `/stats` on this rail in the first place (fixed in 934bea4). The gateway
+    // now returns `x-blockrun-cost-usd`, so the charge is knowable here and
+    // there is no longer a reason to drop the row.
+    if (upstream.body) {
+      await pipeline(
+        Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream<Uint8Array>),
+        res,
+        { signal: clientAbort.signal },
+      );
+    } else {
+      res.end();
     }
+  } else {
+    // Stream response body
+    if (upstream.body) {
+      const chunks = await readBodyWithTimeout(upstream.body, ERROR_BODY_READ_TIMEOUT_MS);
+      for (const chunk of chunks) {
+        safeWrite(res, Buffer.from(chunk));
+      }
+    }
+    res.end();
   }
-
-  res.end();
 
   const latencyMs = Date.now() - startTime;
   console.log(`[ClawRouter] ${requestLabel} response: ${upstream.status} (${latencyMs}ms)`);
 
-  // Log paid tool usage with actual x402 payment amount.
+  // Log paid tool usage with the actual amount charged.
+  //
+  // On the wallet rail that is the x402 payment. On the API-key rail no x402
+  // ever happens, so this was 0 for every paid partner call — Surf, Exa,
+  // prediction markets, images, speech all landed in the journal at $0 and were
+  // invisible in `/stats`. That is the mirror of the 152x chat overstatement:
+  // there we inherited an x402 cost model that did not apply, here we inherited
+  // an x402 payment that never occurs. Unlike chat we have no local price model
+  // for these services, so the gateway's own figure is the only truthful source.
+  //
+  // BlockRun publishes it as `x-blockrun-cost-usd` on pre-priced (non-chat)
+  // services. Its contract, per the gateway: ABSENT means "no charge settled at
+  // the time of the response", NOT "this call was free" — a charge that really
+  // is zero is written explicitly as 0.000000. So absence must fall back to the
+  // previous behaviour rather than assert $0, or async media (billed on a later
+  // settlement) would be under-counted instead of over-counted.
+  //
   // Phone/voice telemetry rules — see resolvePhoneTelemetryCost.
-  const paidAmount = getActualPaymentUsd();
-  const requestCost = resolvePhoneTelemetryCost({
-    paidAmount,
-    isPhone,
-    upstreamStatus: upstream.status,
-    method: req.method,
-    urlPath: req.url ?? "",
-  });
+  noteRemainingCredit(upstream);
+  const settledCostUsd = gatewaySettledCostUsd(upstream);
+  const paidAmount = settledCostUsd ?? getActualPaymentUsd();
+  const requestCost =
+    settledCostUsd !== undefined
+      ? settledCostUsd
+      : resolvePhoneTelemetryCost({
+          paidAmount,
+          isPhone,
+          upstreamStatus: upstream.status,
+          method: req.method,
+          urlPath: req.url ?? "",
+        });
   logUsage({
     timestamp: new Date().toISOString(),
+    ...(blockrunRequestId(upstream) ? { requestId: blockrunRequestId(upstream) } : {}),
     model: isBlockrunExa
       ? "blockrun-exa"
       : isModalSandbox
@@ -1881,6 +2524,109 @@ async function uploadDataUriToHost(dataUri: string): Promise<string> {
 }
 
 /**
+ * Tell the operator which parts of `clawrouter policy` cannot fire on this rail.
+ *
+ * Since #329 the amount windows DO hold on the API-key rail — `withSpendPolicy`
+ * enforces them at the dispatch boundary, reading the same `spending.json`. What
+ * still cannot fire are the counterparty lists: `blockedPayees`,
+ * `allowedPayees`, `allowedNetworks` and `allowedAssets` each presuppose a
+ * payee, a network and an on-chain asset, and account credit has one
+ * counterparty and no asset. They are vacuous here, not merely disabled — but an
+ * operator who configured one is entitled to hear that it is not doing anything.
+ *
+ * Silent when none are configured, which is the common path.
+ */
+function warnIfSpendLimitsUnenforced(spendControl: SpendControl | undefined): void {
+  let configured: string[];
+  try {
+    const limits = (spendControl ?? new SpendControl()).getStatus().limits;
+    configured = POLICY_LISTS.filter((list) => (limits[list]?.length ?? 0) > 0);
+  } catch {
+    return; // an unreadable policy file is its own problem, reported elsewhere
+  }
+  if (configured.length === 0) return;
+
+  console.warn(
+    `[ClawRouter] \u26A0 Counterparty policy (${configured.join(", ")}) does not apply in API-key mode — there is one counterparty and no on-chain asset.`,
+  );
+  console.warn(
+    `[ClawRouter]   Your perRequest/hourly/daily/session limits DO apply here and are enforced per call.`,
+  );
+}
+
+/**
+ * Refuse to attach to a proxy that is not billing what this process configured.
+ *
+ * Two paths reach an already-running proxy: the pre-listen probe, and the
+ * EADDRINUSE race when another process wins the bind between that probe and
+ * `listen()`. Only the first one checked credentials, so the race path could
+ * hand an API-key caller a wallet proxy — the caller believes it is billing
+ * account credit while every request spends USDC, and the handle it gets back
+ * even reports `authMode: "api-key"` and the key's label. Both paths validate
+ * here so the rule is one rule and not two.
+ *
+ * The three refusals, all for the same reason (reuse would spend money the
+ * caller did not mean to spend):
+ *
+ *   - a different auth mode: the two rails bill different accounts from
+ *     different hosts
+ *   - a different API key: `clawrouter login` with a second key on a port
+ *     already serving the first used to attach silently, and every request was
+ *     charged to the old account. An older proxy that reports no label cannot
+ *     be verified, and an unverifiable credential on a money path is refused
+ *     rather than assumed to match.
+ *   - a different payment chain: a different signer and a different gateway
+ */
+function assertExistingProxyBillsUs(
+  existing: { wallet: string; paymentChain?: string; authMode: AuthMode; apiKeyLabel?: string },
+  requested: {
+    listenPort: number;
+    authMode: AuthMode;
+    apiKeyLabel?: string;
+    paymentChain: string;
+  },
+): void {
+  const { listenPort } = requested;
+  const describe = (mode: AuthMode) => (mode === "api-key" ? "a BlockRun API key" : "a wallet");
+
+  if (existing.authMode !== requested.authMode) {
+    throw new Error(
+      `Existing proxy on port ${listenPort} is authenticating with ${describe(existing.authMode)} but ${describe(requested.authMode)} was requested. ` +
+        `Stop the existing proxy first or use a different port.`,
+    );
+  }
+
+  if (requested.authMode === "api-key") {
+    if (existing.apiKeyLabel !== requested.apiKeyLabel) {
+      throw new Error(
+        `Existing proxy on port ${listenPort} is billing ${existing.apiKeyLabel ?? "an unidentified BlockRun account"}, ` +
+          `but this process is configured for ${requested.apiKeyLabel}. Reusing it would charge the other account. ` +
+          `Stop that proxy first, or use a different port.`,
+      );
+    }
+    return;
+  }
+
+  if (existing.paymentChain) {
+    if (existing.paymentChain !== requested.paymentChain) {
+      throw new Error(
+        `Existing proxy on port ${listenPort} is using ${existing.paymentChain} but ${requested.paymentChain} was requested. ` +
+          `Stop the existing proxy first or use a different port.`,
+      );
+    }
+  } else if (requested.paymentChain !== "base") {
+    // Old proxy doesn't report chain — assume Base. Reject if Solana was requested.
+    console.warn(
+      `[ClawRouter] Existing proxy on port ${listenPort} does not report paymentChain (pre-v0.11 instance). Assuming Base.`,
+    );
+    throw new Error(
+      `Existing proxy on port ${listenPort} is a pre-v0.11 instance (assumed Base) but ${requested.paymentChain} was requested. ` +
+        `Stop the existing proxy first or use a different port.`,
+    );
+  }
+}
+
+/**
  * Start the local x402 proxy server.
  *
  * If a proxy is already running on the target port, reuses it instead of failing.
@@ -1895,18 +2641,58 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     console.log(`[ClawRouter] Upstream proxy: ${upstreamProxy}`);
   }
 
+  // An API key takes precedence over a wallet: it is the explicit, newer
+  // credential, and a machine that has both (a legacy wallet plus a key the
+  // user just added) means "bill my account", not "keep spending my USDC".
+  const apiKey = options.apiKey?.trim() || undefined;
+  if (apiKey && !isValidApiKey(apiKey)) {
+    throw new Error(
+      `BlockRun API key is malformed (expected it to start with "brk_"). Mint one at https://user.blockrun.ai/dashboard/keys`,
+    );
+  }
+  const authMode: AuthMode = apiKey ? "api-key" : "wallet";
+  if (!apiKey && !options.wallet) {
+    throw new Error(
+      `startProxy needs a credential: pass either a wallet (x402) or an apiKey (brk_…, from https://user.blockrun.ai/dashboard/keys).`,
+    );
+  }
+
   // Normalize wallet config: string = EVM-only, object = full resolution
-  const walletKey = typeof options.wallet === "string" ? options.wallet : options.wallet.key;
+  const walletKey =
+    options.wallet === undefined
+      ? undefined
+      : typeof options.wallet === "string"
+        ? options.wallet
+        : options.wallet.key;
   const solanaPrivateKeyBytes =
-    typeof options.wallet === "string" ? undefined : options.wallet.solanaPrivateKeyBytes;
+    options.wallet === undefined || typeof options.wallet === "string"
+      ? undefined
+      : options.wallet.solanaPrivateKeyBytes;
 
   // Payment chain: options > env var > persisted file > default "base".
   // No dynamic switching — user selects chain via /wallet solana or /wallet base.
+  // Meaningless in API-key mode (there is no chain to sign on), and reported as
+  // undefined there so /health never advertises a rail this proxy cannot use.
   const paymentChain = options.paymentChain ?? (await resolvePaymentChain());
-  const apiBase =
+  const requestedApiBase =
     options.apiBase ??
-    (paymentChain === "solana" && solanaPrivateKeyBytes ? BLOCKRUN_SOLANA_API : BLOCKRUN_API);
-  if (paymentChain === "solana" && !solanaPrivateKeyBytes) {
+    (authMode === "api-key"
+      ? BLOCKRUN_API_KEY_API
+      : paymentChain === "solana" && solanaPrivateKeyBytes
+        ? BLOCKRUN_SOLANA_API
+        : BLOCKRUN_API);
+  // Validated once here rather than per request: an unusable account URL should
+  // fail at startup, not on the first paid call.
+  const apiBase = authMode === "api-key" ? normalizeApiKeyBase(requestedApiBase) : requestedApiBase;
+  if (authMode === "api-key") {
+    console.log(`[ClawRouter] Auth: BlockRun API key ${maskApiKey(apiKey!)} (${apiBase})`);
+    console.log(`[ClawRouter] Billing: account credit — top up at ${PORTAL_CREDITS_URL}`);
+    // `clawrouter policy` limits are enforced in the x402 pre-sign hook, which
+    // does not exist here — there is no signature to refuse. Say so at startup
+    // rather than letting an operator believe a cap they configured is live.
+    // `maxCostPerRun` is unaffected: it is enforced by the router, not the signer.
+    warnIfSpendLimitsUnenforced(options.spendControl);
+  } else if (paymentChain === "solana" && !solanaPrivateKeyBytes) {
     console.warn(
       `[ClawRouter] ⚠ Payment chain is Solana but no mnemonic found — falling back to Base (EVM).`,
     );
@@ -1916,41 +2702,56 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     console.warn(`[ClawRouter]   or run "npx @blockrun/clawrouter chain base" to switch to EVM.`);
   } else if (paymentChain === "solana") {
     console.log(`[ClawRouter] Payment chain: Solana (${BLOCKRUN_SOLANA_API})`);
+  } else {
+    // Base said nothing, so the one rail that never announced itself was also
+    // the default. Three rails, three gateways — each should say which.
+    console.log(`[ClawRouter] Payment chain: Base (${apiBase})`);
   }
+
+  // Learn which models THIS chain's gateway serves, so the free cascade can skip
+  // rungs it does not carry (the two gateways do not share a free tier). Kicked
+  // off without awaiting: startup must not block on it, and until it resolves
+  // every rung stays eligible, which is the old behaviour.
+  void loadGatewayCatalog(apiBase, apiKey);
 
   // Determine port: options.port > env var > default
   const listenPort = options.port ?? getProxyPort();
 
   // Check if a proxy is already running on this port
-  const existingProxy = await checkExistingProxy(listenPort);
+  const existingProxy =
+    options.allowExistingProxy === false ? undefined : await checkExistingProxy(listenPort);
+  const ourApiKeyLabel = apiKey ? maskApiKey(apiKey) : undefined;
   if (existingProxy) {
     // Proxy already running — reuse it instead of failing with EADDRINUSE
-    const account = privateKeyToAccount(walletKey as `0x${string}`);
     const baseUrl = `http://127.0.0.1:${listenPort}`;
+
+    assertExistingProxyBillsUs(existingProxy, {
+      listenPort,
+      authMode,
+      apiKeyLabel: ourApiKeyLabel,
+      paymentChain,
+    });
+
+    if (authMode === "api-key") {
+      options.onReady?.(listenPort);
+      return {
+        port: listenPort,
+        baseUrl,
+        walletAddress: "",
+        authMode,
+        apiKeyLabel: ourApiKeyLabel!,
+        balanceMonitor: new ApiKeyBalanceMonitor(),
+        // No-op: we didn't start this proxy, so we shouldn't close it
+        close: async () => {},
+      };
+    }
+
+    const account = privateKeyToAccount(walletKey as `0x${string}`);
 
     // Verify the existing proxy is using the same wallet (or warn if different)
     if (existingProxy.wallet !== account.address) {
       console.warn(
         `[ClawRouter] Existing proxy on port ${listenPort} uses wallet ${existingProxy.wallet}, but current config uses ${account.address}. Reusing existing proxy.`,
-      );
-    }
-
-    // Verify the existing proxy is using the same payment chain
-    if (existingProxy.paymentChain) {
-      if (existingProxy.paymentChain !== paymentChain) {
-        throw new Error(
-          `Existing proxy on port ${listenPort} is using ${existingProxy.paymentChain} but ${paymentChain} was requested. ` +
-            `Stop the existing proxy first or use a different port.`,
-        );
-      }
-    } else if (paymentChain !== "base") {
-      // Old proxy doesn't report chain — assume Base. Reject if Solana was requested.
-      console.warn(
-        `[ClawRouter] Existing proxy on port ${listenPort} does not report paymentChain (pre-v0.11 instance). Assuming Base.`,
-      );
-      throw new Error(
-        `Existing proxy on port ${listenPort} is a pre-v0.11 instance (assumed Base) but ${paymentChain} was requested. ` +
-          `Stop the existing proxy first or use a different port.`,
       );
     }
 
@@ -1978,6 +2779,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       baseUrl,
       walletAddress: existingProxy.wallet,
       solanaAddress: reuseSolanaAddress,
+      authMode,
       balanceMonitor,
       close: async () => {
         // No-op: we didn't start this proxy, so we shouldn't close it
@@ -1985,25 +2787,58 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     };
   }
 
-  // Create x402 payment client with EVM scheme (always available)
-  const account = privateKeyToAccount(walletKey as `0x${string}`);
-  const evmPublicClient = createPublicClient({ chain: base, transport: http() });
-  const evmSigner = toClientEvmSigner(account, evmPublicClient);
-  const x402 = new x402Client();
-  registerExactEvmScheme(x402, { signer: evmSigner });
+  // In API-key mode there is nothing to sign: no EVM account, no x402 client,
+  // no spend policy hook (the policy it enforces is "which counterparty may I
+  // pay", and we pay no one — the gateway bills the account server-side).
+  // `account` stays undefined and every wallet-shaped field reads off it.
+  const account = walletKey ? privateKeyToAccount(walletKey as `0x${string}`) : undefined;
+  const x402 = authMode === "wallet" ? new x402Client() : undefined;
+  if (x402 && account) {
+    const evmPublicClient = createPublicClient({ chain: base, transport: http() });
+    const evmSigner = toClientEvmSigner(account, evmPublicClient);
+    const spendControl = options.spendControl ?? getSharedSpendControl();
+    registerSpendPolicyHook(x402, spendControl);
+    // Opt-in only (TWZRD_AUTO_GATE=1). Default off — does not replace SpendControl.
+    await maybeComposeTwzrdAutoGate(x402);
+    registerExactEvmScheme(x402, { signer: evmSigner });
+  }
 
   // Register Solana scheme if key is available
   // Uses registerExactSvmScheme helper which registers:
   //   - solana:* wildcard (catches any CAIP-2 Solana network)
   //   - V1 compat names: "solana", "solana-devnet", "solana-testnet"
   let solanaAddress: string | undefined;
-  if (solanaPrivateKeyBytes) {
+  if (x402 && solanaPrivateKeyBytes) {
     const { registerExactSvmScheme } = await import("@x402/svm/exact/client");
     const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
     const solanaSigner = await createKeyPairSignerFromPrivateKeyBytes(solanaPrivateKeyBytes);
     solanaAddress = solanaSigner.address;
+    // Unlike EIP-3009 on Base, signing a Solana payment is NOT purely local:
+    // the exact-SVM client reads the payment asset's mint account over RPC
+    // before it can build the transfer, and with no `rpcUrl` it uses the
+    // library default (api.mainnet-beta.solana.com). A host that cannot reach
+    // that endpoint — blocked egress, or the public node refusing its IP —
+    // fails EVERY paid Solana call with a bare "fetch failed" while the gateway
+    // itself answers fine (ClawRouter-Hermes#38). Honour the same override the
+    // balance monitor takes, so such a host can sign against its own RPC.
+    const solanaRpcUrl = process["env"].CLAWROUTER_SOLANA_RPC_URL;
     registerExactSvmScheme(x402, { signer: solanaSigner });
+    if (solanaRpcUrl) {
+      // registerExactSvmScheme builds its schemes from the signer alone and
+      // takes no RPC, so the override has to be applied by re-registering the
+      // same keys with rpc-aware instances — a later register wins for a given
+      // version+network+scheme. Everything else the helper set up stays.
+      const { ExactSvmScheme } = await import("@x402/svm/exact/client");
+      const { ExactSvmSchemeV1, NETWORKS: SVM_V1_NETWORKS } = await import("@x402/svm/v1");
+      x402.register("solana:*", new ExactSvmScheme(solanaSigner, { rpcUrl: solanaRpcUrl }));
+      for (const network of SVM_V1_NETWORKS) {
+        x402.registerV1(network, new ExactSvmSchemeV1(solanaSigner, { rpcUrl: solanaRpcUrl }));
+      }
+    }
     console.log(`[ClawRouter] Solana wallet: ${solanaAddress}`);
+    if (solanaRpcUrl) {
+      console.log(`[ClawRouter] Solana RPC (payment signing + balance): ${solanaRpcUrl}`);
+    }
   }
 
   // Stamp BlockRun's builder-code service code (`s`) onto every signed EVM
@@ -2016,7 +2851,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   // Gated to EVM (`eip155:*`): builder-code / ERC-8021 is Ethereum-only, so
   // stamping it onto Solana (`solana:*`) payloads would attach a field the SVM
   // facilitator never expects — a no-op at best, a settlement risk at worst.
-  x402.onAfterPaymentCreation(async (context) => {
+  x402?.onAfterPaymentCreation(async (context) => {
     if (!context.selectedRequirements.network.startsWith("eip155")) return;
     const payload = context.paymentPayload as {
       extensions?: Record<string, unknown>;
@@ -2025,7 +2860,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   });
 
   // Log which chain is used for each payment and capture actual payment amount
-  x402.onAfterPaymentCreation(async (context) => {
+  x402?.onAfterPaymentCreation(async (context) => {
     const network = context.selectedRequirements.network;
     const chain = network.startsWith("eip155")
       ? "Base (EVM)"
@@ -2041,23 +2876,50 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     console.log(`[ClawRouter] Payment signed on ${chain} (${network}) — $${amountUsd.toFixed(6)}`);
   });
 
-  const payFetch = createPayFetchWithPreAuth(fetch, x402, undefined, {
-    skipPreAuth: paymentChain === "solana",
-    // Per-request cost estimate so pre-auth is only reused when the cached
-    // payment still covers the (possibly larger) request — BlockRun prices per
-    // token, so one model can cost different amounts across requests.
-    estimateAmount,
-  });
+  // The upstream fetch. Same signature on both rails, which is what lets every
+  // handler below stay unaware of how the call is being paid for: one settles a
+  // 402 by signing USDC, the other never sees a 402 because the bearer token
+  // was already good for the request (or was not, and the gateway says so).
+  //
+  // The key rail's wrapper is where its spend windows live. On the wallet rail
+  // the same windows are enforced inside the signer (`registerSpendPolicyHook`
+  // above); there is no signer here, so they move to the only other place every
+  // paid call on this rail passes through (#329).
+  const payFetch =
+    authMode === "api-key"
+      ? withSpendPolicy(
+          createApiKeyFetch(apiKey!, fetch, apiBase),
+          options.spendControl ?? getSharedSpendControl(),
+          () => {
+            const store = paymentStore.getStore();
+            const published = store?.estimatedUsd;
+            if (store) store.estimatedUsd = undefined; // consume: polls are not billable
+            return published;
+          },
+        )
+      : createPayFetchWithPreAuth(fetch, x402!, undefined, {
+          skipPreAuth: paymentChain === "solana",
+          // Per-request cost estimate so pre-auth is only reused when the cached
+          // payment still covers the (possibly larger) request — BlockRun prices per
+          // token, so one model can cost different amounts across requests.
+          estimateAmount,
+          // Only the wallet rail settles per call. The API-key rail is billed
+          // server-side against account credit, so there is no per-request
+          // settlement for an observer to report.
+          onPayment: options.onPayment,
+        });
 
   // Create balance monitor for pre-request checks (lazy import to avoid loading @solana/kit on Base chain)
   let balanceMonitor: AnyBalanceMonitor;
   if (options._balanceMonitorOverride) {
     balanceMonitor = options._balanceMonitorOverride;
+  } else if (authMode === "api-key") {
+    balanceMonitor = new ApiKeyBalanceMonitor();
   } else if (paymentChain === "solana" && solanaAddress) {
     const { SolanaBalanceMonitor } = await import("./solana-balance.js");
     balanceMonitor = new SolanaBalanceMonitor(solanaAddress);
   } else {
-    balanceMonitor = new BalanceMonitor(account.address);
+    balanceMonitor = new BalanceMonitor(account!.address);
   }
 
   // Build router options (100% local — no external API calls for routing)
@@ -2066,6 +2928,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const routerOpts: RouterOptions = {
     config: routingConfig,
     modelPricing,
+    modelCapabilities: buildModelCapabilities(),
   };
 
   // Request deduplicator (shared across all requests)
@@ -2120,28 +2983,90 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
 
         const response: Record<string, unknown> = {
           status: "ok",
-          wallet: account.address,
-          paymentChain,
+          authMode,
         };
-        if (solanaAddress) {
-          response.solana = solanaAddress;
+        if (authMode === "api-key") {
+          // No wallet, no chain, and deliberately no full key: /health is
+          // unauthenticated on localhost and a bearer token is not a status field.
+          response.apiKey = maskApiKey(apiKey!);
+          response.gateway = apiBase;
+        } else {
+          response.wallet = account!.address;
+          response.paymentChain = paymentChain;
+          // Name the gateway on the wallet rails too. It was reported only in
+          // API-key mode, so a wallet user could not tell from /health whether
+          // they were pointed at blockrun.ai or sol.blockrun.ai — the single
+          // most useful fact when a paid call fails, and the one missing from
+          // every report that took a round trip to diagnose.
+          response.gateway = apiBase;
+          if (solanaAddress) {
+            response.solana = solanaAddress;
+          }
         }
         if (upstreamProxy) {
           response.upstreamProxy = upstreamProxy;
         }
 
         if (full) {
+          // Time-bound the RPC: `catch` alone covers a rejection but not a
+          // hang, and health is the one endpoint that must always answer.
           try {
-            const balanceInfo = await balanceMonitor.checkBalance();
-            response.balance = balanceInfo.balanceUSD;
-            response.isLow = balanceInfo.isLow;
-            response.isEmpty = balanceInfo.isEmpty;
+            const balanceInfo = await Promise.race([
+              balanceMonitor.checkBalance(),
+              new Promise<never>((_, reject) =>
+                setTimeout(
+                  () => reject(new Error("balance check timed out")),
+                  BALANCE_CHECK_TIMEOUT_MS,
+                ).unref(),
+              ),
+            ]);
+            if (authMode === "api-key") {
+              // The gateway now publishes a key-readable credit position at
+              // GET /v1/credits, so this no longer has to report `null`. Note
+              // `remaining` is legitimately null on an ungated account (no
+              // granted allowance to draw down) — that is not a failure, and a
+              // consumer must not render it as $0.00. An unreachable gateway
+              // leaves every field null and health still answers.
+              const credit = await fetchCreditBalance(apiKey!, BALANCE_CHECK_TIMEOUT_MS);
+              response.balance = credit?.remainingUsd ?? null;
+              response.creditSpent = credit?.spentUsd ?? null;
+              response.creditGranted = credit?.grantedUsd ?? null;
+              response.billingMode = credit?.billingMode ?? null;
+              response.creditSummary = credit ? formatCreditBalance(credit) : null;
+              response.blocked = credit?.blocked ?? false;
+              if (credit?.blockedReason) response.blockedReason = credit.blockedReason;
+              response.isEmpty = credit?.remainingUsd !== null && (credit?.remainingUsd ?? 1) <= 0;
+              response.billing = "BlockRun account credit";
+              response.topUpUrl = PORTAL_CREDITS_URL;
+            } else {
+              response.balance = balanceInfo.balanceUSD;
+              response.isLow = balanceInfo.isLow;
+              response.isEmpty = balanceInfo.isEmpty;
+            }
           } catch {
             response.balanceError = "Could not fetch balance";
           }
         }
 
-        res.writeHead(200, { "Content-Type": "application/json" });
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        };
+        const challengeValue = req.headers["x-clawrouter-challenge"];
+        const challenge = Array.isArray(challengeValue) ? challengeValue[0] : challengeValue;
+        if (challenge && /^[a-f0-9]{64}$/i.test(challenge)) {
+          try {
+            const token = readFileSync(DESKTOP_SERVICE_TOKEN_FILE, "utf8").trim();
+            if (/^[a-f0-9]{64}$/i.test(token)) {
+              headers["X-ClawRouter-Proof"] = createHmac("sha256", token)
+                .update(challenge)
+                .digest("hex");
+            }
+          } catch {
+            // Desktop identity proof is optional for ordinary health clients.
+          }
+        }
+        res.writeHead(200, headers);
         res.end(JSON.stringify(response));
         return;
       }
@@ -2178,8 +3103,8 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       if (req.url === "/stats" || req.url?.startsWith("/stats?")) {
         try {
           const url = new URL(req.url, "http://localhost");
-          const days = parseInt(url.searchParams.get("days") || "7", 10);
-          const stats = await getStats(Math.min(days, 30));
+          const days = resolveStatsDays(url.searchParams.get("days"));
+          const stats = await getStats(days);
 
           res.writeHead(200, {
             "Content-Type": "application/json",
@@ -2435,7 +3360,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
         let imgCost = 0;
         try {
           const parsed = JSON.parse(reqBody.toString());
-          imgModel = parsed.model || "openai/dall-e-3";
+          imgModel = parsed.model || "google/nano-banana";
           const n = parsed.n || 1;
           imgCost = estimateImageCost(imgModel, parsed.size, n);
         } catch {
@@ -2445,6 +3370,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           // Step 1: submit job. Fast models return 200 + image data inline within
           // BlockRun's 30s window. Slow models (e.g. openai/gpt-image-2) return
           // 202 + { id, poll_url } and we poll below — same pattern as video.
+          publishDispatchCost(imgCost);
           const upstream = await payFetch(`${apiBase}/v1/images/generations`, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": USER_AGENT },
@@ -2570,7 +3496,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
                 console.log(`[ClawRouter] Image saved → ${img.url}`);
               } else if (img.url?.startsWith("https://") || img.url?.startsWith("http://")) {
                 try {
-                  const imgResp = await fetch(img.url);
+                  const imgResp = await fetch(img.url, { signal: clientAbort.signal });
                   if (imgResp.ok) {
                     const contentType = imgResp.headers.get("content-type") ?? "image/png";
                     const ext =
@@ -2594,9 +3520,15 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
             }
           }
           // Log image generation usage with actual x402 payment (previously missing entirely)
-          const imgActualCost = paymentStore.getStore()?.amountUsd ?? imgCost;
+          const imgActualCost = settledMediaCostUsd(
+            upstream,
+            result,
+            paymentStore.getStore()?.amountUsd,
+            imgCost,
+          );
           logUsage({
             timestamp: new Date().toISOString(),
+            ...(blockrunRequestId(upstream) ? { requestId: blockrunRequestId(upstream) } : {}),
             model: imgModel,
             tier: "IMAGE",
             cost: imgActualCost,
@@ -2622,6 +3554,13 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       // Accepts image as: data URI, local file path, ~/path, or HTTP(S) URL
       if (req.url === "/v1/images/image2image" && req.method === "POST") {
         const img2imgStartTime = Date.now();
+        // #251: mirror /v1/images/generations — if the client goes away, abort
+        // the upstream call so the x402 payment doesn't settle for a result
+        // nobody will receive.
+        const clientAbort = new AbortController();
+        res.on("close", () => {
+          if (!res.writableEnded) clientAbort.abort();
+        });
         const chunks: Buffer[] = [];
         for await (const chunk of req) {
           chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -2643,7 +3582,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
               // Already a data URI — pass through
             } else if (val.startsWith("https://") || val.startsWith("http://")) {
               // Download URL → data URI
-              const imgResp = await fetch(val);
+              const imgResp = await fetch(val, { signal: clientAbort.signal });
               if (!imgResp.ok)
                 throw new Error(`Failed to download ${field} from ${val}: HTTP ${imgResp.status}`);
               const contentType = imgResp.headers.get("content-type") ?? "image/png";
@@ -2664,6 +3603,9 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           img2imgCost = estimateImageCost(img2imgModel, parsed.size, parsed.n || 1);
           reqBody = JSON.stringify(parsed);
         } catch (parseErr) {
+          // #277: an aborted source/mask download rejects here — the client is
+          // gone, so don't misreport it as invalid input on a dead socket.
+          if (clientAbort.signal.aborted) return;
           const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Invalid request", details: msg }));
@@ -2671,11 +3613,19 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
         }
 
         try {
-          const upstream = await payFetch(`${apiBase}/v1/images/image2image`, {
+          publishDispatchCost(img2imgCost);
+          let upstream = await payFetch(`${apiBase}/v1/images/image2image`, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": USER_AGENT },
             body: reqBody,
+            signal: clientAbort.signal,
           });
+          // 202 + poll_url on the account rail: complete it here. The wallet
+          // path re-signs an x402 payment per poll; there is nothing to sign on a
+          // bearer token, so without this the caller gets a raw 202 it cannot use.
+          if (authMode === "api-key") {
+            upstream = await pollApiKeyJob(upstream, payFetch, apiBase, clientAbort.signal);
+          }
           const text = await upstream.text();
           if (!upstream.ok) {
             res.writeHead(upstream.status, { "Content-Type": "application/json" });
@@ -2706,7 +3656,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
                 console.log(`[ClawRouter] Image saved → ${img.url}`);
               } else if (img.url?.startsWith("https://") || img.url?.startsWith("http://")) {
                 try {
-                  const imgResp = await fetch(img.url);
+                  const imgResp = await fetch(img.url, { signal: clientAbort.signal });
                   if (imgResp.ok) {
                     const contentType = imgResp.headers.get("content-type") ?? "image/png";
                     const ext =
@@ -2730,9 +3680,15 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
             }
           }
           // Log image editing usage with actual x402 payment (previously missing entirely)
-          const img2imgActualCost = paymentStore.getStore()?.amountUsd ?? img2imgCost;
+          const img2imgActualCost = settledMediaCostUsd(
+            upstream,
+            result,
+            paymentStore.getStore()?.amountUsd,
+            img2imgCost,
+          );
           logUsage({
             timestamp: new Date().toISOString(),
+            ...(blockrunRequestId(upstream) ? { requestId: blockrunRequestId(upstream) } : {}),
             model: img2imgModel,
             tier: "IMAGE",
             cost: img2imgActualCost,
@@ -2743,6 +3699,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
         } catch (err) {
+          if (clientAbort.signal.aborted) return; // client gone — nothing to report
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] Image editing error: ${msg}`);
           if (!res.headersSent) {
@@ -2756,6 +3713,12 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       // --- Handle /v1/audio/generations: proxy with x402 payment + save audio locally ---
       if (req.url === "/v1/audio/generations" && req.method === "POST") {
         const audioStartTime = Date.now();
+        // Same class as #251: abort the paid upstream call if the client goes
+        // away so the x402 payment doesn't settle for audio nobody receives.
+        const clientAbort = new AbortController();
+        res.on("close", () => {
+          if (!res.writableEnded) clientAbort.abort();
+        });
         const chunks: Buffer[] = [];
         for await (const chunk of req) {
           chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -2769,11 +3732,19 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           /* use defaults */
         }
         try {
-          const upstream = await payFetch(`${apiBase}/v1/audio/generations`, {
+          publishDispatchCost(0.15);
+          let upstream = await payFetch(`${apiBase}/v1/audio/generations`, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": USER_AGENT },
             body: reqBody,
+            signal: clientAbort.signal,
           });
+          // 202 + poll_url on the account rail: complete it here. The wallet
+          // path re-signs an x402 payment per poll; there is nothing to sign on a
+          // bearer token, so without this the caller gets a raw 202 it cannot use.
+          if (authMode === "api-key") {
+            upstream = await pollApiKeyJob(upstream, payFetch, apiBase, clientAbort.signal);
+          }
           const text = await upstream.text();
           if (!upstream.ok) {
             res.writeHead(upstream.status, { "Content-Type": "application/json" });
@@ -2799,7 +3770,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
             for (const track of result.data) {
               if (track.url?.startsWith("https://") || track.url?.startsWith("http://")) {
                 try {
-                  const audioResp = await fetch(track.url);
+                  const audioResp = await fetch(track.url, { signal: clientAbort.signal });
                   if (audioResp.ok) {
                     const contentType = audioResp.headers.get("content-type") ?? "audio/mpeg";
                     const ext = contentType.includes("wav") ? "wav" : "mp3";
@@ -2817,9 +3788,15 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
               }
             }
           }
-          const audioActualCost = paymentStore.getStore()?.amountUsd ?? 0.15;
+          const audioActualCost = settledMediaCostUsd(
+            upstream,
+            result,
+            paymentStore.getStore()?.amountUsd,
+            0.15,
+          );
           logUsage({
             timestamp: new Date().toISOString(),
+            ...(blockrunRequestId(upstream) ? { requestId: blockrunRequestId(upstream) } : {}),
             model: audioModel,
             tier: "AUDIO",
             cost: audioActualCost,
@@ -2830,6 +3807,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
         } catch (err) {
+          if (clientAbort.signal.aborted) return; // client gone — nothing to report
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] Audio generation error: ${msg}`);
           if (!res.headersSent) {
@@ -2874,6 +3852,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
         }
         try {
           // Step 1: submit job. Server returns 202 with poll_url.
+          publishDispatchCost(estimateVideoCost(videoModel, videoDuration, videoHasImageInput));
           const submitResp = await payFetch(`${apiBase}/v1/videos/generations`, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": USER_AGENT },
@@ -2997,7 +3976,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
             for (const clip of finalResult.data) {
               if (clip.url?.startsWith("https://") || clip.url?.startsWith("http://")) {
                 try {
-                  const videoResp = await fetch(clip.url);
+                  const videoResp = await fetch(clip.url, { signal: clientAbort.signal });
                   if (videoResp.ok) {
                     const contentType = videoResp.headers.get("content-type") ?? "video/mp4";
                     const ext = contentType.includes("webm")
@@ -3019,9 +3998,12 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
               }
             }
           }
-          const videoActualCost =
-            paymentStore.getStore()?.amountUsd ??
-            estimateVideoCost(videoModel, videoDuration, videoHasImageInput);
+          const videoActualCost = settledMediaCostUsd(
+            undefined,
+            submitResult,
+            paymentStore.getStore()?.amountUsd,
+            estimateVideoCost(videoModel, videoDuration, videoHasImageInput),
+          );
           logUsage({
             timestamp: new Date().toISOString(),
             model: videoModel,
@@ -3051,7 +4033,30 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       // /v1/voice/* (Bland.ai outbound AI voice calls),
       // /v1/surf/* (Surf unified crypto data API: 84 endpoints across CEX/DEX,
       //   on-chain SQL, wallet intelligence, prediction markets, social, news)) ---
+      // Gateway endpoints that carry no `model` we route on, and so must be
+      // forwarded verbatim rather than fed to the chat path:
+      //   /v1/messages       — the Anthropic-shaped chat surface
+      //   /v1/audio/speech   — ElevenLabs/Seed TTS (distinct from the
+      //                        /v1/audio/generations music route handled above)
+      // Without this they fall through to proxyRequest, where `modelsToTry` is
+      // `modelId ? [modelId] : []` — empty, because neither body carries a model
+      // this proxy routes on. The attempt loop then never issues an upstream
+      // request at all and the caller gets a 502 "All models in fallback chain
+      // failed" for an endpoint the gateway serves perfectly well. Both are
+      // verified live against api.blockrun.ai and blockrun.ai/api.
+      //
+      // Note the passthrough buffers the response before writing it, so an SSE
+      // stream arrives complete rather than incrementally. That is correct but
+      // not incremental; smart routing, sessions and the response cache do not
+      // apply on these paths either.
+      const isVerbatimGatewayPath =
+        req.url === "/v1/messages" ||
+        (req.url?.startsWith("/v1/messages?") ?? false) ||
+        req.url === "/v1/audio/speech" ||
+        (req.url?.startsWith("/v1/audio/speech?") ?? false);
+
       if (
+        isVerbatimGatewayPath ||
         req.url?.match(
           /^\/v1\/(?:partner|pm|exa|modal|stocks|usstock|crypto|fx|commodity|phone|voice|surf)\//,
         )
@@ -3063,6 +4068,8 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
             apiBase,
             payFetch,
             () => paymentStore.getStore()?.amountUsd ?? 0,
+            false,
+            authMode,
           );
         } catch (err) {
           const error = err instanceof Error ? err : new Error(String(err));
@@ -3087,6 +4094,73 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       if (!req.url?.startsWith("/v1")) {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Not found" }));
+        return;
+      }
+
+      // Account rail: forward everything that is not chat straight through.
+      //
+      // Placed AFTER the specialised routes above on purpose — images, videos,
+      // audio/generations, /v1/models and the partner prefixes keep their own
+      // polling, local-download and pricing behaviour. What reaches here is the
+      // long tail of account services, which have no `model` to route on and
+      // whose native payload, status and SSE contract should survive untouched.
+      // Chat and /v1/messages are excluded so smart routing still applies to
+      // them.
+      if (
+        authMode === "api-key" &&
+        /^\/v1\//.test(req.url ?? "") &&
+        !/^\/v1\/(?:chat\/completions|messages)(?:\?|$)/.test(req.url ?? "")
+      ) {
+        try {
+          await proxyPaidApiRequest(
+            req,
+            res,
+            apiBase,
+            payFetch,
+            () => paymentStore.getStore()?.amountUsd ?? 0,
+            true,
+            authMode,
+          );
+        } catch (err) {
+          const error = err instanceof Error ? err : new Error(String(err));
+          options.onError?.(error);
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: { message: `Account API error: ${error.message}`, type: "account_error" },
+              }),
+            );
+          } else if (!res.writableEnded) {
+            res.end();
+          }
+        }
+        return;
+      }
+
+      // Everything still here is handed to proxyRequest, which is the chat
+      // path: it routes on the body's `model`, and its attempt loop is keyed on
+      // that model. A /v1 path with no model reaches the loop with nothing to
+      // try, issues no upstream request, and returns 502 "All models in
+      // fallback chain failed" — an answer that blames the model catalog for
+      // what is really an unrouted URL, and sends people debugging the wrong
+      // thing. Say what actually happened instead.
+      if (!req.url.includes("/chat/completions")) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: {
+              message:
+                `ClawRouter does not proxy ${req.url}. It serves /v1/chat/completions, /v1/messages, ` +
+                `/v1/models, /v1/images/generations, /v1/images/image2image, /v1/videos/generations, ` +
+                `/v1/audio/generations, /v1/audio/speech, and the partner prefixes /v1/{partner,pm,exa,` +
+                `modal,stocks,usstock,crypto,fx,commodity,phone,voice,surf}/. ` +
+                `If BlockRun serves this endpoint, call it directly against the gateway.`,
+              type: "invalid_request_error",
+              code: "unsupported_endpoint",
+            },
+          }),
+        );
         return;
       }
 
@@ -3159,16 +4233,20 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
         server.removeListener("error", onError);
 
         if (err.code === "EADDRINUSE") {
+          if (options.allowExistingProxy === false) {
+            rejectAttempt(err);
+            return;
+          }
           // Port is in use - check if a proxy is actually running
           const existingProxy2 = await checkExistingProxy(listenPort);
           if (existingProxy2) {
             // Proxy is actually running - this is fine, reuse it
             console.log(`[ClawRouter] Existing proxy detected on port ${listenPort}, reusing`);
-            rejectAttempt({
-              code: "REUSE_EXISTING",
-              wallet: existingProxy2.wallet,
-              existingChain: existingProxy2.paymentChain,
-            });
+            // Carry the whole probe result, not just the wallet: the credential
+            // check below needs authMode and the key label too, and an API-key
+            // proxy publishes an EMPTY wallet — a truthiness test on that field
+            // dropped straight through to the generic error path.
+            rejectAttempt({ code: "REUSE_EXISTING", existing: existingProxy2 });
             return;
           }
 
@@ -3209,20 +4287,25 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     } catch (err: unknown) {
       const error = err as {
         code?: string;
-        wallet?: string;
-        existingChain?: string;
+        existing?: {
+          wallet: string;
+          paymentChain?: string;
+          authMode: AuthMode;
+          apiKeyLabel?: string;
+        };
         attempt?: number;
       };
 
-      if (error.code === "REUSE_EXISTING" && error.wallet) {
-        // Validate payment chain matches (same check as pre-listen reuse path)
-        if (error.existingChain && error.existingChain !== paymentChain) {
-          throw new Error(
-            `Existing proxy on port ${listenPort} is using ${error.existingChain} but ${paymentChain} was requested. ` +
-              `Stop the existing proxy first or use a different port.`,
-            { cause: err },
-          );
-        }
+      if (error.code === "REUSE_EXISTING" && error.existing) {
+        // Same credential rule as the pre-listen reuse path — auth mode, API
+        // key and chain must all match before this process attaches to someone
+        // else's payer.
+        assertExistingProxyBillsUs(error.existing, {
+          listenPort,
+          authMode,
+          apiKeyLabel: ourApiKeyLabel,
+          paymentChain,
+        });
 
         // Proxy is running, reuse it
         const baseUrl = `http://127.0.0.1:${listenPort}`;
@@ -3230,7 +4313,9 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
         return {
           port: listenPort,
           baseUrl,
-          walletAddress: error.wallet,
+          walletAddress: error.existing.wallet,
+          authMode,
+          ...(ourApiKeyLabel ? { apiKeyLabel: ourApiKeyLabel } : {}),
           balanceMonitor,
           close: async () => {
             // No-op: we didn't start this proxy, so we shouldn't close it
@@ -3309,8 +4394,10 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   return {
     port,
     baseUrl,
-    walletAddress: account.address,
+    walletAddress: account?.address ?? "",
     solanaAddress,
+    authMode,
+    ...(apiKey ? { apiKeyLabel: maskApiKey(apiKey) } : {}),
     balanceMonitor,
     close: () =>
       new Promise<void>((res, rej) => {
@@ -3344,6 +4431,15 @@ type ModelRequestResult = {
   errorStatus?: number;
   isProviderError?: boolean;
   errorCategory?: ErrorCategory; // Semantic error classification
+  /**
+   * The gateway's `x-blockrun-request-id` for the FAILED attempt.
+   *
+   * Without this a paid 5xx is undiagnosable from either side: the caller sees
+   * only "fetch failed" or "All models failed", and nobody can point the
+   * gateway at the request that broke (reported against the Solana rail,
+   * ClawRouter-Hermes#38). The id is the only handle the two sides share.
+   */
+  upstreamRequestId?: string;
 };
 
 /**
@@ -3467,6 +4563,7 @@ async function tryModelRequest(
         errorStatus: response.status,
         isProviderError: category !== null,
         errorCategory: category ?? undefined,
+        upstreamRequestId: blockrunRequestId(response),
       };
     }
 
@@ -3496,9 +4593,35 @@ async function tryModelRequest(
     return { success: true, response };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
+    if (err instanceof SpendPolicyError) {
+      // A local refusal, not an upstream fault. Retrying it walks every paid
+      // model in the chain (a wasted 402 round trip each) and then lands on a
+      // free model, returning HTTP 200 — so the caller never learns their
+      // spend policy blocked the payment. Stop the chain here and say so.
+      return {
+        success: false,
+        errorBody: JSON.stringify({
+          error: { message: errorMsg, type: "spend_policy_denied", status: 403 },
+        }),
+        errorStatus: 403,
+        isProviderError: false,
+        errorCategory: "payment_error",
+      };
+    }
+    // Name the connection that broke. undici collapses every network failure
+    // into "fetch failed", and on the Solana rail two very different faults
+    // wear that same string: the gateway being unreachable, and the Solana RPC
+    // that signs the payment being unreachable. Callers see only the body, so
+    // the distinction has to travel in it (ClawRouter-Hermes#38).
+    const networkMsg = describeFetchError(err);
+    const solanaSigningHint =
+      upstreamUrl.startsWith(BLOCKRUN_SOLANA_API) && networkMsg.startsWith("fetch failed")
+        ? " — on the Solana rail this may be the RPC that signs the payment rather than the gateway; if api.mainnet-beta.solana.com is unreachable from this host, set CLAWROUTER_SOLANA_RPC_URL to your own endpoint"
+        : "";
+    console.error(`[ClawRouter] ${modelId} network error: ${networkMsg}${solanaSigningHint}`);
     return {
       success: false,
-      errorBody: errorMsg,
+      errorBody: `${networkMsg}${solanaSigningHint}`,
       errorStatus: 500,
       isProviderError: true, // Network errors are retryable
     };
@@ -3549,18 +4672,33 @@ async function proxyRequest(
   // --- Smart routing ---
   let routingDecision: RoutingDecision | undefined;
   let hasTools = false; // true when request includes a tools schema
+  let requestTools: unknown; // the request's `tools` schema, for tool-aware textual recovery (#213)
   let hasVision = false; // true when request includes image_url content parts
   let isStreaming = false;
   let modelId = "";
-  let maxTokens = 4096;
+  let maxTokens = DEFAULT_MAX_TOKENS;
   let routingProfile: "eco" | "auto" | "premium" | null = null;
   let stickyExplicitModel: string | undefined;
+  let pendingShadowComparison:
+    | {
+        shadow: RoutingDecision;
+        hasTools: boolean;
+        hasVision: boolean;
+        requiresStructuredOutput: boolean;
+      }
+    | undefined;
   let balanceFallbackNotice: string | undefined;
   let budgetDowngradeNotice: string | undefined;
   let budgetDowngradeHeaderMode: "downgraded" | undefined;
   let accumulatedContent = ""; // For session journal event extraction
   let responseInputTokens: number | undefined;
   let responseOutputTokens: number | undefined;
+  /**
+   * The gateway's `x-blockrun-request-id` for whichever attempt actually
+   * answered. Captured here rather than read at logging time because `upstream`
+   * is scoped to the fallback loop and is gone by then. See UsageEntry.requestId.
+   */
+  let upstreamRequestId: string | undefined;
   let requestHadError = false; // Set to true when all models fail → used in logUsage
   let requestSummaryForStore = ""; // Truncated user prompt — captured for response-store entry
   const isChatCompletion = req.url?.includes("/chat/completions");
@@ -3575,7 +4713,7 @@ async function proxyRequest(
       const parsed = JSON.parse(body.toString()) as Record<string, unknown>;
       isStreaming = parsed.stream === true;
       modelId = (parsed.model as string) || "";
-      maxTokens = (parsed.max_tokens as number) || 4096;
+      maxTokens = resolveMaxTokens(parsed);
       let bodyModified = false;
 
       // Extract last user message content (used by session journal + /debug command)
@@ -3604,6 +4742,7 @@ async function proxyRequest(
       // Early tool detection for ALL request types (explicit model + routing profile).
       // The routing-profile branch may re-assign below (no-op since same value).
       hasTools = Array.isArray(parsed.tools) && (parsed.tools as unknown[]).length > 0;
+      requestTools = parsed.tools;
 
       // Preserve OpenClaw tool schemas exactly as provided.
       // Stripping tools like web_search/web_fetch/browser/exec makes the upstream
@@ -3784,7 +4923,7 @@ async function proxyRequest(
       if (imagegenMatch) {
         const imageArgs = lastContent.slice(imagegenMatch.length).trim();
 
-        // Parse optional flags: /cr-imagegen --model dall-e-3 --size 1792x1024 a cute cat
+        // Parse optional flags: /cr-imagegen --model gpt-image-2 --size 1536x1024 a cute cat
         let imageModel = "google/nano-banana";
         let imageSize = "1024x1024";
         let imagePrompt = imageArgs;
@@ -3793,21 +4932,13 @@ async function proxyRequest(
         const modelMatch = imageArgs.match(/--model\s+(\S+)/);
         if (modelMatch) {
           const raw = modelMatch[1];
-          // Resolve shorthand aliases
-          const IMAGE_MODEL_ALIASES: Record<string, string> = {
-            "dall-e-3": "openai/dall-e-3",
-            dalle3: "openai/dall-e-3",
-            dalle: "openai/dall-e-3",
-            "gpt-image": "openai/gpt-image-1",
-            "gpt-image-1": "openai/gpt-image-1",
-            flux: "black-forest/flux-1.1-pro",
-            "flux-pro": "black-forest/flux-1.1-pro",
-            banana: "google/nano-banana",
-            "nano-banana": "google/nano-banana",
-            "banana-pro": "google/nano-banana-pro",
-            "nano-banana-pro": "google/nano-banana-pro",
-          };
-          imageModel = IMAGE_MODEL_ALIASES[raw] ?? raw;
+          // Resolve shorthand aliases (module-scope map, pinned by tests).
+          // hasOwnProperty guard: a plain-object lookup would resolve prototype
+          // keys ("constructor", "toString") to functions, which JSON.stringify
+          // then drops — sending a model-less body upstream.
+          imageModel = Object.prototype.hasOwnProperty.call(IMAGE_MODEL_ALIASES, raw)
+            ? IMAGE_MODEL_ALIASES[raw]
+            : raw;
           imagePrompt = imagePrompt.replace(/--model\s+\S+/, "").trim();
         }
 
@@ -3828,14 +4959,18 @@ async function proxyRequest(
             "",
             "Models:",
             "  nano-banana       Google Gemini Flash — $0.05/image",
+            "  banana-2          Google Nano Banana 2 — $0.09/image",
             "  banana-pro        Google Gemini Pro — $0.10/image (up to 4K)",
-            "  dall-e-3          OpenAI DALL-E 3 — $0.04/image",
             "  gpt-image         OpenAI GPT Image 1 — $0.02/image",
-            "  flux              Black Forest Flux 1.1 Pro — $0.04/image",
+            "  gpt-image-2       OpenAI GPT Image 2 — $0.06/image",
+            "  seedream          ByteDance Seedream 5 Pro — $0.045/image",
+            "  grok-imagine      xAI Grok Imagine — $0.02/image",
+            "  grok-imagine-pro  xAI Grok Imagine Pro — $0.07/image",
+            "  cogview           Zhipu CogView-4 — $0.015/image",
             "",
             "Examples:",
             "  /cr-imagegen a cat wearing sunglasses",
-            "  /cr-imagegen --model dall-e-3 a futuristic city at sunset",
+            "  /cr-imagegen --model gpt-image-2 a futuristic city at sunset",
             "  /cr-imagegen --model banana-pro --size 2048x2048 mountain landscape",
             "",
             "Note: `/imagegen` is still accepted in chat for backward compatibility.",
@@ -3884,6 +5019,14 @@ async function proxyRequest(
         console.log(
           `[ClawRouter] /imagegen command → ${imageModel} (${imageSize}): ${imagePrompt.slice(0, 80)}...`,
         );
+        // Stop upstream work (especially the slow-model poll loop below,
+        // whose first `completed` poll settles the x402 payment) if the
+        // chat client goes away mid-generation. Declared outside the try so
+        // the catch below can tell a client abort from a real failure.
+        const imagegenAbort = new AbortController();
+        res.on("close", () => {
+          if (!res.writableEnded) imagegenAbort.abort();
+        });
         try {
           const imageUpstreamUrl = `${apiBase}/v1/images/generations`;
           const imageBody = JSON.stringify({
@@ -3892,20 +5035,99 @@ async function proxyRequest(
             size: imageSize,
             n: 1,
           });
+          publishDispatchCost(estimateImageCost(imageModel, imageSize, 1));
           const imageResponse = await payFetch(imageUpstreamUrl, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": USER_AGENT },
             body: imageBody,
+            signal: imagegenAbort.signal,
           });
 
-          const imageResult = (await imageResponse.json()) as {
+          type ImagegenResult = {
             created?: number;
             data?: Array<{ url?: string; revised_prompt?: string }>;
             error?: string | { message?: string };
+            id?: string;
+            poll_url?: string;
+            status?: string;
           };
+          let imageResult = (await imageResponse.json()) as ImagegenResult;
+          let imageFailure: string | undefined;
+
+          // Slow path — BlockRun returned 202 + poll_url (model exceeded the
+          // 30s inline window, e.g. openai/gpt-image-2). Response.ok is true
+          // for 202 and data[] is absent, so without this branch the paid job
+          // would surface as "returned no results". Mirrors the poll loop in
+          // the /v1/images/generations handler above.
+          if (
+            imageResponse.ok &&
+            imageResult.poll_url &&
+            imageResult.id &&
+            !imageResult.data?.length
+          ) {
+            const apiOrigin = new URL(apiBase).origin;
+            const pollUrl = imageResult.poll_url.startsWith("http")
+              ? imageResult.poll_url
+              : `${apiOrigin}${imageResult.poll_url}`;
+            console.log(
+              `[ClawRouter] /imagegen job submitted (id=${imageResult.id}), polling upstream — typical 30–120s...`,
+            );
+            // Poll every 3s, bail after ~5min total. Server auth window is 10min.
+            const pollDeadline = Date.now() + 300_000;
+            await new Promise((r) => setTimeout(r, 2_000));
+            let completed = false;
+            while (Date.now() < pollDeadline) {
+              if (imagegenAbort.signal.aborted) {
+                console.log(
+                  `[ClawRouter] Chat client disconnected — abandoning image poll (id=${imageResult.id})`,
+                );
+                return;
+              }
+              const pollResp = await payFetch(pollUrl, {
+                method: "GET",
+                headers: { "user-agent": USER_AGENT },
+                signal: imagegenAbort.signal,
+              });
+              const pollText = await pollResp.text();
+              let pollBody: ImagegenResult = {};
+              try {
+                pollBody = JSON.parse(pollText) as ImagegenResult;
+              } catch {
+                imageFailure = `Non-JSON poll response (${pollResp.status}): ${pollText.slice(0, 200)}`;
+                break;
+              }
+              if (
+                pollResp.status === 202 ||
+                pollBody.status === "queued" ||
+                pollBody.status === "in_progress"
+              ) {
+                await new Promise((r) => setTimeout(r, 3_000));
+                continue;
+              }
+              if (pollBody.status === "failed" || !pollResp.ok) {
+                imageFailure =
+                  typeof pollBody.error === "string"
+                    ? pollBody.error
+                    : ((pollBody.error as { message?: string })?.message ??
+                      `Upstream image generation failed (HTTP ${pollResp.status})`);
+                break;
+              }
+              // completed, or OK with an unrecognized shape — hand through.
+              imageResult = pollBody;
+              completed = true;
+              break;
+            }
+            if (!completed && !imageFailure) {
+              imageFailure =
+                "Image generation timed out after 5 minutes — the job may still complete upstream.";
+            }
+          }
 
           let responseText: string;
-          if (!imageResponse.ok || imageResult.error) {
+          if (imageFailure) {
+            responseText = `Image generation failed: ${imageFailure}`;
+            console.log(`[ClawRouter] /imagegen error: ${imageFailure}`);
+          } else if (!imageResponse.ok || imageResult.error) {
             const errMsg =
               typeof imageResult.error === "string"
                 ? imageResult.error
@@ -3929,9 +5151,7 @@ async function proxyRequest(
                       console.error(
                         `[ClawRouter] /imagegen: failed to upload data URI: ${uploadErr instanceof Error ? uploadErr.message : String(uploadErr)}`,
                       );
-                      lines.push(
-                        "Image generated but upload failed. Try again or use --model dall-e-3.",
-                      );
+                      lines.push("Image generated but upload failed. Try again.");
                     }
                   } else {
                     lines.push(img.url);
@@ -3944,10 +5164,17 @@ async function proxyRequest(
             }
             console.log(`[ClawRouter] /imagegen success: ${images.length} image(s) generated`);
             // Log /imagegen usage with actual x402 payment
-            const imagegenActualCost =
-              paymentStore.getStore()?.amountUsd ?? estimateImageCost(imageModel, imageSize, 1);
+            const imagegenActualCost = settledMediaCostUsd(
+              imageResponse,
+              imageResult,
+              paymentStore.getStore()?.amountUsd,
+              estimateImageCost(imageModel, imageSize, 1),
+            );
             logUsage({
               timestamp: new Date().toISOString(),
+              ...(blockrunRequestId(imageResponse)
+                ? { requestId: blockrunRequestId(imageResponse) }
+                : {}),
               model: imageModel,
               tier: "IMAGE",
               cost: imagegenActualCost,
@@ -3994,6 +5221,7 @@ async function proxyRequest(
             );
           }
         } catch (err) {
+          if (imagegenAbort.signal.aborted) return; // client gone — nothing to report
           const errMsg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] /imagegen error: ${errMsg}`);
           if (!res.headersSent) {
@@ -4123,6 +5351,12 @@ async function proxyRequest(
           `[ClawRouter] /img2img → ${img2imgModel} (${img2imgSize}): ${img2imgPrompt.slice(0, 80)}`,
         );
 
+        // Same class as #251: abort the paid upstream call if the chat
+        // client goes away, mirroring the /imagegen handler above.
+        const img2imgAbort = new AbortController();
+        res.on("close", () => {
+          if (!res.writableEnded) img2imgAbort.abort();
+        });
         try {
           const img2imgBody = JSON.stringify({
             model: img2imgModel,
@@ -4133,10 +5367,12 @@ async function proxyRequest(
             n: 1,
           });
 
+          publishDispatchCost(estimateImageCost(img2imgModel, img2imgSize, 1));
           const img2imgResponse = await payFetch(`${apiBase}/v1/images/image2image`, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": USER_AGENT },
             body: img2imgBody,
+            signal: img2imgAbort.signal,
           });
 
           const img2imgResult = (await img2imgResponse.json()) as {
@@ -4183,10 +5419,17 @@ async function proxyRequest(
             }
             console.log(`[ClawRouter] /img2img success: ${images.length} image(s)`);
             // Log /img2img usage with actual x402 payment
-            const img2imgActualCost2 =
-              paymentStore.getStore()?.amountUsd ?? estimateImageCost(img2imgModel, img2imgSize, 1);
+            const img2imgActualCost2 = settledMediaCostUsd(
+              img2imgResponse,
+              img2imgResult,
+              paymentStore.getStore()?.amountUsd,
+              estimateImageCost(img2imgModel, img2imgSize, 1),
+            );
             logUsage({
               timestamp: new Date().toISOString(),
+              ...(blockrunRequestId(img2imgResponse)
+                ? { requestId: blockrunRequestId(img2imgResponse) }
+                : {}),
               model: img2imgModel,
               tier: "IMAGE",
               cost: img2imgActualCost2,
@@ -4198,6 +5441,7 @@ async function proxyRequest(
 
           sendImg2ImgText(responseText);
         } catch (err) {
+          if (img2imgAbort.signal.aborted) return; // client gone — nothing to report
           const errMsg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] /img2img error: ${errMsg}`);
           if (!res.headersSent) {
@@ -4303,9 +5547,20 @@ async function proxyRequest(
           // Tool detection — when tools are present, force agentic tiers for reliable tool use
           const tools = parsed.tools as unknown[] | undefined;
           hasTools = Array.isArray(tools) && tools.length > 0;
+          const requiresTools =
+            hasTools && inferToolRequirement(prompt, systemPrompt, parsed.tool_choice);
+          const toolNames = (tools ?? [])
+            .map((tool) => {
+              if (typeof tool !== "object" || tool === null) return undefined;
+              const fn = (tool as { function?: unknown }).function;
+              if (typeof fn !== "object" || fn === null) return undefined;
+              const name = (fn as { name?: unknown }).name;
+              return typeof name === "string" ? name : undefined;
+            })
+            .filter((name): name is string => name !== undefined);
 
           if (hasTools && tools) {
-            console.log(`[ClawRouter] Tools detected (${tools.length}), forcing agentic tiers`);
+            console.log(`[ClawRouter] Tools detected (${tools.length}), required=${requiresTools}`);
           }
 
           // Vision detection: scan messages for image_url content parts
@@ -4324,7 +5579,41 @@ async function proxyRequest(
             ...routerOpts,
             routingProfile: routingProfile ?? undefined,
             hasTools,
+            toolCount: tools?.length ?? 0,
+            toolNames,
+            requiresTools,
+            hasVision,
+            requiresStructuredOutput:
+              typeof parsed.response_format === "object" && parsed.response_format !== null,
           });
+
+          // Shadow routing is deliberately local-only: compare metadata for a
+          // sampled request without changing the serving model or making a
+          // second paid upstream call.
+          const shadow = routerOpts.config.shadow;
+          const activeStrategy = routerOpts.config.strategy ?? "portfolio";
+          const shadowRate = Math.max(0, Math.min(1, shadow?.sampleRate ?? 1));
+          if (shadow && shadow.strategy !== activeStrategy && Math.random() < shadowRate) {
+            const requiresStructuredOutput =
+              typeof parsed.response_format === "object" && parsed.response_format !== null;
+            const shadowDecision = route(prompt, systemPrompt, maxTokens, {
+              ...routerOpts,
+              config: { ...routerOpts.config, strategy: shadow.strategy },
+              routingProfile: routingProfile ?? undefined,
+              hasTools,
+              toolCount: tools?.length ?? 0,
+              toolNames,
+              requiresTools,
+              hasVision,
+              requiresStructuredOutput,
+            });
+            pendingShadowComparison = {
+              shadow: shadowDecision,
+              hasTools,
+              hasVision,
+              requiresStructuredOutput,
+            };
+          }
 
           // Keep agentic routing when tools are present, even for SIMPLE queries.
           // Tool-using requests need models with reliable function-call support;
@@ -4477,6 +5766,21 @@ async function proxyRequest(
             }
           }
 
+          if (pendingShadowComparison) {
+            try {
+              options.onShadowRouted?.({
+                executed: routingDecision,
+                shadow: pendingShadowComparison.shadow,
+                sameModel: routingDecision.model === pendingShadowComparison.shadow.model,
+                hasTools: pendingShadowComparison.hasTools,
+                hasVision: pendingShadowComparison.hasVision,
+                requiresStructuredOutput: pendingShadowComparison.requiresStructuredOutput,
+              });
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              console.warn(`[ClawRouter] Shadow routing callback failed: ${message}`);
+            }
+          }
           options.onRouted?.(routingDecision);
         }
       }
@@ -4656,13 +5960,17 @@ async function proxyRequest(
 
   if (modelId && !options.skipBalanceCheck && !isFreeModel) {
     const estimated = estimateAmount(modelId, body.length, maxTokens);
+    const preflightEstimated = estimateBalancePreflightAmount(modelId, body.length, maxTokens);
     if (estimated) {
       estimatedCostMicros = BigInt(estimated);
+    }
+    if (preflightEstimated) {
+      const preflightEstimatedCostMicros = BigInt(preflightEstimated);
 
       // Apply extra buffer for balance check to prevent x402 failures after streaming starts.
       // This is aggressive to avoid triggering OpenClaw's 5-24 hour billing cooldown.
       const bufferedCostMicros =
-        (estimatedCostMicros * BigInt(Math.ceil(BALANCE_CHECK_BUFFER * 100))) / 100n;
+        (preflightEstimatedCostMicros * BigInt(Math.ceil(BALANCE_CHECK_BUFFER * 100))) / 100n;
 
       // Check balance before proceeding (using buffered amount)
       // Wrap in try/catch: Solana RPC failures (timeouts, rate limits) should
@@ -4703,6 +6011,7 @@ async function proxyRequest(
         );
         modelId = freeFallback;
         isFreeModel = true; // keep in sync — budget logic gates on !isFreeModel
+        estimatedCostMicros = undefined;
         // Update the body with new model (map free/ → nvidia/ for upstream)
         const parsed = JSON.parse(body.toString()) as Record<string, unknown>;
         parsed.model = toUpstreamModelId(freeFallback);
@@ -4935,13 +6244,31 @@ async function proxyRequest(
   // Abort in-flight upstream requests when the client disconnects.
   // OpenClaw 2026.4.7+ aborts gateway requests on client disconnect;
   // without this, ClawRouter would leave orphan upstream fetches running.
+  // Must hang off `res` "close", not `req`: on Node (verified on v24.15.0) an
+  // IncomingMessage emits "close" when the request-body readable finishes, not
+  // when the client hangs up. The body is fully drained above, so a `req`
+  // listener would fire at body-end (or never, having missed the event) rather
+  // than on disconnect. The media handlers all use `res.on("close")` for this.
+  // True once the client is gone: the response socket is destroyed without us
+  // having finished it. Used to tell a client disconnect apart from the global
+  // timeout — both surface as `globalController.signal.aborted`.
+  const clientDisconnected = () => res.destroyed && !res.writableEnded;
+  const abortError = () =>
+    clientDisconnected()
+      ? new ClientDisconnectedError()
+      : new Error(`Request timed out after ${timeoutMs}ms`);
   const onClientClose = () => {
-    if (!globalController.signal.aborted) {
+    if (!res.writableEnded && !globalController.signal.aborted) {
       console.log(`[ClawRouter] Client disconnected — aborting upstream request`);
       globalController.abort();
     }
   };
-  req.on("close", onClientClose);
+  res.on("close", onClientClose);
+  // The body was drained ~1,500 lines above and several awaits ran since
+  // (context compression, the balance check). If the client hung up in that
+  // window, `res` "close" has already fired and the listener above will never
+  // run — check the socket state now so that disconnect still aborts.
+  if (res.destroyed) onClientClose();
 
   try {
     // --- Build fallback chain ---
@@ -4972,18 +6299,53 @@ async function proxyRequest(
       // Use tier configs from the routing decision (set by RouterStrategy)
       const tierConfigs = routingDecision.tierConfigs ?? routerOpts.config.tiers;
 
-      // Get full chain first, then filter by context
-      const fullChain = prependStickyExplicitModel(
-        getFallbackChain(routingDecision.tier, tierConfigs),
+      // Portfolio decisions carry a capability-ranked candidate order. Legacy
+      // rules decisions retain the established tier chain. Always put the
+      // actual serving decision first so a session pin remains sticky.
+      const rankedCandidates =
+        routingDecision.candidates ?? getFallbackChain(routingDecision.tier, tierConfigs);
+      const selectedModel = routingDecision.model;
+      const fullChain = prependStickyExplicitModel([
+        selectedModel,
+        ...rankedCandidates.filter((model) => model !== selectedModel),
+      ]);
+      const contextFiltered = filterCandidatesByCapacity(
+        fullChain,
+        estimatedInputTokens,
+        maxTokens,
+        (modelId) => {
+          const model = BLOCKRUN_MODEL_BY_ID.get(modelId);
+          return model
+            ? { contextWindow: model.contextWindow, maxOutput: model.maxOutput }
+            : undefined;
+        },
       );
-      const contextFiltered = prependStickyExplicitModel(
-        getFallbackChainFiltered(
-          routingDecision.tier,
-          tierConfigs,
-          estimatedTotalTokens,
-          getModelContextWindow,
-        ),
-      );
+
+      if (contextFiltered.length === 0) {
+        const errPayload = JSON.stringify({
+          error: {
+            message: `No routed model can satisfy the requested context and output capacity (~${estimatedTotalTokens} tokens). Reduce the input or max_tokens and retry.`,
+            type: "invalid_request_error",
+            code: "context_capacity_exceeded",
+          },
+        });
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval);
+          heartbeatInterval = undefined;
+        }
+        if (headersSentEarly) {
+          safeWrite(res, `data: ${errPayload}\n\ndata: [DONE]\n\n`);
+          res.end();
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(errPayload);
+        }
+        completed = true;
+        deduplicator.removeInflight(dedupKey);
+        clearTimeout(timeoutId);
+        res.removeListener("close", onClientClose);
+        return;
+      }
 
       // Log if models were filtered out due to context limits
       const contextExcluded = fullChain.filter((m) => !contextFiltered.includes(m));
@@ -4994,9 +6356,7 @@ async function proxyRequest(
       }
 
       // Filter out user-excluded models
-      const excludeFiltered = prependStickyExplicitModel(
-        filterByExcludeList(contextFiltered, excludeList),
-      );
+      const excludeFiltered = filterByExcludeList(contextFiltered, excludeList);
       const excludeExcluded = contextFiltered.filter((m) => !excludeFiltered.includes(m));
       if (excludeExcluded.length > 0) {
         console.log(
@@ -5007,9 +6367,7 @@ async function proxyRequest(
       // Filter to models that support tool calling when request has tools.
       // Prevents models like grok-code-fast-1 from outputting tool invocations
       // as plain text JSON (the "talking to itself" bug).
-      let toolFiltered = prependStickyExplicitModel(
-        filterByToolCalling(excludeFiltered, hasTools, supportsToolCalling),
-      );
+      let toolFiltered = filterByToolCalling(excludeFiltered, hasTools, supportsToolCalling);
       const toolExcluded = excludeFiltered.filter((m) => !toolFiltered.includes(m));
       if (toolExcluded.length > 0) {
         console.log(
@@ -5032,14 +6390,12 @@ async function proxyRequest(
           console.log(
             `[ClawRouter] Tool-compliance filter: excluded ${dropped.join(", ")} (unreliable tool schema handling)`,
           );
-          toolFiltered = prependStickyExplicitModel(compliant);
+          toolFiltered = compliant;
         }
       }
 
       // Filter to models that support vision when request has image_url content
-      const visionFiltered = prependStickyExplicitModel(
-        filterByVision(toolFiltered, hasVision, supportsVision),
-      );
+      const visionFiltered = filterByVision(toolFiltered, hasVision, supportsVision);
       const visionExcluded = toolFiltered.filter((m) => !visionFiltered.includes(m));
       if (visionExcluded.length > 0) {
         console.log(
@@ -5048,13 +6404,39 @@ async function proxyRequest(
       }
 
       // Limit to MAX_FALLBACK_ATTEMPTS to prevent infinite loops
-      modelsToTry = prependStickyExplicitModel(visionFiltered).slice(0, MAX_FALLBACK_ATTEMPTS);
+      modelsToTry = visionFiltered.slice(0, MAX_FALLBACK_ATTEMPTS);
 
       // Deprioritize rate-limited models (put them at the end)
       modelsToTry = prioritizeNonRateLimited(modelsToTry);
     } else {
       // For explicit model requests, use the requested model
       modelsToTry = modelId ? [modelId] : [];
+    }
+
+    // A free model this chain's gateway does not carry is a hard 400, not a
+    // fallback: the never-retire redirect rule only covers ids a gateway once
+    // shipped, and the free tiers diverged on 2026-08-30. `/model free` resolves
+    // through the alias map to a concrete id, so it lands in the explicit branch
+    // above and never touches pickFreeModel's filter — substitute here instead,
+    // where every path has converged on a chain.
+    //
+    // Only ever swaps one free model for another free model, so nothing becomes
+    // payable that was not, and a user who pinned a PAID model is untouched.
+    if (modelsToTry.length > 0) {
+      const unservedFree = modelsToTry.filter((m) => FREE_MODELS.has(m) && !isServedByGateway(m));
+      if (unservedFree.length > 0) {
+        const servedFree = [...FREE_MODELS].filter(
+          (m) => isServedByGateway(m) && !excludeList?.has(m),
+        );
+        const replacement = servedFree[0];
+        if (replacement) {
+          modelsToTry = modelsToTry.map((m) => (unservedFree.includes(m) ? replacement : m));
+          modelsToTry = modelsToTry.filter((m, i) => modelsToTry.indexOf(m) === i);
+          console.log(
+            `[ClawRouter] ${unservedFree.join(", ")} not served on this chain — using ${replacement}`,
+          );
+        }
+      }
     }
 
     // Ensure routed requests have a free-model last resort for non-tool chats.
@@ -5134,7 +6516,7 @@ async function proxyRequest(
         // This return exits before the shared cleanup below — release the
         // global timeout + close listener so they don't outlive the request.
         clearTimeout(timeoutId);
-        req.removeListener("close", onClientClose);
+        res.removeListener("close", onClientClose);
         return;
       }
 
@@ -5163,7 +6545,7 @@ async function proxyRequest(
 
     // --- Fallback loop: try each model until success ---
     let upstream: Response | undefined;
-    let lastError: { body: string; status: number } | undefined;
+    let lastError: { body: string; status: number; requestId?: string } | undefined;
     let actualModelUsed = modelId;
     const failedAttempts: Array<{ model: string; reason: string; status: number }> = [];
 
@@ -5171,12 +6553,23 @@ async function proxyRequest(
       const tryModel = modelsToTry[i];
       const isLastAttempt = i === modelsToTry.length - 1;
 
-      // Abort immediately if global deadline has already fired
+      // Abort immediately if global deadline has already fired (or the client left)
       if (globalController.signal.aborted) {
-        throw new Error(`Request timed out after ${timeoutMs}ms`);
+        throw abortError();
       }
 
       console.log(`[ClawRouter] Trying model ${i + 1}/${modelsToTry.length}: ${tryModel}`);
+
+      // Publish what THIS attempt should cost, for the API-key rail's spend
+      // windows (#329). Per attempt, not per request: a fallback chain can end
+      // on a different model at a different price, and the wallet rail likewise
+      // re-checks policy against each attempt's own 402 quote. Free models
+      // publish 0 rather than being skipped, so a previous attempt's estimate
+      // cannot leak into a call that costs nothing.
+      const attemptEst = FREE_MODELS.has(tryModel)
+        ? undefined
+        : estimateAmount(tryModel, body.length, maxTokens);
+      publishDispatchCost(attemptEst ? Number(attemptEst) / 1_000_000 : 0);
 
       // Per-model abort controller — each attempt gets its own window.
       // Reasoning models (o-series, GPT-5 reasoning, Claude opus, V4 Pro, etc.)
@@ -5200,9 +6593,9 @@ async function proxyRequest(
       );
       clearTimeout(modelTimeoutId);
 
-      // If the global deadline fired during this attempt, bail out entirely
+      // If the global deadline fired during this attempt (or the client left), bail out entirely
       if (globalController.signal.aborted) {
-        throw new Error(`Request timed out after ${timeoutMs}ms`);
+        throw abortError();
       }
 
       // If the per-model timeout fired (but not global), treat as fallback-worthy error
@@ -5255,6 +6648,7 @@ async function proxyRequest(
       lastError = {
         body: result.errorBody || "Unknown error",
         status: result.errorStatus || 500,
+        requestId: result.upstreamRequestId,
       };
       failedAttempts.push({
         model: tryModel,
@@ -5315,6 +6709,9 @@ async function proxyRequest(
         );
         await new Promise<void>((resolve) => setTimeout(resolve, 500));
         if (!globalController.signal.aborted) {
+          // The first attempt consumed the published estimate; this retry is a
+          // second billable dispatch and needs its own.
+          publishDispatchCost(attemptEst ? Number(attemptEst) / 1_000_000 : 0);
           const retryController = new AbortController();
           const retryTimeoutId = setTimeout(
             () => retryController.abort(),
@@ -5350,6 +6747,7 @@ async function proxyRequest(
           lastError = {
             body: retryResult.errorBody || lastError?.body || "Unknown error",
             status: retryResult.errorStatus || lastError?.status || 500,
+            requestId: retryResult.upstreamRequestId ?? lastError?.requestId,
           };
           failedAttempts.push({
             model: tryModel,
@@ -5387,6 +6785,8 @@ async function proxyRequest(
             );
             await new Promise<void>((resolve) => setTimeout(resolve, 200));
             if (!globalController.signal.aborted) {
+              // Second billable dispatch — republish, the first one consumed it.
+              publishDispatchCost(attemptEst ? Number(attemptEst) / 1_000_000 : 0);
               const retryController = new AbortController();
               const retryTimeoutId = setTimeout(
                 () => retryController.abort(),
@@ -5465,7 +6865,7 @@ async function proxyRequest(
 
     // Clear timeout and client-close listener — request attempts completed
     clearTimeout(timeoutId);
-    req.removeListener("close", onClientClose);
+    res.removeListener("close", onClientClose);
 
     // Clear heartbeat — real data is about to flow
     if (heartbeatInterval) {
@@ -5520,6 +6920,11 @@ async function proxyRequest(
       }
     }
 
+    // Record the answering attempt's gateway id before `upstream` goes out of
+    // scope — this is the join key the usage journal needs.
+    upstreamRequestId = blockrunRequestId(upstream);
+    noteRemainingCredit(upstream);
+
     // --- Handle case where all models failed ---
     if (!upstream) {
       // Build structured error summary listing all attempted models
@@ -5531,7 +6936,15 @@ async function proxyRequest(
         failedAttempts.length > 0
           ? `All ${failedAttempts.length} models failed. Tried: ${attemptSummary}`
           : "All models in fallback chain failed";
-      console.log(`[ClawRouter] ${structuredMessage}`);
+      // Name the gateway's own id for the failed attempt. A paid 5xx is
+      // otherwise undiagnosable from both ends at once: the caller sees only
+      // "All models failed" and has nothing to give support, and the gateway
+      // cannot find the request without an id. Logged AND returned, because the
+      // person who hits this is usually reading an agent transcript, not our
+      // logs (ClawRouter-Hermes#38).
+      console.log(
+        `[ClawRouter] ${structuredMessage}${lastError?.requestId ? ` | gateway request id: ${lastError.requestId}` : ""}`,
+      );
       const rawErrBody = lastError?.body || structuredMessage;
       const errStatus = lastError?.status || 502;
 
@@ -5577,11 +6990,15 @@ async function proxyRequest(
           completedAt: Date.now(),
         });
       } else {
-        // Non-streaming: send transformed error response with context headers
+        // Non-streaming: send transformed error response with context headers.
+        // The gateway's request id rides along so a failing paid call can be
+        // traced upstream — the reporter of ClawRouter-Hermes#38 had a paid 500
+        // on Solana and no id to hand anyone, on either side.
         res.writeHead(errStatus, {
           "Content-Type": "application/json",
           "x-context-used-kb": String(originalContextSizeKB),
           "x-context-limit-kb": String(CONTEXT_LIMIT_KB),
+          ...(lastError?.requestId ? { "x-blockrun-request-id": lastError.requestId } : {}),
         });
         res.end(transformedErr);
 
@@ -5681,13 +7098,14 @@ async function proxyRequest(
           if (rsp.choices && Array.isArray(rsp.choices)) {
             for (const choice of rsp.choices) {
               const endsWithToolCalls = choice.finish_reason === "tool_calls";
-              // Some OpenAI-compatible providers include planning prose in content
-              // alongside tool_calls, or mark the turn as a tool-call turn via
-              // finish_reason before exposing the tool_calls array at the same
-              // object shape. Tool execution only needs tool_calls, so do not
-              // forward that prose to chat channels.
+              // A tool-calling turn can still be talking to the user, so the
+              // prose in `content` is forwarded alongside `tool_calls` rather
+              // than dropped. Thinking blocks are still stripped below, and
+              // CLAWROUTER_TOOL_CALL_PROSE=off restores full suppression for
+              // models that leak untagged chain-of-thought here.
               let toolCalls = choice.message?.tool_calls ?? choice.delta?.tool_calls;
               const rawContent = choice.message?.content ?? choice.delta?.content ?? "";
+              let proseContent = rawContent;
 
               // When upstream returns no structured tool_calls but the model emitted
               // tool calls as XML/text in `content` (e.g. OpenClaw-instructed
@@ -5697,17 +7115,20 @@ async function proxyRequest(
               // (six retries then a hallucinated "API key missing") came from
               // this gap.
               if (!endsWithToolCalls && (!toolCalls || toolCalls.length === 0) && rawContent) {
-                const extracted = extractTextualToolCalls(rawContent);
+                const extracted = extractTextualToolCalls(rawContent, { tools: requestTools });
                 if (extracted.toolCalls.length > 0) {
                   toolCalls = extracted.toolCalls;
+                  // Keep the prose the model wrapped around the call syntax;
+                  // the raw `<tool_call>` markup itself is already stripped out.
+                  proseContent = extracted.cleanedContent;
                 }
               }
 
               // Strip thinking tokens (Kimi <｜...｜> and standard <think> tags)
-              const content =
-                endsWithToolCalls || (toolCalls && toolCalls.length > 0)
-                  ? ""
-                  : stripThinkingTokens(rawContent);
+              const suppressProse =
+                (endsWithToolCalls || (toolCalls && toolCalls.length > 0)) &&
+                !forwardToolCallProse();
+              const content = suppressProse ? "" : stripThinkingTokens(proseContent);
               const role = choice.message?.role ?? choice.delta?.role ?? "assistant";
               const index = choice.index ?? 0;
 
@@ -5950,8 +7371,9 @@ async function proxyRequest(
               choice.finish_reason === "tool_calls" ||
               (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
             ) {
-              if (message.content !== "") {
-                message.content = "";
+              const next = forwardToolCallProse() ? stripThinkingTokens(message.content) : "";
+              if (message.content !== next) {
+                message.content = next;
                 changed = true;
               }
               continue;
@@ -5961,10 +7383,12 @@ async function proxyRequest(
             // `content` (OpenClaw `<tool_call><arg_key>...`, Anthropic-style
             // `<function_calls><invoke>...`). Without this, tool calls land as
             // plain text and downstream executors can't dispatch them.
-            const extracted = extractTextualToolCalls(message.content);
+            const extracted = extractTextualToolCalls(message.content, { tools: requestTools });
             if (extracted.toolCalls.length > 0) {
               message.tool_calls = extracted.toolCalls;
-              message.content = "";
+              message.content = forwardToolCallProse()
+                ? stripThinkingTokens(extracted.cleanedContent)
+                : "";
               choice.finish_reason = "tool_calls";
               changed = true;
               continue;
@@ -6168,7 +7592,7 @@ async function proxyRequest(
   } catch (err) {
     // Clear timeout and client-close listener on error
     clearTimeout(timeoutId);
-    req.removeListener("close", onClientClose);
+    res.removeListener("close", onClientClose);
 
     // Clear heartbeat on error
     if (heartbeatInterval) {
@@ -6178,6 +7602,17 @@ async function proxyRequest(
 
     // Remove in-flight entry so retries aren't blocked
     deduplicator.removeInflight(dedupKey);
+
+    // Client hung up and we aborted the upstream on purpose: nobody is
+    // listening for a response, the balance cache is not suspect, and
+    // reporting this as a 300s timeout to onError would be a lie.
+    if (
+      err instanceof ClientDisconnectedError ||
+      (err instanceof Error && err.name === "AbortError" && clientDisconnected())
+    ) {
+      console.log(`[ClawRouter] Request cancelled — client disconnected`);
+      return;
+    }
 
     // Invalidate balance cache on payment failure (might be out of date)
     balanceMonitor.invalidate();
@@ -6226,15 +7661,49 @@ async function proxyRequest(
         maxTokens,
         routingProfile ?? undefined,
       );
-      // Free models: actual cost is $0 (no x402 payment ever made).
-      // MIN_PAYMENT_USD floor in calculateModelCost would falsely inflate stats.
-      logCost = FREE_MODELS.has(logModel) ? 0 : costs.costEstimate;
+      const apiKeyPricing = options.apiKey ? routerOpts.modelPricing.get(logModel) : undefined;
+      if (FREE_MODELS.has(logModel)) {
+        // Free models: actual cost is $0 (no x402 payment ever made).
+        // MIN_PAYMENT_USD floor in calculateModelCost would falsely inflate stats.
+        logCost = 0;
+        logSavings = 1;
+      } else if (apiKeyPricing) {
+        // API-key rail: no x402 payment happens, so `actualPayment` is always 0
+        // and every call used to land on the estimate below — which adds a 5%
+        // server margin, a $0.001 per-transaction settlement fee and a
+        // MIN_PAYMENT_USD floor. All three are x402 concepts: the fee covers
+        // on-chain gas and the floor is the CDP facilitator's minimum. Account
+        // credit settles none of that, and BlockRun confirms this rail charges
+        // provider list price with no markup, no per-call fee and no minimum.
+        //
+        // Measured 2026-09-05: a 12-in/8-out gpt-4o-mini call was billed
+        // $0.0000066 while this branch logged $0.001 — a 152x overstatement on
+        // small calls, in the number `/stats` reports as money spent.
+        //
+        // So price it the way the gateway does, and prefer the token counts the
+        // response actually reported over an estimate from body length:
+        //   (12 * 0.15 + 8 * 0.60) / 1e6 = $0.0000066, matching to the cent.
+        const inTokens = responseInputTokens ?? chargedInputTokens;
+        const outTokens = responseOutputTokens ?? 0;
+        logCost =
+          (inTokens * (apiKeyPricing.inputPrice ?? 0) +
+            outTokens * (apiKeyPricing.outputPrice ?? 0)) /
+          1_000_000;
+        logSavings =
+          costs.baselineCost > 0
+            ? Math.max(0, (costs.baselineCost - logCost) / costs.baselineCost)
+            : 0;
+      } else {
+        // Wallet rail with no payment recorded, or a model we have no price for.
+        logCost = costs.costEstimate;
+        logSavings = costs.savings;
+      }
       logBaseline = costs.baselineCost;
-      logSavings = FREE_MODELS.has(logModel) ? 1 : costs.savings;
     }
 
     const entry: UsageEntry = {
       timestamp: new Date().toISOString(),
+      ...(upstreamRequestId ? { requestId: upstreamRequestId } : {}),
       model: logModel,
       tier: routingDecision?.tier ?? "DIRECT",
       cost: logCost,

@@ -14,6 +14,32 @@ import { VERSION } from "./version.js";
 
 const LOG_DIR = join(homedir(), ".openclaw", "blockrun", "logs");
 
+/** Default reporting window when the request declares no usable `days`. */
+export const DEFAULT_STATS_DAYS = 7;
+/** Hard cap on the window — only this many daily log files are ever read. */
+export const MAX_STATS_DAYS = 30;
+
+/**
+ * Resolve the reporting window (`?days=`) for the /stats endpoint.
+ *
+ * The raw value is user-controlled, so it has to survive the ways JS silently
+ * coerces bad input into a number that changes behaviour. `parseInt("abc", 10)`
+ * is `NaN`, `Math.min(NaN, 30)` stays `NaN`, and `getStats`' `slice(0, NaN)`
+ * reads as `slice(0, 0)` — so a typo'd param reported zero usage instead of the
+ * default window. A negative value (`?days=-1`) survived `Math.min` and
+ * `slice(0, -1)` dropped the newest day while the response mislabelled itself
+ * "last -1 days". The single `Number.isFinite(parsed) && parsed > 0` guard
+ * covers non-numeric, NaN, zero, and negative alike; anything else falls back to
+ * the default. The result is clamped to MAX_STATS_DAYS.
+ */
+export function resolveStatsDays(raw: string | null | undefined): number {
+  const parsed = parseInt(raw ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_STATS_DAYS;
+  }
+  return Math.min(parsed, MAX_STATS_DAYS);
+}
+
 export type DailyStats = {
   date: string;
   totalRequests: number;
@@ -299,7 +325,15 @@ export function formatStatsAscii(stats: AggregatedStats): string {
  * Format per-request log entries as an ASCII table for terminal display.
  * Reads the last N days of log files and shows each request individually.
  */
-export async function formatRecentLogs(days: number = 1): Promise<string> {
+export async function formatRecentLogs(requestedDays: number = 1): Promise<string> {
+  // `days` reaches here straight from `clawrouter logs --days <n>`, where
+  // `parseInt(raw, 10) || 1` lets a negative through (it is truthy). A negative
+  // then turns `slice(0, days)` into a tail-trim — `slice(0, -1)` silently drops
+  // the NEWEST day, the exact opposite of asking for more history — and the
+  // header renders "last -1 days". Guard at the sink so every caller is covered,
+  // not just the CLI one.
+  const days = Number.isFinite(requestedDays) && requestedDays > 0 ? Math.floor(requestedDays) : 1;
+
   const logFiles = await getLogFiles();
   const filesToRead = logFiles.slice(0, days);
 

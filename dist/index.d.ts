@@ -1,3 +1,7 @@
+import { RoutingConfig, RoutingDecision } from '@blockrun/router-core';
+export { DEFAULT_ROUTING_CONFIG, RouterOptions, RoutingConfig, RoutingDecision, TaskType, Tier, calculateModelCost, filterCandidatesByCapacity, getFallbackChain, getFallbackChainFiltered, inferToolRequirement, route } from '@blockrun/router-core';
+import { x402Client } from '@x402/fetch';
+
 /**
  * OpenClaw Plugin Types (locally defined)
  *
@@ -355,180 +359,8 @@ type OpenClawPluginDefinition = {
     };
 };
 
-/**
- * Tier → Model Selection
- *
- * Maps a classification tier to the cheapest capable model.
- * Builds RoutingDecision metadata with cost estimates and savings.
- */
-
-type ModelPricing = {
-    inputPrice: number;
-    outputPrice: number;
-    /** Active promo flat price per request (overrides token-based pricing when set) */
-    flatPrice?: number;
-};
-/**
- * Get the ordered fallback chain for a tier: [primary, ...fallbacks].
- */
-declare function getFallbackChain(tier: Tier, tierConfigs: Record<Tier, TierConfig>): string[];
-declare function calculateModelCost(model: string, modelPricing: Map<string, ModelPricing>, estimatedInputTokens: number, maxOutputTokens: number, routingProfile?: "free" | "eco" | "auto" | "premium"): {
-    costEstimate: number;
-    baselineCost: number;
-    savings: number;
-};
-/**
- * Get the fallback chain filtered by context length.
- * Only returns models that can handle the estimated total context.
- *
- * @param tier - The tier to get fallback chain for
- * @param tierConfigs - Tier configurations
- * @param estimatedTotalTokens - Estimated total context (input + output)
- * @param getContextWindow - Function to get context window for a model ID
- * @returns Filtered list of models that can handle the context
- */
-declare function getFallbackChainFiltered(tier: Tier, tierConfigs: Record<Tier, TierConfig>, estimatedTotalTokens: number, getContextWindow: (modelId: string) => number | undefined): string[];
-
-/**
- * Smart Router Types
- *
- * Four classification tiers — REASONING is distinct from COMPLEX because
- * reasoning tasks need different models (o3, gemini-pro) than general
- * complex tasks (gpt-4o, sonnet-4).
- *
- * Scoring uses weighted float dimensions with sigmoid confidence calibration.
- */
-type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
-type RoutingDecision = {
-    model: string;
-    tier: Tier;
-    confidence: number;
-    method: "rules" | "llm";
-    reasoning: string;
-    costEstimate: number;
-    baselineCost: number;
-    savings: number;
-    agenticScore?: number;
-    /** Which tier configs were used (auto/eco/premium/agentic) — avoids re-derivation in proxy */
-    tierConfigs?: Record<Tier, TierConfig>;
-    /** Which routing profile was applied */
-    profile?: "auto" | "eco" | "premium" | "agentic";
-};
-type RouterOptions = {
-    config: RoutingConfig;
-    modelPricing: Map<string, ModelPricing>;
-    routingProfile?: "eco" | "auto" | "premium";
-    hasTools?: boolean;
-    /** Override current time for promotion window checks (for testing). Default: new Date() */
-    now?: Date;
-};
-type TierConfig = {
-    primary: string;
-    fallback: string[];
-};
-type ScoringConfig = {
-    tokenCountThresholds: {
-        simple: number;
-        complex: number;
-    };
-    codeKeywords: string[];
-    reasoningKeywords: string[];
-    simpleKeywords: string[];
-    technicalKeywords: string[];
-    creativeKeywords: string[];
-    imperativeVerbs: string[];
-    constraintIndicators: string[];
-    outputFormatKeywords: string[];
-    referenceKeywords: string[];
-    negationKeywords: string[];
-    domainSpecificKeywords: string[];
-    agenticTaskKeywords: string[];
-    dimensionWeights: Record<string, number>;
-    tierBoundaries: {
-        simpleMedium: number;
-        mediumComplex: number;
-        complexReasoning: number;
-    };
-    confidenceSteepness: number;
-    confidenceThreshold: number;
-};
-type ClassifierConfig = {
-    llmModel: string;
-    llmMaxTokens: number;
-    llmTemperature: number;
-    promptTruncationChars: number;
-    cacheTtlMs: number;
-};
-type OverridesConfig = {
-    maxTokensForceComplex: number;
-    structuredOutputMinTier: Tier;
-    ambiguousDefaultTier: Tier;
-    /**
-     * When enabled, prefer models optimized for agentic workflows.
-     * Agentic models continue autonomously with multi-step tasks
-     * instead of stopping and waiting for user input.
-     */
-    agenticMode?: boolean;
-};
-/**
- * Time-windowed promotion that temporarily overrides tier routing.
- * Active promotions are auto-applied; expired ones are ignored at runtime.
- */
-type Promotion = {
-    /** Human-readable label (e.g. "GLM-5 Launch Promo") */
-    name: string;
-    /** ISO date string, promotion starts (inclusive). e.g. "2026-04-01" */
-    startDate: string;
-    /** ISO date string, promotion ends (exclusive). e.g. "2026-04-15" */
-    endDate: string;
-    /** Partial tier overrides — merged into the active tier configs (primary/fallback) */
-    tierOverrides: Partial<Record<Tier, Partial<TierConfig>>>;
-    /** Which profiles this applies to. Default: all profiles. */
-    profiles?: Array<"auto" | "eco" | "premium" | "agentic">;
-};
-type RoutingConfig = {
-    version: string;
-    classifier: ClassifierConfig;
-    scoring: ScoringConfig;
-    tiers: Record<Tier, TierConfig>;
-    /**
-     * Tier configs for agentic mode — models that excel at multi-step tasks.
-     * Set to `null` to disable agentic tier selection entirely (forces all
-     * requests through `tiers`, even when tools are present in the request).
-     */
-    agenticTiers?: Record<Tier, TierConfig> | null;
-    /** Tier configs for eco profile — ultra cost-optimized (blockrun/eco). `null` falls back to `tiers`. */
-    ecoTiers?: Record<Tier, TierConfig> | null;
-    /** Tier configs for premium profile — best quality (blockrun/premium). `null` falls back to `tiers`. */
-    premiumTiers?: Record<Tier, TierConfig> | null;
-    /** Time-windowed promotions that temporarily override tier routing */
-    promotions?: Promotion[];
-    overrides: OverridesConfig;
-};
-
-/**
- * Default Routing Config
- *
- * All routing parameters as a TypeScript constant.
- * Operators override via openclaw.yaml plugin config.
- *
- * Scoring uses 14 weighted dimensions with sigmoid confidence calibration.
- */
-
-declare const DEFAULT_ROUTING_CONFIG: RoutingConfig;
-
-/**
- * Smart Router Entry Point
- *
- * Classifies requests and routes to the cheapest capable model.
- * Delegates to pluggable RouterStrategy (default: RulesStrategy, <1ms).
- */
-
-/**
- * Route a request to the cheapest capable model.
- * Delegates to the registered "rules" strategy by default.
- */
-declare function route(prompt: string, systemPrompt: string | undefined, maxOutputTokens: number, options: RouterOptions): RoutingDecision;
+/** OpenClaw's bundled router owns `clawrouter`; BlockRun must never claim it. */
+declare const BLOCKRUN_PLUGIN_ID = "blockrun-clawrouter";
 
 /**
  * Response Cache for LLM Completions
@@ -711,6 +543,38 @@ declare class BalanceMonitor {
     /** Build BalanceInfo from raw balance */
     private buildInfo;
 }
+/**
+ * The balance monitor for API-key mode.
+ *
+ * There is no wallet to read. Credit lives in the customer's BlockRun account
+ * and the gateway is its own authority on it: a call that outruns the balance
+ * comes back as HTTP 402 `insufficient_quota`, with a message pointing at the
+ * top-up page. api.blockrun.ai publishes no key-authenticated balance endpoint,
+ * so ClawRouter cannot poll one, and inventing a number here would be worse
+ * than having none — the free-model fallback downgrades a request the moment
+ * the monitor reports empty, and a guessed zero would silently move a paying
+ * customer onto the free tier.
+ *
+ * So this reports "always sufficient" and lets the server refuse. That is not
+ * a bypass of the spend gate: the gate it satisfies is the local *wallet*
+ * check, which exists because an x402 payment that fails after the stream
+ * opens is unrecoverable. An API-key call is refused before a single token is
+ * generated, which is the stronger guarantee, and it is enforced server-side
+ * where the actual balance is.
+ */
+declare class ApiKeyBalanceMonitor {
+    /** Large enough that every `balance >= estimatedCost` comparison passes. */
+    private static readonly UNMETERED;
+    checkBalance(): Promise<BalanceInfo>;
+    checkSufficient(): Promise<SufficiencyResult>;
+    /** No local cache to adjust — the server keeps the books. */
+    deductEstimated(): void;
+    invalidate(): void;
+    refresh(): Promise<BalanceInfo>;
+    formatUSDC(amountMicros: bigint): string;
+    /** No wallet in this mode; callers render the account instead. */
+    getWalletAddress(): string;
+}
 
 /**
  * Solana USDC Balance Monitor
@@ -759,6 +623,309 @@ declare class SolanaBalanceMonitor {
     private fetchBalanceOnce;
     private buildInfo;
 }
+
+/**
+ * Spend Control - Time-windowed spending limits and counterparty policy
+ *
+ * Absorbed from @blockrun/clawwallet. Chain-agnostic (works for both EVM and Solana).
+ *
+ * Features:
+ * - Per-request limits (e.g., max $0.10 per call)
+ * - Hourly limits (e.g., max $3.00 per hour)
+ * - Daily limits (e.g., max $20.00 per day)
+ * - Session limits (e.g., max $5.00 per session)
+ * - Rolling windows (last 1h, last 24h)
+ * - Counterparty policy: payee allow/deny, network and asset allowlists
+ * - Fail-closed enforcement before the signer, via the x402 pre-sign hook
+ * - Persistent storage (~/.openclaw/blockrun/spending.json)
+ */
+
+type SpendWindow = "perRequest" | "hourly" | "daily" | "session";
+/**
+ * Counterparty/network/asset allow-or-deny lists. Default-off: a list only
+ * takes effect once configured via setPolicy(). `allowedPayees`/`blockedPayees`
+ * are both supported (block always wins if both are set); network and asset
+ * are allowlist-only, matching what a caller can realistically enumerate.
+ */
+type PolicyList = "allowedPayees" | "blockedPayees" | "allowedNetworks" | "allowedAssets";
+/** Base mainnet, as carried on x402 `selectedRequirements.network`. */
+declare const CAIP2_BASE = "eip155:8453";
+/** Solana mainnet genesis, as carried on x402 `selectedRequirements.network`. */
+declare const CAIP2_SOLANA_MAINNET = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+/**
+ * Every network the proxy can pay on, as carried on x402
+ * `selectedRequirements.network`. Single source of truth for surfaces that
+ * validate `allowedNetworks` entries: an entry outside this set can never
+ * match a quote and would only block payments.
+ */
+declare const PAYABLE_NETWORKS: readonly string[];
+/**
+ * A policy list on disk is present but unusable. Thrown rather than swallowed:
+ * silently dropping a corrupted allow/deny list would widen what the agent may
+ * pay, which is the one direction this file must never fail in. Callers
+ * classify on `instanceof`, not on the message text.
+ */
+/**
+ * spending.json exists but could not be read or parsed. Distinct from "no file
+ * yet" (load() returns null) so a reload can tell a failed read from an empty
+ * store and refuse to widen what the agent may pay.
+ */
+declare class UnreadableSpendPolicyError extends Error {
+    constructor(cause: unknown);
+}
+declare class MalformedSpendPolicyError extends Error {
+    constructor(key: string);
+}
+interface SpendLimits {
+    perRequest?: number;
+    hourly?: number;
+    daily?: number;
+    session?: number;
+    allowedPayees?: string[];
+    blockedPayees?: string[];
+    /**
+     * CAIP-2 identifiers matching x402 `selectedRequirements.network`
+     * (e.g. `eip155:8453`, `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d`).
+     * Nicknames such as `base` or `solana` do not match and fail closed.
+     */
+    allowedNetworks?: string[];
+    allowedAssets?: string[];
+}
+/**
+ * Counterparty details for a pending payment, passed to check() alongside
+ * the estimated cost. EVM `payTo` values matching `0x` + 40 hex are compared
+ * case-insensitively; anything else (including Solana base58) is exact-match.
+ */
+interface CounterpartyInfo {
+    payTo?: string;
+    network?: string;
+    asset?: string;
+}
+interface SpendRecord {
+    timestamp: number;
+    amount: number;
+    model?: string;
+    action?: string;
+}
+interface SpendingStatus {
+    limits: SpendLimits;
+    spending: {
+        hourly: number;
+        daily: number;
+        session: number;
+    };
+    remaining: {
+        hourly: number | null;
+        daily: number | null;
+        session: number | null;
+    };
+    calls: number;
+}
+interface CheckResult {
+    allowed: boolean;
+    blockedBy?: SpendWindow;
+    blockedByPolicy?: PolicyList;
+    remaining?: number;
+    reason?: string;
+    resetIn?: number;
+}
+interface SpendControlStorage {
+    load(): {
+        limits: SpendLimits;
+        history: SpendRecord[];
+    } | null;
+    save(data: {
+        limits: SpendLimits;
+        history: SpendRecord[];
+    }): void;
+    /**
+     * Optional: persist history without touching stored limits. Implement it to
+     * keep recorded spend from overwriting an operator's policy edits. Falls
+     * back to save() when absent.
+     */
+    saveHistory?(history: SpendRecord[]): void;
+    /**
+     * Optional: persist limits without touching stored history — the mirror of
+     * saveHistory(). A policy edit from a second process (the CLI) must not
+     * write its own stale history snapshot back over spend the proxy recorded
+     * since, which would reopen a rolling window. Falls back to save() when
+     * absent.
+     */
+    saveLimits?(limits: SpendLimits, expect?: SpendLimits): void;
+}
+declare class FileSpendControlStorage implements SpendControlStorage {
+    private readonly spendingFile;
+    constructor();
+    load(): {
+        limits: SpendLimits;
+        history: SpendRecord[];
+    } | null;
+    save(data: {
+        limits: SpendLimits;
+        history: SpendRecord[];
+    }): void;
+    /**
+     * Persist history while leaving the stored limits exactly as they are on
+     * disk. Recording spend must not rewrite policy: the proxy reads limits once
+     * at startup, so writing its in-memory copy back on every payment would
+     * erase an operator's hand-edit to spending.json seconds after they made it.
+     */
+    saveHistory(history: SpendRecord[]): void;
+    /**
+     * Persist limits while leaving the stored history exactly as it is on disk.
+     * With `expect`, refuse when the stored limits are no longer the ones the
+     * writer read — a stale instance must not replace another writer's edit.
+     * The re-read happens immediately before the atomic rename, so the race
+     * window is the write itself, not the whole command.
+     */
+    saveLimits(limits: SpendLimits, expect?: SpendLimits): void;
+}
+declare class InMemorySpendControlStorage implements SpendControlStorage {
+    private data;
+    load(): {
+        limits: SpendLimits;
+        history: SpendRecord[];
+    } | null;
+    save(data: {
+        limits: SpendLimits;
+        history: SpendRecord[];
+    }): void;
+    saveLimits(limits: SpendLimits, expect?: SpendLimits): void;
+}
+interface SpendControlOptions {
+    storage?: SpendControlStorage;
+    now?: () => number;
+}
+declare class SpendControl {
+    private limits;
+    private history;
+    private sessionSpent;
+    private sessionCalls;
+    private pending;
+    private reservationSeq;
+    /** Limits we loaded and have not changed; history-only saves must not clobber operator edits. */
+    private limitsDirty;
+    /** The limits this instance last read from or wrote to storage — the compare-and-swap baseline. */
+    private diskLimits;
+    /** Set when spending.json held an unusable policy list: refuse every payment. */
+    private policyFileBroken?;
+    private readonly storage;
+    private readonly now;
+    constructor(options?: SpendControlOptions);
+    setLimit(window: SpendWindow, amount: number): void;
+    clearLimit(window: SpendWindow): void;
+    setPolicy(list: PolicyList, values: string[]): void;
+    clearPolicy(list: PolicyList): void;
+    getLimits(): SpendLimits;
+    /**
+     * Why spending.json could not be loaded, or undefined when it is usable.
+     * While set, every setter mutates memory only: save() refuses to rewrite a
+     * file it could not fully parse, so callers must check this before
+     * reporting a change as applied.
+     */
+    getPolicyFileError(): string | undefined;
+    /**
+     * Re-read limits from storage, keeping this instance's history and open
+     * reservations. Used on an in-process proxy restart so a hand-edit to
+     * spending.json made while the process was running still applies, without
+     * resetting the rolling windows. Fails closed exactly like the constructor:
+     * a malformed file refuses every payment until repaired, and a repaired
+     * file clears that refusal.
+     */
+    reloadLimits(): void;
+    check(estimatedCost: number, counterparty?: CounterpartyInfo): CheckResult;
+    /**
+     * The amount windows alone, with no counterparty to inspect.
+     *
+     * `perRequest` / `hourly` / `daily` / `session` are denominated in USD and
+     * say nothing about how the money moves, so they are the part of the policy
+     * that means the same thing on the API-key rail as on the wallet rail — a
+     * daily cap is as sensible against account credit as against USDC, and both
+     * are read from the same `spending.json` (#329). The counterparty lists are
+     * the part that does NOT translate: `blockedPayees`, `allowedPayees`,
+     * `blockedNetworks` and `allowedAssets` presuppose a payee, a network and an
+     * asset, and on the key rail there is one counterparty and no on-chain asset.
+     * They are vacuous there rather than missing, which is why `check()` layers
+     * them on top of this instead of the other way round.
+     */
+    checkAmount(estimatedCost: number): CheckResult;
+    record(amount: number, metadata?: {
+        model?: string;
+        action?: string;
+    }): void;
+    /** True when any window that this module can compare an amount against is set. */
+    hasAmountLimits(): boolean;
+    /** True when a window spans more than one request, so reservations matter. */
+    hasAggregateLimits(): boolean;
+    /**
+     * Hold `amount` against the aggregate windows before a payment is signed.
+     *
+     * Reservations live in memory only and are never persisted: an unsettled
+     * reservation is not spend, and writing it to disk is what made a failed
+     * signer permanently consume budget. They expire on their own so a caller
+     * that never settles or releases (process killed mid-payment, a transport
+     * that hangs past the payment timeout) cannot wedge the window shut.
+     */
+    reserve(amount: number): string;
+    /** Convert a reservation into recorded spend (the payment was signed). */
+    settleReservation(id: string, metadata?: {
+        model?: string;
+        action?: string;
+    }): void;
+    /** Drop a reservation without recording spend (the payment was never signed). */
+    releaseReservation(id: string): void;
+    /** Total currently held but not yet settled. */
+    private pendingTotal;
+    private expireReservations;
+    private getSpendingInWindow;
+    getSpending(window: "hourly" | "daily" | "session"): number;
+    getRemaining(window: "hourly" | "daily" | "session"): number | null;
+    getStatus(): SpendingStatus;
+    getHistory(limit?: number): SpendRecord[];
+    /**
+     * Reset the session window. `sessionSpent`/`sessionCalls` are instance state
+     * that is never persisted, so this used to happen implicitly: every
+     * startProxy() built a fresh SpendControl. The process-wide ledger outlives
+     * an in-process proxy restart, which would silently redefine `session` as
+     * "since the gateway booted" — docs/configuration.md and the /policy help
+     * both promise "session resets on restart". The restart path in index.ts
+     * calls this to keep that promise. History and the rolling hourly/daily
+     * windows are deliberately untouched.
+     */
+    resetSession(): void;
+    private cleanup;
+    private save;
+    private load;
+}
+/**
+ * Thrown from the pre-sign hook when policy or an amount window refuses.
+ *
+ * A deliberate refusal must never be mistaken for a transient upstream fault:
+ * the proxy's fallback loop retries provider errors across every paid model
+ * and then silently lands on a free one, which would hide the denial from the
+ * caller entirely. Callers classify on `instanceof` (see `proxy.ts`), so the
+ * message text is free to change. It keeps the `Payment creation aborted:`
+ * prefix that `@x402/core` uses for its own aborts so existing log greps and
+ * error matchers still see a familiar string.
+ */
+declare class SpendPolicyError extends Error {
+    readonly blockedBy?: SpendWindow;
+    readonly blockedByPolicy?: PolicyList;
+    constructor(reason: string, blocked?: {
+        blockedBy?: SpendWindow;
+        blockedByPolicy?: PolicyList;
+    });
+}
+/**
+ * Register the fail-closed spend-policy hook on an x402 client.
+ *
+ * Reservations are keyed on the `selectedRequirements` object, which
+ * `@x402/core` passes by reference to the before / after / failure hooks of
+ * the same `createPaymentPayload` call, so concurrent payments never settle
+ * each other's reservation.
+ */
+declare function registerSpendPolicyHook(x402: x402Client, control: SpendControl): void;
+declare function formatDuration(seconds: number): string;
 
 /**
  * Session Persistence Store
@@ -906,8 +1073,8 @@ declare function hashRequestContent(lastUserContent: string, toolCallNames?: str
  *   - Usage logging: log every request as JSON line to ~/.openclaw/blockrun/logs/
  */
 
-/** Union type for chain-agnostic balance monitoring */
-type AnyBalanceMonitor = BalanceMonitor | SolanaBalanceMonitor;
+/** Union type for chain- and auth-agnostic balance monitoring */
+type AnyBalanceMonitor = BalanceMonitor | SolanaBalanceMonitor | ApiKeyBalanceMonitor;
 
 /**
  * Get the proxy port from pre-loaded configuration.
@@ -936,13 +1103,41 @@ type WalletConfig = string | {
     solanaPrivateKeyBytes?: Uint8Array;
 };
 type PaymentChain = "base" | "solana";
+/**
+ * How this proxy pays BlockRun.
+ * - "wallet"  — x402 micropayments signed per call from a local USDC wallet.
+ * - "api-key" — a `brk_…` bearer token drawing on account credit topped up by
+ *               card at https://user.blockrun.ai. No wallet, no chain, no gas.
+ */
+type AuthMode = "wallet" | "api-key";
 type ProxyOptions = {
-    wallet: WalletConfig;
+    /**
+     * Wallet material for x402 mode. Optional only when `apiKey` is set — one of
+     * the two must be present or the proxy has no way to pay for anything.
+     */
+    wallet?: WalletConfig;
+    /**
+     * BlockRun API key (`brk_…`). When present it wins over `wallet`: the proxy
+     * talks to api.blockrun.ai with a bearer token and signs no payments at all.
+     * Also readable from BLOCKRUN_API_KEY / ~/.blockrun/.api-key via
+     * resolveApiKey(); callers resolve it and pass it in.
+     */
+    apiKey?: string;
     apiBase?: string;
-    /** Payment chain: "base" (default) or "solana". Can also be set via CLAWROUTER_PAYMENT_CHAIN env var. */
+    /**
+     * Payment chain: "base" or "solana". New installs persist "solana" at wallet
+     * generation; absent config resolves to "base" for pre-existing installs.
+     * Can also be set via CLAWROUTER_PAYMENT_CHAIN env var.
+     */
     paymentChain?: PaymentChain;
     /** Port to listen on (default: 8402) */
     port?: number;
+    /**
+     * Reuse a compatible process already listening on the requested port.
+     * Desktop disables this because it must only configure agents against a
+     * process whose lifecycle it owns.
+     */
+    allowExistingProxy?: boolean;
     routingConfig?: Partial<RoutingConfig>;
     /** Request timeout in ms (default: 180000 = 3 minutes). Covers on-chain tx + LLM response. */
     requestTimeoutMs?: number;
@@ -1000,10 +1195,24 @@ type ProxyOptions = {
         network: string;
     }) => void;
     onRouted?: (decision: RoutingDecision) => void;
+    /** Local comparison only; it never changes the serving request or sends another completion. */
+    onShadowRouted?: (comparison: {
+        executed: RoutingDecision;
+        shadow: RoutingDecision;
+        sameModel: boolean;
+        hasTools: boolean;
+        hasVision: boolean;
+        requiresStructuredOutput: boolean;
+    }) => void;
     /** Called when balance drops below $1.00 (warning, request still proceeds) */
     onLowBalance?: (info: LowBalanceInfo) => void;
     /** Called when balance is insufficient for a request (request fails) */
     onInsufficientFunds?: (info: InsufficientFundsInfo) => void;
+    /**
+     * Spend / counterparty policy. Default: FileSpendControlStorage at
+     * ~/.openclaw/blockrun/spending.json. Inject in tests.
+     */
+    spendControl?: SpendControl;
     /**
      * Upstream proxy URL for all outgoing requests.
      * Supports http://, https://, and socks5:// schemes.
@@ -1015,8 +1224,13 @@ type ProxyOptions = {
 type ProxyHandle = {
     port: number;
     baseUrl: string;
+    /** The x402 signer's address, or "" in API-key mode (there is no wallet). */
     walletAddress: string;
     solanaAddress?: string;
+    /** Which credential this proxy is paying with. */
+    authMode: AuthMode;
+    /** Masked API key, for status display. Only set in API-key mode. */
+    apiKeyLabel?: string;
     balanceMonitor: AnyBalanceMonitor;
     close: () => Promise<void>;
 };
@@ -1031,21 +1245,21 @@ type ProxyHandle = {
 declare function startProxy(options: ProxyOptions): Promise<ProxyHandle>;
 
 /**
- * Resolve wallet key: load saved → env var → auto-generate.
- * Also loads mnemonic if available for Solana key derivation.
+ * Resolve wallet key: migrate legacy files → explicit env → Core → legacy → generate.
+ * Also loads Core Solana material or a legacy mnemonic-derived key when available.
  * Called by index.ts before the auth wizard runs.
  */
 type WalletResolution = {
     key: string;
     address: string;
-    source: "saved" | "env" | "config" | "generated";
+    source: "core" | "saved" | "env" | "config" | "generated";
     mnemonic?: string;
     solanaPrivateKeyBytes?: Uint8Array;
 };
 /**
  * Set up Solana wallet for existing EVM-only users.
  * Generates a new mnemonic for Solana key derivation.
- * NEVER touches the existing wallet.key file.
+ * NEVER changes the existing Base wallet.
  */
 declare function setupSolana(): Promise<{
     mnemonic: string;
@@ -1057,11 +1271,29 @@ declare function setupSolana(): Promise<{
 declare function savePaymentChain(chain: "base" | "solana"): Promise<void>;
 /**
  * Load the persisted payment chain selection from disk.
- * Returns "base" if no file exists or the file is invalid.
+ *
+ * Solana is the preferred rail, and since v0.12.246 wallet generation persists
+ * `solana` outright — so a fresh install answers "solana" from its own chain
+ * file, not from a default. This function only decides the case where no chain
+ * file exists at all, and there the answer turns on whether a wallet already
+ * does:
+ *
+ *   no chain file, no wallet   → "solana"  (nothing to strand; prefer Solana)
+ *   no chain file, wallet on disk → "base" (a pre-v0.12.246 install)
+ *
+ * That second line is the one that must not move. An install predating the
+ * Solana default has USDC sitting in its Base wallet and no Solana balance;
+ * flipping it would point every request at a gateway its money is not on and
+ * fail them all with an empty balance. The same reasoning covers a wallet
+ * supplied through BLOCKRUN_WALLET_KEY, and a generated wallet whose Solana
+ * derivation failed (no chain file is written in that case, on purpose — see
+ * resolveOrGenerateWalletKey — and the wallet it did write keeps us on Base,
+ * which is the only chain that proxy can actually sign for).
  */
 declare function loadPaymentChain(): Promise<"base" | "solana">;
 /**
- * Resolve payment chain: env var first → persisted file second → default "base".
+ * Resolve payment chain: env var first → persisted file second → the
+ * fresh-install preference (Solana) last. See loadPaymentChain.
  */
 declare function resolvePaymentChain(): Promise<"base" | "solana">;
 
@@ -1154,6 +1386,7 @@ declare const BLOCKRUN_MODELS: BlockRunModel[];
  * target's real metadata instead.
  */
 declare const OPENCLAW_MODELS: ModelDefinitionConfig[];
+declare const VISIBLE_OPENCLAW_MODELS: ModelDefinitionConfig[];
 /**
  * Build a ModelProviderConfig for BlockRun.
  *
@@ -1206,6 +1439,23 @@ type UsageEntry = {
     partnerId?: string;
     /** Partner service name (e.g., "BlockRun") — only set for partner API calls */
     service?: string;
+    /**
+     * The gateway's own id for this request, from the `x-blockrun-request-id`
+     * response header. Absent for requests that never reached the gateway (a
+     * cache hit, a local refusal, an aborted call).
+     *
+     * This is the JOIN KEY for billing reconciliation. Every `cost` in this file
+     * is a LOCAL estimate computed from our copy of the price table, so it drifts
+     * whenever that copy goes stale — six prices were wrong until v0.12.270, and
+     * `/stats` had been reporting the wrong money the whole time. Recording the
+     * gateway's id is what will let us diff this journal line-by-line against a
+     * server-side ledger and show what was actually charged instead of what we
+     * guessed. It cannot be backfilled: a call whose id we did not record is
+     * unreconcilable forever, which is why this is captured before the ledger API
+     * that will consume it exists. It is also the id support needs to trace one
+     * failed call.
+     */
+    requestId?: string;
 };
 /**
  * Log a usage entry as a JSON line.
@@ -1246,117 +1496,8 @@ declare class RequestDeduplicator {
     private prune;
 }
 
-/**
- * Spend Control - Time-windowed spending limits
- *
- * Absorbed from @blockrun/clawwallet. Chain-agnostic (works for both EVM and Solana).
- *
- * Features:
- * - Per-request limits (e.g., max $0.10 per call)
- * - Hourly limits (e.g., max $3.00 per hour)
- * - Daily limits (e.g., max $20.00 per day)
- * - Session limits (e.g., max $5.00 per session)
- * - Rolling windows (last 1h, last 24h)
- * - Persistent storage (~/.openclaw/blockrun/spending.json)
- */
-type SpendWindow = "perRequest" | "hourly" | "daily" | "session";
-interface SpendLimits {
-    perRequest?: number;
-    hourly?: number;
-    daily?: number;
-    session?: number;
-}
-interface SpendRecord {
-    timestamp: number;
-    amount: number;
-    model?: string;
-    action?: string;
-}
-interface SpendingStatus {
-    limits: SpendLimits;
-    spending: {
-        hourly: number;
-        daily: number;
-        session: number;
-    };
-    remaining: {
-        hourly: number | null;
-        daily: number | null;
-        session: number | null;
-    };
-    calls: number;
-}
-interface CheckResult {
-    allowed: boolean;
-    blockedBy?: SpendWindow;
-    remaining?: number;
-    reason?: string;
-    resetIn?: number;
-}
-interface SpendControlStorage {
-    load(): {
-        limits: SpendLimits;
-        history: SpendRecord[];
-    } | null;
-    save(data: {
-        limits: SpendLimits;
-        history: SpendRecord[];
-    }): void;
-}
-declare class FileSpendControlStorage implements SpendControlStorage {
-    private readonly spendingFile;
-    constructor();
-    load(): {
-        limits: SpendLimits;
-        history: SpendRecord[];
-    } | null;
-    save(data: {
-        limits: SpendLimits;
-        history: SpendRecord[];
-    }): void;
-}
-declare class InMemorySpendControlStorage implements SpendControlStorage {
-    private data;
-    load(): {
-        limits: SpendLimits;
-        history: SpendRecord[];
-    } | null;
-    save(data: {
-        limits: SpendLimits;
-        history: SpendRecord[];
-    }): void;
-}
-interface SpendControlOptions {
-    storage?: SpendControlStorage;
-    now?: () => number;
-}
-declare class SpendControl {
-    private limits;
-    private history;
-    private sessionSpent;
-    private sessionCalls;
-    private readonly storage;
-    private readonly now;
-    constructor(options?: SpendControlOptions);
-    setLimit(window: SpendWindow, amount: number): void;
-    clearLimit(window: SpendWindow): void;
-    getLimits(): SpendLimits;
-    check(estimatedCost: number): CheckResult;
-    record(amount: number, metadata?: {
-        model?: string;
-        action?: string;
-    }): void;
-    private getSpendingInWindow;
-    getSpending(window: "hourly" | "daily" | "session"): number;
-    getRemaining(window: "hourly" | "daily" | "session"): number | null;
-    getStatus(): SpendingStatus;
-    getHistory(limit?: number): SpendRecord[];
-    resetSession(): void;
-    private cleanup;
-    private save;
-    private load;
-}
-declare function formatDuration(seconds: number): string;
+/** Derive the Solana seed at m/44'/501'/0'/0' using SLIP-0010 Ed25519. */
+declare function deriveSolanaKeyBytes(mnemonic: string): Uint8Array;
 
 /**
  * Wallet Key Derivation
@@ -1389,17 +1530,7 @@ declare function deriveEvmKey(mnemonic: string): {
     privateKey: `0x${string}`;
     address: string;
 };
-/**
- * Derive 32-byte Solana private key using SLIP-10 Ed25519 derivation.
- * Path: m/44'/501'/0'/0' (Phantom / Solflare / Backpack compatible)
- *
- * Algorithm (SLIP-0010 for Ed25519):
- *   1. Master: HMAC-SHA512(key="ed25519 seed", data=bip39_seed) → IL=key, IR=chainCode
- *   2. For each hardened child index:
- *      HMAC-SHA512(key=chainCode, data=0x00 || key || ser32(index)) → split again
- *   3. Final IL (32 bytes) = Ed25519 private key seed
- */
-declare function deriveSolanaKeyBytes(mnemonic: string): Uint8Array;
+
 /**
  * Derive both EVM and Solana keys from a single mnemonic.
  */
@@ -1501,12 +1632,6 @@ declare function fetchWithRetry(fetchFn: (url: string, init?: RequestInit) => Pr
  */
 declare function isRetryable(errorOrResponse: Error | Response, config?: Partial<RetryConfig>): boolean;
 
-/**
- * Usage Statistics Aggregator
- *
- * Reads usage log files and aggregates statistics for terminal display.
- * Supports filtering by date range and provides multiple aggregation views.
- */
 type DailyStats = {
     date: string;
     totalRequests: number;
@@ -1650,7 +1775,8 @@ declare function buildPartnerTools(proxyBaseUrl: string): PartnerToolDefinition[
  *   # Install the plugin
  *   openclaw plugins install @blockrun/clawrouter
  *
- *   # Fund your wallet with USDC on Base (address printed on install)
+ *   # Fund your wallet with USDC (Solana for new installs, Base for existing ones;
+ *   # the funding address is printed on install)
  *
  *   # Use smart routing (auto-picks cheapest model)
  *   openclaw models set blockrun/auto
@@ -1675,32 +1801,54 @@ declare function buildPartnerTools(proxyBaseUrl: string): PartnerToolDefinition[
  * opt-in.
  */
 declare function isBlockrunWebSearchDisabled(config?: unknown): boolean;
-/**
- * Inject BlockRun models config into OpenClaw config file.
- * This is required because registerProvider() alone doesn't make models available.
- *
- * CRITICAL: This function must be idempotent and handle ALL edge cases:
- * - Config file doesn't exist (create it)
- * - Config file exists but is empty/invalid (reinitialize)
- * - blockrun provider exists but has undefined fields (fix them)
- * - Config exists but uses old port/models (update them)
- *
- * This function is called on EVERY plugin load to ensure config is always correct.
- *
- * Also strips any previously managed `mcp.servers.blockrun` entry we wrote in
- * older releases — ClawRouter no longer bundles the MCP bridge (the npx-spawned
- * grandchildren were leaking). The scrub only removes entries matching the
- * managed shape; user-defined `blockrun` MCP servers are left alone.
- */
 declare function injectModelsConfig(logger: {
     info: (msg: string) => void;
 }, options?: {
     forceWrite?: boolean;
 }): void;
 /**
+ * Repair the per-agent model cache OpenClaw keeps at
+ * `~/.openclaw/agents/<agent>/agent/models.json`.
+ *
+ * This is a THIRD model-list plane, distinct from the two in `openclaw.json`
+ * (`models.providers.blockrun.models` = the picker, `agents.defaults.models` =
+ * the allowlist). Nothing synced it, so it rotted independently: a machine whose
+ * openclaw.json `injectModelsConfig` had just repaired to the current 47 still
+ * had 155 entries here — 127 long-retired models (gpt-5.2, gpt-4.1, o1 …) plus
+ * duplicate `free` / `moonshot/kimi-k2.5` rows, and none of the current
+ * flagships. That is what surfaces as stale and duplicated rows in the picker.
+ *
+ * Only rewrites when the cache already has a `blockrun` provider — we repair our
+ * own entry, never introduce one — and leaves every other provider and each
+ * provider's non-`models` fields (baseUrl/api/apiKey) untouched.
+ *
+ * Gated like `injectModelsConfig`: outside gateway mode this is a no-op unless
+ * forced. `openclaw plugins install` runs activation hooks inside a transaction,
+ * and writing OpenClaw's own state from under it is what stranded users before
+ * (see the baseHash note on the config write above).
+ */
+declare function syncAgentModelCache(logger: {
+    info: (msg: string) => void;
+}, options?: {
+    forceWrite?: boolean;
+}): void;
+/**
  * Inject dummy auth profile for BlockRun into agent auth stores.
- * OpenClaw's agent system looks for auth credentials even if provider has auth: [].
- * We inject a placeholder so the lookup succeeds (proxy handles real auth internally).
+ *
+ * The legacy ``auth-profiles.json`` write is now deliberately narrow:
+ *
+ * - Wherever ``openclaw-agent.sqlite`` exists, the SQLite auth store is
+ *   authoritative. Writing the legacy JSON beside it is at best ignored, at
+ *   worst a failed-closed migration trigger: since OpenClaw 2026.8.1 a
+ *   leftover legacy file beside a store that holds no profiles fails auth
+ *   migration for the whole agent fleet. So we never write there, and we
+ *   clean up the placeholder we previously injected.
+ * - The shared auth-owner directory (``main``) is managed by OpenClaw
+ *   itself; a placeholder written there can shadow that state. The
+ *   provider's real auth comes from the x402 proxy (and the apiKey
+ *   injectModelsConfig writes into openclaw.json), so nothing is lost.
+ * - Only on very old installs with no SQLite store at all do we keep the
+ *   original JSON bootstrap, which those releases import.
  */
 declare function injectAuthProfile(logger: {
     info: (msg: string) => void;
@@ -1723,6 +1871,13 @@ declare function parseCallArgs(raw: string): {
     from?: string;
     language?: string;
 };
+/**
+ * Build the ImageGenerationProvider that registers BlockRun image models
+ * with OpenClaw's native image generation UI.
+ * Delegates to the local proxy (which handles x402 payment).
+ */
+declare function buildImageGenerationProvider(): ImageGenerationProviderPlugin;
+
 declare const plugin: OpenClawPluginDefinition;
 
-export { type AggregatedStats, BALANCE_THRESHOLDS, BLOCKRUN_MODELS, type BalanceInfo, BalanceMonitor, type CachedLLMResponse, type CachedResponse, type CheckResult, DEFAULT_RETRY_CONFIG, DEFAULT_ROUTING_CONFIG, DEFAULT_SESSION_CONFIG, type DailyStats, type DerivedKeys, EmptyWalletError, FileSpendControlStorage, InMemorySpendControlStorage, InsufficientFundsError, type InsufficientFundsInfo, type LowBalanceInfo, MODEL_ALIASES, OPENCLAW_MODELS, PARTNER_SERVICES, type PartnerServiceDefinition, type PartnerToolDefinition, type PaymentChain, type ProxyHandle, type ProxyOptions, RequestDeduplicator, ResponseCache, type ResponseCacheConfig, type RetryConfig, type RoutingConfig, type RoutingDecision, RpcError, type SessionConfig, type SessionEntry, SessionStore, type SolanaBalanceInfo, SolanaBalanceMonitor, SpendControl, type SpendControlOptions, type SpendControlStorage, type SpendLimits, type SpendRecord, type SpendWindow, type SpendingStatus, type SufficiencyResult, type Tier, type UsageEntry, type WalletConfig, type WalletResolution, blockrunProvider, buildPartnerTools, buildProviderModels, calculateModelCost, clearStats, plugin as default, deriveAllKeys, deriveEvmKey, deriveSolanaKeyBytes, fetchWithRetry, formatDuration, formatStatsAscii, generateWalletMnemonic, getAgenticModels, getFallbackChain, getFallbackChainFiltered, getModelContextWindow, getPartnerService, getProxyPort, getSessionId, getStats, hashRequestContent, injectAuthProfile, injectModelsConfig, isAgenticModel, isBalanceError, isBlockrunWebSearchDisabled, isEmptyWalletError, isInsufficientFundsError, isRetryable, isRpcError, isValidMnemonic, loadPaymentChain, logUsage, parseCallArgs, resolveModelAlias, resolvePaymentChain, route, savePaymentChain, setupSolana, startProxy };
+export { type AggregatedStats, BALANCE_THRESHOLDS, BLOCKRUN_MODELS, BLOCKRUN_PLUGIN_ID, type BalanceInfo, BalanceMonitor, CAIP2_BASE, CAIP2_SOLANA_MAINNET, type CachedLLMResponse, type CachedResponse, type CheckResult, type CounterpartyInfo, DEFAULT_RETRY_CONFIG, DEFAULT_SESSION_CONFIG, type DailyStats, type DerivedKeys, EmptyWalletError, FileSpendControlStorage, InMemorySpendControlStorage, InsufficientFundsError, type InsufficientFundsInfo, type LowBalanceInfo, MODEL_ALIASES, MalformedSpendPolicyError, OPENCLAW_MODELS, PARTNER_SERVICES, PAYABLE_NETWORKS, type PartnerServiceDefinition, type PartnerToolDefinition, type PaymentChain, type PolicyList, type ProxyHandle, type ProxyOptions, RequestDeduplicator, ResponseCache, type ResponseCacheConfig, type RetryConfig, RpcError, type SessionConfig, type SessionEntry, SessionStore, type SolanaBalanceInfo, SolanaBalanceMonitor, SpendControl, type SpendControlOptions, type SpendControlStorage, type SpendLimits, SpendPolicyError, type SpendRecord, type SpendWindow, type SpendingStatus, type SufficiencyResult, UnreadableSpendPolicyError, type UsageEntry, VISIBLE_OPENCLAW_MODELS, type WalletConfig, type WalletResolution, blockrunProvider, buildImageGenerationProvider, buildPartnerTools, buildProviderModels, clearStats, plugin as default, deriveAllKeys, deriveEvmKey, deriveSolanaKeyBytes, fetchWithRetry, formatDuration, formatStatsAscii, generateWalletMnemonic, getAgenticModels, getModelContextWindow, getPartnerService, getProxyPort, getSessionId, getStats, hashRequestContent, injectAuthProfile, injectModelsConfig, isAgenticModel, isBalanceError, isBlockrunWebSearchDisabled, isEmptyWalletError, isInsufficientFundsError, isRetryable, isRpcError, isValidMnemonic, loadPaymentChain, logUsage, parseCallArgs, registerSpendPolicyHook, resolveModelAlias, resolvePaymentChain, savePaymentChain, setupSolana, startProxy, syncAgentModelCache };

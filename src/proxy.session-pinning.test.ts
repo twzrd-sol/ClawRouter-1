@@ -4,8 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { generatePrivateKey } from "viem/accounts";
 
 import { startProxy, type ProxyHandle } from "./proxy.js";
-import { DEFAULT_ROUTING_CONFIG } from "./router/config.js";
-import type { RoutingDecision } from "./router/types.js";
+import { DEFAULT_ROUTING_CONFIG, type RoutingDecision } from "./router/index.js";
 
 const EXPLICIT_MODEL = "openai/user-explicit";
 const AUTO_PRIMARY = "openai/auto-primary";
@@ -45,7 +44,17 @@ async function createUpstream(
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
 
-    const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+    // The proxy reads `${apiBase}/v1/models` once at startup (see
+    // loadGatewayCatalog) — a GET with no body. Answer it here and return:
+    // parsing it throws "Unexpected end of JSON input", and letting it reach the
+    // handler would record a phantom "" entry in whatever this test asserts on.
+    const rawBody = Buffer.concat(chunks).toString();
+    if (!rawBody) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ data: [] }));
+      return;
+    }
+    const body = JSON.parse(rawBody) as Record<string, unknown>;
     await handler(body, req, res);
   });
 
@@ -211,6 +220,243 @@ describe("proxy session pinning", () => {
     expect(receivedModels).toEqual([EXPLICIT_MODEL, EXPLICIT_MODEL]);
     expect(routedDecisions).toHaveLength(1);
     expect(routedDecisions[0]?.model).toBe(EXPLICIT_MODEL);
+  });
+
+  it("emits a local shadow comparison without changing the serving request", async () => {
+    const receivedModels: string[] = [];
+    const shadows: Array<{
+      executed: RoutingDecision;
+      shadow: RoutingDecision;
+      sameModel: boolean;
+      hasTools: boolean;
+      hasVision: boolean;
+      requiresStructuredOutput: boolean;
+    }> = [];
+    const upstreamSetup = await createUpstream((body, _req, res) => {
+      const model = String(body.model ?? "");
+      receivedModels.push(model);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl-shadow",
+          object: "chat.completion",
+          created: 1,
+          model,
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: "ok" },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+    });
+    upstream = upstreamSetup.server;
+    proxy = await startProxy({
+      wallet: generatePrivateKey(),
+      apiBase: upstreamSetup.url,
+      port: 0,
+      skipBalanceCheck: true,
+      cacheConfig: { enabled: false },
+      routingConfig: {
+        ...createRoutingConfig(),
+        strategy: "portfolio",
+        shadow: { strategy: "rules", sampleRate: 1 },
+      },
+      onShadowRouted: (comparison) => shadows.push(comparison),
+    });
+
+    const response = await postChat(proxy, "shadow", "blockrun/auto", "simple follow-up");
+    expect(response.status).toBe(200);
+    expect(receivedModels).toEqual([AUTO_PRIMARY]);
+    expect(shadows).toHaveLength(1);
+    expect(shadows[0]).toMatchObject({
+      hasTools: false,
+      hasVision: false,
+      requiresStructuredOutput: false,
+    });
+    expect(JSON.stringify(shadows[0])).not.toContain("simple follow-up");
+  });
+
+  it("reports the session-pinned serving model in shadow telemetry", async () => {
+    const receivedModels: string[] = [];
+    const shadows: Array<{ executed: RoutingDecision; shadow: RoutingDecision }> = [];
+    const upstreamSetup = await createUpstream((body, _req, res) => {
+      const model = String(body.model ?? "");
+      receivedModels.push(model);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: `chatcmpl-shadow-pin-${receivedModels.length}`,
+          object: "chat.completion",
+          created: 1,
+          model,
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+    });
+    upstream = upstreamSetup.server;
+    proxy = await startProxy({
+      wallet: generatePrivateKey(),
+      apiBase: upstreamSetup.url,
+      port: 0,
+      skipBalanceCheck: true,
+      cacheConfig: { enabled: false },
+      routingConfig: {
+        ...createRoutingConfig(),
+        strategy: "portfolio",
+        shadow: { strategy: "rules", sampleRate: 1 },
+      },
+      onShadowRouted: (comparison) => shadows.push(comparison),
+    });
+
+    const sessionId = "shadow-pinned-session";
+    expect((await postChat(proxy, sessionId, EXPLICIT_MODEL, "pin this model")).status).toBe(200);
+    expect((await postChat(proxy, sessionId, "blockrun/auto", "simple follow-up")).status).toBe(
+      200,
+    );
+
+    expect(receivedModels).toEqual([EXPLICIT_MODEL, EXPLICIT_MODEL]);
+    expect(shadows).toHaveLength(1);
+    expect(shadows[0]?.executed.model).toBe(EXPLICIT_MODEL);
+    expect(shadows[0]?.shadow.model).toBe(AUTO_PRIMARY);
+    expect(shadows[0]?.executed.model).not.toBe(shadows[0]?.shadow.model);
+  });
+
+  it("isolates shadow callback failures from the serving request", async () => {
+    const receivedModels: string[] = [];
+    let shadowCallbackCalls = 0;
+    const upstreamSetup = await createUpstream((body, _req, res) => {
+      const model = String(body.model ?? "");
+      receivedModels.push(model);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "chatcmpl-shadow-callback-failure",
+          object: "chat.completion",
+          created: 1,
+          model,
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+    });
+    upstream = upstreamSetup.server;
+    proxy = await startProxy({
+      wallet: generatePrivateKey(),
+      apiBase: upstreamSetup.url,
+      port: 0,
+      skipBalanceCheck: true,
+      cacheConfig: { enabled: false },
+      routingConfig: {
+        ...createRoutingConfig(),
+        strategy: "portfolio",
+        shadow: { strategy: "rules", sampleRate: 1 },
+      },
+      onShadowRouted: () => {
+        shadowCallbackCalls += 1;
+        throw new Error("telemetry sink unavailable");
+      },
+    });
+
+    const response = await postChat(proxy, "shadow-callback-failure", "blockrun/auto", "hello");
+    expect(response.status).toBe(200);
+    expect(receivedModels).toEqual([AUTO_PRIMARY]);
+    expect(shadowCallbackCalls).toBe(1);
+  });
+
+  it("does not reinsert a sticky model removed by a hard capacity filter", async () => {
+    // Needs a catalog model whose maxOutput is under the 20_000 max_tokens
+    // requested below. This was openai/gpt-5.3 until the 2026-08-30 catalog
+    // resync raised its maxOutput to 128_000 to match blockrun — which quietly
+    // made the fixture stop exercising the filter. gpt-4o's 16_384 cap has been
+    // stable since it was listed.
+    const capacityLimitedModel = "openai/gpt-4o";
+    const receivedModels: string[] = [];
+    const upstreamSetup = await createUpstream((body, _req, res) => {
+      const model = String(body.model ?? "");
+      receivedModels.push(model);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: `chatcmpl-capacity-${receivedModels.length}`,
+          object: "chat.completion",
+          created: 1,
+          model,
+          choices: [
+            { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      );
+    });
+    upstream = upstreamSetup.server;
+    proxy = await startProxy({
+      wallet: generatePrivateKey(),
+      apiBase: upstreamSetup.url,
+      port: 0,
+      skipBalanceCheck: true,
+      cacheConfig: { enabled: false },
+      routingConfig: createRoutingConfig(),
+    });
+
+    const sessionId = "capacity-filtered-pin";
+    expect((await postChat(proxy, sessionId, capacityLimitedModel, "pin this model")).status).toBe(
+      200,
+    );
+    expect(
+      (
+        await postChat(proxy, sessionId, "blockrun/auto", "produce a long answer", {
+          max_tokens: 20_000,
+        })
+      ).status,
+    ).toBe(200);
+
+    expect(receivedModels).toEqual([capacityLimitedModel, AUTO_PRIMARY]);
+  });
+
+  it("returns a clear error without an upstream attempt when every candidate is too small", async () => {
+    const receivedModels: string[] = [];
+    const upstreamSetup = await createUpstream((body, _req, res) => {
+      receivedModels.push(String(body.model ?? ""));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [] }));
+    });
+    upstream = upstreamSetup.server;
+    const tooSmall = "openai/gpt-4o"; // maxOutput 16_384 < the 20_000 requested below
+    const tooSmallConfig = {
+      ...createRoutingConfig(),
+      tiers: {
+        SIMPLE: { primary: tooSmall, fallback: [] },
+        MEDIUM: { primary: tooSmall, fallback: [] },
+        COMPLEX: { primary: tooSmall, fallback: [] },
+        REASONING: { primary: tooSmall, fallback: [] },
+      },
+    };
+    proxy = await startProxy({
+      wallet: generatePrivateKey(),
+      apiBase: upstreamSetup.url,
+      port: 0,
+      skipBalanceCheck: true,
+      cacheConfig: { enabled: false },
+      routingConfig: tooSmallConfig,
+    });
+
+    const response = await postChat(proxy, "all-capacity-ineligible", "blockrun/auto", "hello", {
+      max_tokens: 20_000,
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { code: "context_capacity_exceeded" },
+    });
+    expect(receivedModels).toEqual([]);
   });
 
   it("retries an explicit-pin model once on transient 5xx upstream errors", async () => {

@@ -1,5 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+/**
+ * Drain the microtask queue.
+ *
+ * These tests used to flush with a fixed pair of `await Promise.resolve()`,
+ * which pins the exact number of awaits inside startProxyInBackground — adding
+ * one (resolving the BlockRun API key before any wallet is touched, v0.12.268)
+ * broke four of them without changing any behaviour they test. Draining until
+ * quiet keeps the assertions about ordering instead of about await counts.
+ * Fake timers are unaffected: this advances no clock.
+ */
+const flush = async (): Promise<void> => {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+};
+
 vi.mock("node:fs", () => ({
   writeFileSync: vi.fn(),
   existsSync: vi.fn(() => false),
@@ -35,12 +49,14 @@ describe("plugin lifecycle", () => {
       __clawrouterStartupGeneration?: number;
       __clawrouterStartedWithEmptyConfig?: boolean;
       __clawrouterStartupPhase?: "idle" | "probing" | "starting" | "running";
+      __clawrouterSharedSpendControl?: unknown;
     };
     proc.__clawrouterProxyStarted = undefined;
     proc.__clawrouterDeferredStartTimer = undefined;
     proc.__clawrouterStartupGeneration = undefined;
     proc.__clawrouterStartedWithEmptyConfig = undefined;
     proc.__clawrouterStartupPhase = undefined;
+    proc.__clawrouterSharedSpendControl = undefined;
   });
 
   it("clears deferred proxy startup state during deactivate", async () => {
@@ -73,6 +89,50 @@ describe("plugin lifecycle", () => {
     expect(proc.__clawrouterDeferredStartTimer).toBeUndefined();
   });
 
+  it("connects /policy to the process-wide ledger when another module owns the proxy", async () => {
+    const { InMemorySpendControlStorage, SpendControl, setSharedSpendControl } =
+      await import("./spend-control.js");
+    const shared = new SpendControl({ storage: new InMemorySpendControlStorage() });
+    shared.setLimit("daily", 7);
+    setSharedSpendControl(shared);
+
+    const proc = process as NodeJS.Process & { __clawrouterProxyStarted?: boolean };
+    proc.__clawrouterProxyStarted = true;
+    const commands: import("./types.js").OpenClawPluginCommandDefinition[] = [];
+    const api = {
+      id: "duplicate-module",
+      name: "duplicate-module",
+      source: "local",
+      config: {},
+      pluginConfig: {},
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      registerProvider: vi.fn(),
+      registerImageGenerationProvider: vi.fn(),
+      registerMusicGenerationProvider: vi.fn(),
+      registerWebSearchProvider: vi.fn(),
+      registerTool: vi.fn(),
+      registerHook: vi.fn(),
+      registerHttpRoute: vi.fn(),
+      registerService: vi.fn(),
+      registerCommand: vi.fn((command) => commands.push(command)),
+      resolvePath: vi.fn((input: string) => input),
+      on: vi.fn(),
+    } as unknown as import("./types.js").OpenClawPluginApi;
+
+    const { default: plugin } = await import("./index.js");
+    plugin.register?.(api);
+    const policy = commands.find((command) => command.name === "policy");
+    expect(policy).toBeDefined();
+    const result = await policy!.handler({
+      channel: "test",
+      isAuthorizedSender: true,
+      commandBody: "",
+      args: "",
+      config: {},
+    });
+    expect(result.text).toContain("daily: $7");
+  });
+
   it("restarts a provisional default-config proxy when populated pluginConfig arrives later", async () => {
     vi.useFakeTimers();
 
@@ -96,6 +156,13 @@ describe("plugin lifecycle", () => {
     vi.doMock("./proxy.js", () => ({
       getProxyPort: () => 8402,
       startProxy,
+    }));
+    vi.doMock("./api-key.js", () => ({
+      resolveApiKey: vi.fn(async () => undefined),
+      isValidApiKey: (v: unknown) => typeof v === "string" && v.startsWith("brk_"),
+      maskApiKey: (v: string) => v,
+      PORTAL_CREDITS_URL: "https://user.blockrun.ai/dashboard/credits",
+      PORTAL_KEYS_URL: "https://user.blockrun.ai/dashboard/keys",
     }));
     vi.doMock("./auth.js", () => ({
       resolveOrGenerateWalletKey: vi.fn(async () => ({
@@ -186,21 +253,171 @@ describe("plugin lifecycle", () => {
 
       plugin.register?.(emptyApi);
       await vi.advanceTimersByTimeAsync(300);
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
 
       expect(startProxy).toHaveBeenCalledTimes(1);
       expect(startProxy.mock.calls[0]?.[0]?.routingConfig).toBeUndefined();
 
       plugin.register?.(configuredApi);
       await vi.runAllTimersAsync();
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
 
       expect(firstClose).toHaveBeenCalledTimes(1);
       expect(startProxy).toHaveBeenCalledTimes(2);
       expect(startProxy.mock.calls[1]?.[0]?.routingConfig).toEqual(configuredRouting);
       expect(secondClose).not.toHaveBeenCalled();
+    } finally {
+      process.argv = originalArgv;
+    }
+  });
+
+  it("resets the session window across an in-process proxy restart, keeping the daily one", async () => {
+    vi.useFakeTimers();
+
+    const firstClose = vi.fn(async () => {});
+    const secondClose = vi.fn(async () => {});
+    const startProxy = vi
+      .fn()
+      .mockResolvedValueOnce({
+        close: firstClose,
+        balanceMonitor: {
+          checkBalance: vi.fn(async () => ({ isEmpty: true, isLow: false, balanceUSD: "0.00" })),
+        },
+      })
+      .mockResolvedValueOnce({
+        close: secondClose,
+        balanceMonitor: {
+          checkBalance: vi.fn(async () => ({ isEmpty: true, isLow: false, balanceUSD: "0.00" })),
+        },
+      });
+
+    vi.doMock("./proxy.js", () => ({
+      getProxyPort: () => 8402,
+      startProxy,
+    }));
+    vi.doMock("./api-key.js", () => ({
+      resolveApiKey: vi.fn(async () => undefined),
+      isValidApiKey: (v: unknown) => typeof v === "string" && v.startsWith("brk_"),
+      maskApiKey: (v: string) => v,
+      PORTAL_CREDITS_URL: "https://user.blockrun.ai/dashboard/credits",
+      PORTAL_KEYS_URL: "https://user.blockrun.ai/dashboard/keys",
+    }));
+    vi.doMock("./auth.js", () => ({
+      resolveOrGenerateWalletKey: vi.fn(async () => ({
+        key: "0x1234567890123456789012345678901234567890123456789012345678901234",
+        address: "0x1111111111111111111111111111111111111111",
+        source: "saved",
+      })),
+      setupSolana: vi.fn(),
+      savePaymentChain: vi.fn(),
+      resolvePaymentChain: vi.fn(async () => "base"),
+      WALLET_FILE: "/tmp/wallet",
+      MNEMONIC_FILE: "/tmp/mnemonic",
+    }));
+    vi.doMock("./provider.js", () => ({
+      blockrunProvider: { id: "blockrun" },
+      setActiveProxy: vi.fn(),
+    }));
+    vi.doMock("./models.js", () => ({
+      OPENCLAW_MODELS: [],
+      VISIBLE_OPENCLAW_MODELS: [],
+    }));
+    vi.doMock("./web-search-provider.js", () => ({
+      BLOCKRUN_EXA_PROVIDER_ID: "blockrun-exa",
+      blockrunExaWebSearchProvider: { id: "blockrun-exa" },
+    }));
+    vi.doMock("./partners/index.js", () => ({
+      buildPartnerTools: vi.fn(() => []),
+      PARTNER_SERVICES: [],
+    }));
+    vi.doMock("./commands/stats.js", () => ({
+      createStatsCommand: vi.fn(() => ({ name: "stats", handler: vi.fn() })),
+    }));
+    vi.doMock("./commands/exclude.js", () => ({
+      createExcludeCommand: vi.fn(() => ({ name: "exclude", handler: vi.fn() })),
+    }));
+    vi.doMock("./mcp-config.js", () => ({
+      BLOCKRUN_MCP_SERVER_NAME: "blockrun",
+      createBlockrunMcpServerDefinition: vi.fn(() => ({ command: "npx", args: [] })),
+      ensureBlockrunMcpServerConfig: vi.fn(() => ({ changed: false, status: "preserved" })),
+      removeManagedBlockrunMcpServerConfig: vi.fn(),
+    }));
+    vi.doMock("./version.js", () => ({
+      VERSION: "test",
+    }));
+    vi.doMock("./exclude-models.js", () => ({
+      loadExcludeList: vi.fn(() => new Set()),
+    }));
+
+    const createApi = (pluginConfig: Record<string, unknown>) =>
+      ({
+        id: "test",
+        name: "test",
+        source: "local",
+        config: {},
+        pluginConfig,
+        logger: {
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+        },
+        registerProvider: vi.fn(),
+        registerImageGenerationProvider: vi.fn(),
+        registerMusicGenerationProvider: vi.fn(),
+        registerWebSearchProvider: vi.fn(),
+        registerTool: vi.fn(),
+        registerHook: vi.fn(),
+        registerHttpRoute: vi.fn(),
+        registerService: vi.fn(),
+        registerCommand: vi.fn(),
+        resolvePath: vi.fn((input: string) => input),
+        on: vi.fn(),
+      }) as unknown as import("./types.js").OpenClawPluginApi;
+
+    const originalArgv = process.argv;
+    process.argv = [...originalArgv, "gateway"];
+
+    try {
+      const { default: plugin } = await import("./index.js");
+      const emptyApi = createApi({});
+      const configuredRouting = {
+        tiers: {
+          SIMPLE: { primary: "configured-model", fallback: [] },
+        },
+      };
+      const configuredApi = createApi({
+        routing: configuredRouting,
+      });
+
+      const { InMemorySpendControlStorage, SpendControl, setSharedSpendControl } =
+        await import("./spend-control.js");
+      const shared = new SpendControl({ storage: new InMemorySpendControlStorage() });
+      setSharedSpendControl(shared);
+
+      plugin.register?.(emptyApi);
+      await vi.advanceTimersByTimeAsync(300);
+      await flush();
+
+      expect(startProxy).toHaveBeenCalledTimes(1);
+      expect(startProxy.mock.calls[0]?.[0]?.spendControl).toBe(shared);
+
+      // Spend on the ledger the running proxy signs against.
+      shared.record(3, { model: "some/model" });
+      expect(shared.getSpending("session")).toBe(3);
+      expect(shared.getSpending("daily")).toBe(3);
+
+      plugin.register?.(configuredApi);
+      await vi.runAllTimersAsync();
+      await flush();
+
+      expect(firstClose).toHaveBeenCalledTimes(1);
+      expect(startProxy).toHaveBeenCalledTimes(2);
+      // Same ledger across the restart — that is the point of the singleton...
+      expect(startProxy.mock.calls[1]?.[0]?.spendControl).toBe(shared);
+      // ...but `session` is documented as resetting on restart, so it does,
+      // while the rolling daily window keeps counting the same payment.
+      expect(shared.getSpending("session")).toBe(0);
+      expect(shared.getSpending("daily")).toBe(3);
     } finally {
       process.argv = originalArgv;
     }
@@ -230,6 +447,13 @@ describe("plugin lifecycle", () => {
       getProxyPort: () => 8402,
       startProxy,
     }));
+    vi.doMock("./api-key.js", () => ({
+      resolveApiKey: vi.fn(async () => undefined),
+      isValidApiKey: (v: unknown) => typeof v === "string" && v.startsWith("brk_"),
+      maskApiKey: (v: string) => v,
+      PORTAL_CREDITS_URL: "https://user.blockrun.ai/dashboard/credits",
+      PORTAL_KEYS_URL: "https://user.blockrun.ai/dashboard/keys",
+    }));
     vi.doMock("./auth.js", () => ({
       resolveOrGenerateWalletKey: vi.fn(async () => ({
         key: "0x1234567890123456789012345678901234567890123456789012345678901234",
@@ -319,8 +543,7 @@ describe("plugin lifecycle", () => {
 
       plugin.register?.(emptyApi);
       await vi.advanceTimersByTimeAsync(300);
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
 
       expect(startProxy).toHaveBeenCalledTimes(1);
 
@@ -329,8 +552,7 @@ describe("plugin lifecycle", () => {
 
       rejectFirstStart(new Error("provisional startup failed"));
       await vi.runAllTimersAsync();
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
 
       expect(startProxy).toHaveBeenCalledTimes(2);
       expect(startProxy.mock.calls[1]?.[0]?.routingConfig).toEqual(configuredRouting);
@@ -368,6 +590,13 @@ describe("plugin lifecycle", () => {
     vi.doMock("./proxy.js", () => ({
       getProxyPort: () => 8402,
       startProxy,
+    }));
+    vi.doMock("./api-key.js", () => ({
+      resolveApiKey: vi.fn(async () => undefined),
+      isValidApiKey: (v: unknown) => typeof v === "string" && v.startsWith("brk_"),
+      maskApiKey: (v: string) => v,
+      PORTAL_CREDITS_URL: "https://user.blockrun.ai/dashboard/credits",
+      PORTAL_KEYS_URL: "https://user.blockrun.ai/dashboard/keys",
     }));
     vi.doMock("./auth.js", () => ({
       resolveOrGenerateWalletKey: vi.fn(async () => ({
@@ -466,8 +695,7 @@ describe("plugin lifecycle", () => {
 
       plugin.register?.(emptyApi);
       await vi.advanceTimersByTimeAsync(300);
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
 
       expect(startProxy).toHaveBeenCalledTimes(1);
 
@@ -476,8 +704,7 @@ describe("plugin lifecycle", () => {
 
       plugin.register?.(configuredApiB);
       await vi.runAllTimersAsync();
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
 
       expect(startProxy).toHaveBeenCalledTimes(2);
       expect(startProxy.mock.calls[1]?.[0]?.routingConfig).toEqual(configuredRoutingB);
@@ -488,8 +715,7 @@ describe("plugin lifecycle", () => {
           checkBalance: vi.fn(async () => ({ isEmpty: true, isLow: false, balanceUSD: "0.00" })),
         },
       });
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
 
       expect(firstClose).toHaveBeenCalledTimes(1);
       expect(startProxy).toHaveBeenCalledTimes(2);
@@ -503,6 +729,13 @@ describe("plugin lifecycle", () => {
     vi.doMock("./proxy.js", () => ({
       getProxyPort: () => 8402,
       startProxy: vi.fn(),
+    }));
+    vi.doMock("./api-key.js", () => ({
+      resolveApiKey: vi.fn(async () => undefined),
+      isValidApiKey: (v: unknown) => typeof v === "string" && v.startsWith("brk_"),
+      maskApiKey: (v: string) => v,
+      PORTAL_CREDITS_URL: "https://user.blockrun.ai/dashboard/credits",
+      PORTAL_KEYS_URL: "https://user.blockrun.ai/dashboard/keys",
     }));
     vi.doMock("./auth.js", () => ({
       resolveOrGenerateWalletKey: vi.fn(async () => ({
@@ -610,6 +843,13 @@ describe("plugin lifecycle", () => {
           }),
       ),
     }));
+    vi.doMock("./api-key.js", () => ({
+      resolveApiKey: vi.fn(async () => undefined),
+      isValidApiKey: (v: unknown) => typeof v === "string" && v.startsWith("brk_"),
+      maskApiKey: (v: string) => v,
+      PORTAL_CREDITS_URL: "https://user.blockrun.ai/dashboard/credits",
+      PORTAL_KEYS_URL: "https://user.blockrun.ai/dashboard/keys",
+    }));
     vi.doMock("./auth.js", () => ({
       resolveOrGenerateWalletKey: vi.fn(async () => ({
         key: "0x1234567890123456789012345678901234567890123456789012345678901234",
@@ -699,8 +939,7 @@ describe("plugin lifecycle", () => {
         },
       });
 
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
 
       expect(close).toHaveBeenCalledTimes(1);
     } finally {

@@ -1,6 +1,6 @@
 ---
 name: clawrouter
-description: Hosted-gateway LLM router — save 67% on inference costs. A local proxy that forwards each request to the blockrun.ai gateway, which routes to the cheapest capable model across 55+ models from OpenAI, Anthropic, Google, DeepSeek, xAI, NVIDIA, and more. 7 free NVIDIA models included. Also exposes realtime market data (global stocks, crypto, FX, commodities), Twitter/X intelligence, prediction-market data across Polymarket, Kalshi, Limitless, Opinion, Predict.Fun, dFlow + UMA oracle resolution + wallet identity & clustering, phone-number intelligence (carrier + SIM-swap fraud detection) plus AI-powered outbound voice calls (Twilio + Bland.ai), AND the Surf unified crypto data API (84 endpoints — CEX/DEX, on-chain SQL over 80+ ClickHouse tables, 100M+ labeled wallets, prediction markets, social/CT mindshare, news, VC fund intel) as built-in agent tools. Not a local-inference tool — prompts are sent to the blockrun.ai gateway.
+description: Hosted-gateway LLM router — save 84% on inference costs. A local proxy that forwards each request to the blockrun.ai gateway, which routes to the cheapest capable model across 76 models from OpenAI, Anthropic, Google, DeepSeek, xAI, Z.AI, and more. 7 free open-weight models included. Also exposes realtime market data (global stocks, crypto, FX, commodities), Twitter/X intelligence, prediction-market data across Polymarket, Kalshi, Limitless, Opinion, Predict.Fun, dFlow + UMA oracle resolution + wallet identity & clustering, phone-number intelligence (carrier + SIM-swap fraud detection) plus AI-powered outbound voice calls (Twilio + Bland.ai), AND the Surf unified crypto data API (84 endpoints — CEX/DEX, on-chain SQL over 80+ ClickHouse tables, 100M+ labeled wallets, prediction markets, social/CT mindshare, news, VC fund intel) as built-in agent tools. Not a local-inference tool — prompts are sent to the blockrun.ai gateway.
 triggers:
   - "clawrouter"
   - "claw router"
@@ -53,7 +53,7 @@ metadata:
 
 # ClawRouter
 
-Hosted-gateway LLM router that saves 67% on inference costs by forwarding each request to the blockrun.ai gateway, which picks the cheapest model capable of handling it across 55+ models from 9 providers (7 free NVIDIA models). All billing flows through one USDC wallet; you do not hold provider API keys.
+Hosted-gateway LLM router that saves <!-- br:savings.autoVsBaselinePct -->84<!-- /br:savings.autoVsBaselinePct -->% on inference costs by forwarding each request to the blockrun.ai gateway, which picks the cheapest model capable of handling it across <!-- br:models.chatVisible -->76<!-- /br:models.chatVisible --> models from 9 providers (<!-- br:models.free -->7<!-- /br:models.free --> free open-weight models). All billing flows through one BlockRun credential — either a USDC wallet paying x402 per call, or a BlockRun API key drawing on card-funded account credit. Either way you do not hold provider API keys.
 
 **This is not a local-inference tool.** ClawRouter is a thin local proxy. Your prompts are sent over HTTPS to the blockrun.ai gateway for model execution. If your workload requires inference that never leaves your machine, use a local runtime like Ollama — ClawRouter is not the right tool for that use case.
 
@@ -69,7 +69,7 @@ Your app → localhost proxy (ClawRouter) → https://blockrun.ai/api  (or sol.b
                                         Response → back through proxy → your app
 ```
 
-**Sent to blockrun.ai on every request:** the model name, the full prompt/messages body, sampling params (temperature, max_tokens, tools, etc.), and an `X-PAYMENT` header containing a signed x402 USDC micropayment.
+**Sent to blockrun.ai on every request:** the model name, the full prompt/messages body, sampling params (temperature, max_tokens, tools, etc.), and a payment credential — an `X-PAYMENT` header containing a signed x402 USDC micropayment in wallet mode, or an `Authorization: Bearer brk_live_…` header in API-key mode.
 
 **Not sent:** your wallet private key (only the detached payment signature is sent), any other local files, environment variables, or OpenClaw config beyond what's needed for this request.
 
@@ -81,12 +81,12 @@ ClawRouter does **not** collect or forward third-party provider API keys. You do
 
 **What `models.providers.blockrun` stores (fully enumerated):**
 
-| Field       | Sensitive | Purpose                                                                                                                                                                                                    |
-| ----------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `walletKey` | Yes       | EVM private key used to sign USDC micropayments via x402. **Auto-generated locally on first run** — no user input required. Never transmitted over the network; only detached payment signatures are sent. |
-| `solanaKey` | Yes       | Solana keypair (BIP-44 `m/44'/501'/0'/0'`). Auto-derived from the same local mnemonic via `@scure/bip32` + `@scure/bip39`.                                                                                 |
-| `gateway`   | No        | Gateway URL. Defaults: `https://blockrun.ai/api` (Base) · `https://sol.blockrun.ai/api` (Solana).                                                                                                          |
-| `routing`   | No        | Optional override of the default four-tier router.                                                                                                                                                         |
+| Field       | Sensitive           | Purpose                                                                                                                                                                                                                                                                               |
+| ----------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `walletKey` | Only in wallet mode | EVM private key used to sign USDC micropayments via x402. **Auto-generated locally on first run** — no user input required. Never transmitted over the network; only detached payment signatures are sent. Not used, read, or generated at all when a BlockRun API key is configured. |
+| `solanaKey` | Yes                 | Solana keypair (BIP-44 `m/44'/501'/0'/0'`). Auto-derived from the same local mnemonic via `@scure/bip32` + `@scure/bip39`.                                                                                                                                                            |
+| `gateway`   | No                  | Gateway URL. Defaults: `https://sol.blockrun.ai/api` (Solana, default chain for new installs) · `https://blockrun.ai/api` (Base, default for pre-existing installs).                                                                                                                  |
+| `routing`   | No                  | Optional override of the router-core config (tier chains, `strategy: "rules"` rollback, `shadow` comparison, scorer keywords).                                                                                                                                                        |
 
 **How and where keys are stored:**
 
@@ -124,18 +124,30 @@ openclaw models set openai/gpt-4o
 
 ## How Routing Works
 
-ClawRouter classifies each request into one of four tiers:
+Routing is done locally by [`@blockrun/router-core`](https://github.com/BlockRunAI/router-core) (Router Core V3.4, constraint-first), inlined into ClawRouter and pinned by commit. No network call, no second model — about a quarter of a millisecond per request.
 
-- **SIMPLE** (40% of traffic) — factual lookups, greetings, translations → Gemini Flash ($0.60/M, 99% savings)
-- **MEDIUM** (30%) — summaries, explanations, data extraction → DeepSeek Chat ($0.42/M, 99% savings)
-- **COMPLEX** (20%) — code generation, multi-step analysis → Claude Opus ($75/M, best quality)
-- **REASONING** (10%) — proofs, formal logic, multi-step math → o3 ($8/M, 89% savings)
+1. A 15-dimension weighted scorer classifies each request into one of four tiers, and a task classifier labels the shape of the work (chat, extraction, code_edit, code_agent, tool_agent, reasoning_math, long_context, vision, …).
+2. Models that cannot satisfy the request — no tool calling, no vision, too small a context window or max-output, incompatible structured output — are removed before anything is scored.
+3. Survivors are ranked on task quality, capability, estimated cost, speed and reliability; the full ranked list is kept as the fallback chain for timeouts and 5xx.
 
-Rules handle ~~80% of requests in <1ms. Only ambiguous queries hit the LLM classifier (~~$0.00003 per classification).
+Curated primaries on the default `auto` profile:
+
+- **SIMPLE** — factual lookups, greetings, translations → gemini-2.5-flash ($0.30/$2.50)
+- **MEDIUM** — summaries, explanations, data extraction → kimi-k2.7 ($0.95/$4.00)
+- **COMPLEX** — code generation, multi-step analysis → gemini-3.1-pro ($2/$12)
+- **REASONING** — proofs, formal logic, multi-step math → grok-4-1-fast-reasoning ($0.20/$0.50)
+
+Turns that actually need their attached tools switch to agent-tuned tiers (gpt-4o-mini → kimi-k2.7 → claude-sonnet-4.6). `eco` opens on the free tier (nemotron-3.5-lightning); `premium` climbs to gpt-5.3-codex / claude-fable-5 / claude-sonnet-4.6. Full chains: [docs/routing-profiles.md](../../docs/routing-profiles.md).
+
+Prices are per 1M input/output tokens. Per-tier
+savings percentages are deliberately not quoted here: the published figure is
+blended across a stated workload mix, and a per-tier number invites comparing
+it against a baseline nobody wrote down. See
+[savings-mix.json](https://github.com/BlockRunAI/blockrun/blob/main/src/brand/savings-mix.json).
 
 ## Available Models
 
-55+ models including: gpt-5.6-terra [balanced, stable default], gpt-5.6-sol [flagship], gpt-5.6-luna [cost-efficient], gpt-5.5, gpt-5.4, gpt-4o, o3, claude-opus-4.8, claude-opus-4.7, claude-opus-4.6, claude-opus-4.5, claude-sonnet-5, claude-sonnet-4.6, gemini-3.1-pro, gemini-2.5-flash, deepseek-v4-pro, deepseek-chat, grok-4.3, grok-build-0.1, kimi-k2.7, kimi-k2.6, and 8 free NVIDIA models (gpt-oss-120b [default], gpt-oss-20b, mistral-large-3-675b, qwen3.5-122b-a10b, qwen3-next-80b-a3b-instruct, llama-4-maverick, seed-oss-36b [coding], nemotron-3-nano-omni-30b-a3b-reasoning [vision]).
+<!-- br:models.chatVisible -->76<!-- /br:models.chatVisible --> models including: gpt-5.6-terra [balanced, stable default], gpt-5.6-sol [flagship], gpt-5.6-luna [cost-efficient], gpt-5.6-sol/terra/luna-pro [pro reasoning tiers], gpt-5.5, gpt-5.5-pro [max compute], chat-latest [ChatGPT Instant], gpt-5.4, gpt-4o, o3, claude-fable-5, claude-opus-5 [Anthropic flagship, 1M ctx], claude-opus-4.8, claude-opus-4.7, claude-opus-4.5, claude-sonnet-5, claude-sonnet-4.6, gemini-3.1-pro, gemini-3.6-flash, gemini-3.5-flash-lite, gemini-2.5-flash, deepseek-v4-pro, deepseek-chat, grok-4.5, grok-4.3, grok-build-0.1, glm-5.3 [Z.AI flagship, 1M ctx], glm-5.3-flash [natively multimodal, 1M ctx — $0.15/$0.50], glm-5.2, minimax-m3, kimi-k3 [1M ctx flagship], kimi-k2.7, qwen3.7-max [Qwen flagship, 1M ctx], qwen3.7-plus, qwen3.7-flash, hy3 [Tencent], mimo [Xiaomi MiMo-V2.5 Pro, 1M ctx], and 7 free open-weight models (nemotron-3.5-lightning [1M ctx, thinking mode — the free default], nemotron-3-nano-30b [fastest, ~121 tok/s], nemotron-3-ultra-550b [550B/55B MoE, 1M ctx — the largest free model], nemotron-3-nano-omni-30b-a3b-reasoning [256K ctx], llama-3.2-11b-vision [Meta Llama], north-mini-code [Cohere, coding, sub-second], laguna-xs-2.1 [Poolside, coding, ~161 tok/s]). The free tier is text-only — image turns route to a paid vision model, because the two free models the catalogs advertise as vision-capable fail a solid-colour probe on both chains and do so with an HTTP 200.
 
 ## Built-in Agent Tools
 
@@ -158,7 +170,7 @@ Realtime prices and historical OHLC across every asset class. The agent should c
 
 | Tool                        | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Price                                                               |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| `blockrun_image_generation` | 8 image models — DALL-E 3, Nano Banana / Pro, Flux, Grok Imagine, CogView-4                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | $0.015–$0.15 / image                                                |
+| `blockrun_image_generation` | 9 image models — GPT Image 1/2, Nano Banana / 2 / Pro, Seedream 5 Pro, Grok Imagine / Pro, CogView-4                                                                                                                                                                                                                                                                                                                                                                                                                                                         | $0.015–$0.15 / image                                                |
 | `blockrun_image_edit`       | Edit / inpaint existing image (openai/gpt-image-1)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | $0.02–$0.04 / image                                                 |
 | `blockrun_video_generation` | Grok Imagine + ByteDance Seedance (1.5-pro / 2.0-fast / 2.0) at 720p with synced audio (t2v default), 5–10s, + OpenAI Sora 2 via Azure (`azure/sora-2`, 4/8/12s, t2v + i2v, rejects human faces in reference images). Seedance is token-priced upstream (~20,256 tokens/sec at the 720p+audio default — 2× the prior 480p rate); `image_url` (image-to-video) costs the same as t2v since 2026-06-01. Seedance 2.0 variants accept optional `real_face_asset_id` (`ta_…`) for BytePlus RealFace character-consistency — mutually exclusive with `image_url`. | $0.05/s (Grok); $0.10/s (Sora 2); Seedance ~$0.46–$1.49 per 5s clip |
 

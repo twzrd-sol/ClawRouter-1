@@ -32,7 +32,16 @@ describe("tool forwarding", () => {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       }
 
-      receivedBody = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+      // Skip the proxy's bodyless GET of `${apiBase}/v1/models` (startup
+      // catalog read, see loadGatewayCatalog) — parsing it throws and would
+      // also clobber the request this test is actually asserting on.
+      const rawBody = Buffer.concat(chunks).toString();
+      if (!rawBody) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ data: [] }));
+        return;
+      }
+      receivedBody = JSON.parse(rawBody) as Record<string, unknown>;
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(upstreamResponse));
@@ -115,7 +124,7 @@ describe("tool forwarding", () => {
     expect(parsedTools[0]?.function?.name).toBe("web_search");
   });
 
-  it("suppresses assistant content when upstream returns tool_calls", async () => {
+  it("forwards assistant prose alongside upstream tool_calls", async () => {
     upstreamResponse = {
       id: "chatcmpl-tool-content",
       object: "chat.completion",
@@ -174,11 +183,15 @@ describe("tool forwarding", () => {
         };
       }>;
     };
-    expect(json.choices?.[0]?.message?.content).toBe("");
+    // The turn keeps its voice: a model that speaks while calling a tool must
+    // still reach the user, or the agent goes silent for the whole tool run.
+    expect(json.choices?.[0]?.message?.content).toBe(
+      "The user wants the current time. I should call get_current_time with Chicago.",
+    );
     expect(json.choices?.[0]?.message?.tool_calls).toHaveLength(1);
   });
 
-  it("suppresses assistant content in SSE chunks when upstream returns tool_calls", async () => {
+  it("streams assistant prose in SSE chunks alongside upstream tool_calls", async () => {
     upstreamResponse = {
       id: "chatcmpl-tool-content-sse",
       object: "chat.completion",
@@ -264,14 +277,15 @@ describe("tool forwarding", () => {
       })
       .filter((chunk): chunk is NonNullable<typeof chunk> => chunk !== null);
 
-    // No chunk should contain the planning prose as delta.content
-    const planningLeak = chunks.some((chunk) =>
+    // The prose must reach the client as a content delta rather than being
+    // dropped, so a tool-calling turn is not silent in the chat stream.
+    const proseDelivered = chunks.some((chunk) =>
       chunk.choices?.some((choice) => {
         const content = choice.delta?.content;
         return typeof content === "string" && content.includes("get_current_time with Chicago");
       }),
     );
-    expect(planningLeak).toBe(false);
+    expect(proseDelivered).toBe(true);
 
     // A tool_calls chunk must be emitted with the upstream function call
     const toolCallChunks = chunks.flatMap((chunk) =>
@@ -338,7 +352,7 @@ describe("tool forwarding", () => {
     expect(streamText).toContain("[DONE]");
   });
 
-  it("suppresses assistant content when upstream marks finish_reason as tool_calls", async () => {
+  it("forwards assistant prose when upstream marks finish_reason as tool_calls", async () => {
     upstreamResponse = {
       id: "chatcmpl-tool-finish-reason",
       object: "chat.completion",
@@ -388,7 +402,9 @@ describe("tool forwarding", () => {
       }>;
     };
     expect(json.choices?.[0]?.finish_reason).toBe("tool_calls");
-    expect(json.choices?.[0]?.message?.content).toBe("");
+    expect(json.choices?.[0]?.message?.content).toBe(
+      "I should look up Barcelona's next match before replying.",
+    );
   });
 
   it("synthesizes tool_calls from OpenClaw <tool_call><arg_key> XML in content (non-streaming)", async () => {
@@ -659,7 +675,7 @@ describe("tool forwarding", () => {
     expect(json.choices?.[0]?.message?.tool_calls ?? []).toHaveLength(0);
   });
 
-  it("suppresses assistant content in SSE chunks when upstream marks finish_reason as tool_calls", async () => {
+  it("streams assistant prose in SSE chunks when upstream marks finish_reason as tool_calls", async () => {
     upstreamResponse = {
       id: "chatcmpl-tool-finish-reason-sse",
       object: "chat.completion",
@@ -728,14 +744,15 @@ describe("tool forwarding", () => {
       })
       .filter((chunk): chunk is NonNullable<typeof chunk> => chunk !== null);
 
-    // Planning prose must not appear as delta.content in any chunk
-    const planningLeak = chunks.some((chunk) =>
+    // Prose reaches the client as delta.content even though the turn is
+    // marked as a tool-call turn by finish_reason alone.
+    const proseDelivered = chunks.some((chunk) =>
       chunk.choices?.some((choice) => {
         const content = choice.delta?.content;
         return typeof content === "string" && content.includes("Barcelona");
       }),
     );
-    expect(planningLeak).toBe(false);
+    expect(proseDelivered).toBe(true);
 
     // Terminal chunk must propagate the tool_calls finish_reason
     const finishReasons = chunks.flatMap((chunk) =>

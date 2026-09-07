@@ -1,5 +1,5 @@
 /**
- * Spend Control - Time-windowed spending limits
+ * Spend Control - Time-windowed spending limits and counterparty policy
  *
  * Absorbed from @blockrun/clawwallet. Chain-agnostic (works for both EVM and Solana).
  *
@@ -9,12 +9,15 @@
  * - Daily limits (e.g., max $20.00 per day)
  * - Session limits (e.g., max $5.00 per session)
  * - Rolling windows (last 1h, last 24h)
+ * - Counterparty policy: payee allow/deny, network and asset allowlists
+ * - Fail-closed enforcement before the signer, via the x402 pre-sign hook
  * - Persistent storage (~/.openclaw/blockrun/spending.json)
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import type { x402Client } from "@x402/fetch";
 import { readTextFileSync } from "./fs-read.js";
 
 const WALLET_DIR = path.join(homedir(), ".openclaw", "blockrun");
@@ -24,11 +27,131 @@ const DAY_MS = 24 * HOUR_MS;
 
 export type SpendWindow = "perRequest" | "hourly" | "daily" | "session";
 
+/**
+ * Counterparty/network/asset allow-or-deny lists. Default-off: a list only
+ * takes effect once configured via setPolicy(). `allowedPayees`/`blockedPayees`
+ * are both supported (block always wins if both are set); network and asset
+ * are allowlist-only, matching what a caller can realistically enumerate.
+ */
+export type PolicyList = "allowedPayees" | "blockedPayees" | "allowedNetworks" | "allowedAssets";
+
+/** Base mainnet, as carried on x402 `selectedRequirements.network`. */
+export const CAIP2_BASE = "eip155:8453";
+/** Solana mainnet genesis, as carried on x402 `selectedRequirements.network`. */
+export const CAIP2_SOLANA_MAINNET = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+/**
+ * Every network the proxy can pay on, as carried on x402
+ * `selectedRequirements.network`. Single source of truth for surfaces that
+ * validate `allowedNetworks` entries: an entry outside this set can never
+ * match a quote and would only block payments.
+ */
+export const PAYABLE_NETWORKS: readonly string[] = [CAIP2_BASE, CAIP2_SOLANA_MAINNET];
+
+export const POLICY_LISTS: readonly PolicyList[] = [
+  "allowedPayees",
+  "blockedPayees",
+  "allowedNetworks",
+  "allowedAssets",
+];
+/**
+ * Lists whose entries are addresses. EVM addresses are case-insensitive hex,
+ * so a checksummed entry must match a lowercase one and vice versa. `asset` is
+ * a token contract address and belongs here too: on Base, USDC is quoted as
+ * `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, and an operator who configures
+ * the lowercase form would otherwise have every legitimate payment refused.
+ * `allowedNetworks` is deliberately absent — CAIP-2 ids are case-sensitive.
+ */
+const ADDRESS_LISTS = ["allowedPayees", "blockedPayees", "allowedAssets"] as const;
+const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
+/** Lowercase a 20-byte EVM address; leave Solana base58 and other strings alone. */
+export function normalizePayee(value: string): string {
+  return EVM_ADDRESS.test(value) ? value.toLowerCase() : value;
+}
+
+function isAddressList(list: PolicyList): boolean {
+  return (ADDRESS_LISTS as readonly string[]).includes(list);
+}
+
+/** Normalize a policy list's entries for storage and comparison. */
+function normalizePolicyValues(list: PolicyList, values: readonly string[]): string[] {
+  return isAddressList(list) ? values.map(normalizePayee) : [...values];
+}
+
+/** Policy entries must be a non-empty array of non-empty strings. */
+function isValidPolicyValues(values: unknown): values is string[] {
+  return Array.isArray(values) && values.every((v) => typeof v === "string" && v.length > 0);
+}
+
+function isPolicyList(value: string): value is PolicyList {
+  return (POLICY_LISTS as readonly string[]).includes(value);
+}
+
+/**
+ * A policy list on disk is present but unusable. Thrown rather than swallowed:
+ * silently dropping a corrupted allow/deny list would widen what the agent may
+ * pay, which is the one direction this file must never fail in. Callers
+ * classify on `instanceof`, not on the message text.
+ */
+/**
+ * spending.json exists but could not be read or parsed. Distinct from "no file
+ * yet" (load() returns null) so a reload can tell a failed read from an empty
+ * store and refuse to widen what the agent may pay.
+ */
+export class UnreadableSpendPolicyError extends Error {
+  constructor(cause: unknown) {
+    super(`[ClawRouter] Failed to load spending data: ${cause}`);
+    this.name = "UnreadableSpendPolicyError";
+  }
+}
+
+export class MalformedSpendPolicyError extends Error {
+  constructor(key: string) {
+    super(
+      `[ClawRouter] refusing to load spending.json: ${key} is malformed; a corrupted policy file must not widen what the agent may pay`,
+    );
+    this.name = "MalformedSpendPolicyError";
+  }
+}
+
 export interface SpendLimits {
   perRequest?: number;
   hourly?: number;
   daily?: number;
   session?: number;
+  allowedPayees?: string[];
+  blockedPayees?: string[];
+  /**
+   * CAIP-2 identifiers matching x402 `selectedRequirements.network`
+   * (e.g. `eip155:8453`, `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d`).
+   * Nicknames such as `base` or `solana` do not match and fail closed.
+   */
+  allowedNetworks?: string[];
+  allowedAssets?: string[];
+}
+
+/** Defensive copy: the four policy fields are arrays, so a shallow `{...limits}` still shares them by reference. */
+function cloneLimits(limits: SpendLimits): SpendLimits {
+  const clone: SpendLimits = { ...limits };
+  for (const key of POLICY_LISTS) {
+    const val = limits[key];
+    if (val !== undefined) {
+      clone[key] = [...val];
+    }
+  }
+  return clone;
+}
+
+/**
+ * Counterparty details for a pending payment, passed to check() alongside
+ * the estimated cost. EVM `payTo` values matching `0x` + 40 hex are compared
+ * case-insensitively; anything else (including Solana base58) is exact-match.
+ */
+export interface CounterpartyInfo {
+  payTo?: string;
+  network?: string;
+  asset?: string;
 }
 
 export interface SpendRecord {
@@ -56,6 +179,7 @@ export interface SpendingStatus {
 export interface CheckResult {
   allowed: boolean;
   blockedBy?: SpendWindow;
+  blockedByPolicy?: PolicyList;
   remaining?: number;
   reason?: string;
   resetIn?: number;
@@ -64,6 +188,40 @@ export interface CheckResult {
 export interface SpendControlStorage {
   load(): { limits: SpendLimits; history: SpendRecord[] } | null;
   save(data: { limits: SpendLimits; history: SpendRecord[] }): void;
+  /**
+   * Optional: persist history without touching stored limits. Implement it to
+   * keep recorded spend from overwriting an operator's policy edits. Falls
+   * back to save() when absent.
+   */
+  saveHistory?(history: SpendRecord[]): void;
+  /**
+   * Optional: persist limits without touching stored history — the mirror of
+   * saveHistory(). A policy edit from a second process (the CLI) must not
+   * write its own stale history snapshot back over spend the proxy recorded
+   * since, which would reopen a rolling window. Falls back to save() when
+   * absent.
+   */
+  saveLimits?(limits: SpendLimits, expect?: SpendLimits): void;
+}
+
+/** Stored limits as one comparable string: key order does not matter, list order does (setPolicy normalizes it). */
+export function canonicalLimits(limits: SpendLimits): string {
+  return JSON.stringify(
+    Object.fromEntries(Object.entries(limits).sort(([a], [b]) => (a < b ? -1 : 1))),
+  );
+}
+
+/**
+ * Thrown by a compare-and-swap limits write when the stored limits no longer
+ * match what the writer last read: another writer landed in between, and
+ * replacing the whole object would silently drop their change. Nothing is
+ * written; the caller re-reads and decides.
+ */
+export class SpendPolicyConflictError extends Error {
+  constructor() {
+    super("spending.json limits changed underneath this write; nothing was written");
+    this.name = "SpendPolicyConflictError";
+  }
 }
 
 export class FileSpendControlStorage implements SpendControlStorage {
@@ -86,6 +244,18 @@ export class FileSpendControlStorage implements SpendControlStorage {
           if (typeof val === "number" && val > 0 && Number.isFinite(val)) {
             limits[key] = val;
           }
+        }
+        for (const key of POLICY_LISTS) {
+          if (!Object.prototype.hasOwnProperty.call(rawLimits, key)) continue;
+          const val = rawLimits[key];
+          if (!isValidPolicyValues(val)) {
+            throw new MalformedSpendPolicyError(key);
+          }
+          // An empty array is how an operator clears a list by hand. Treat it
+          // as "not configured" rather than corruption — refusing to start
+          // over an empty array would brick the proxy on a legal edit.
+          if (val.length === 0) continue;
+          limits[key] = normalizePolicyValues(key, val);
         }
 
         const history: SpendRecord[] = [];
@@ -111,7 +281,14 @@ export class FileSpendControlStorage implements SpendControlStorage {
         return { limits, history };
       }
     } catch (err) {
-      console.error(`[ClawRouter] Failed to load spending data, starting fresh: ${err}`);
+      if (err instanceof MalformedSpendPolicyError) {
+        throw err;
+      }
+      // A torn or unparseable file loses history, which is safe. It must not
+      // also silently drop configured policy lists. Callers decide: the
+      // constructor starts fresh and says so loudly, a reload keeps enforcing
+      // what it already has.
+      throw new UnreadableSpendPolicyError(err);
     }
     return null;
   }
@@ -121,12 +298,57 @@ export class FileSpendControlStorage implements SpendControlStorage {
       if (!fs.existsSync(WALLET_DIR)) {
         fs.mkdirSync(WALLET_DIR, { recursive: true, mode: 0o700 });
       }
-      fs.writeFileSync(this.spendingFile, JSON.stringify(data, null, 2), {
-        mode: 0o600,
-      });
+      // Write-then-rename: a crash mid-write must not leave truncated JSON.
+      // Torn JSON parses as a failure, which drops configured policy lists on
+      // the next start — fail-open on exactly the file that must not do that.
+      const tmp = `${this.spendingFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, this.spendingFile);
     } catch (err) {
       console.error(`[ClawRouter] Failed to save spending data: ${err}`);
     }
+  }
+
+  /**
+   * Persist history while leaving the stored limits exactly as they are on
+   * disk. Recording spend must not rewrite policy: the proxy reads limits once
+   * at startup, so writing its in-memory copy back on every payment would
+   * erase an operator's hand-edit to spending.json seconds after they made it.
+   */
+  saveHistory(history: SpendRecord[]): void {
+    let storedLimits: SpendLimits = {};
+    try {
+      const current = this.load();
+      if (current) storedLimits = current.limits;
+    } catch {
+      // A malformed policy list on disk: leave the file alone rather than
+      // overwrite it with a version that drops what we could not parse.
+      return;
+    }
+    this.save({ limits: storedLimits, history });
+  }
+
+  /**
+   * Persist limits while leaving the stored history exactly as it is on disk.
+   * With `expect`, refuse when the stored limits are no longer the ones the
+   * writer read — a stale instance must not replace another writer's edit.
+   * The re-read happens immediately before the atomic rename, so the race
+   * window is the write itself, not the whole command.
+   */
+  saveLimits(limits: SpendLimits, expect?: SpendLimits): void {
+    let current: { limits: SpendLimits; history: SpendRecord[] } | null;
+    try {
+      current = this.load();
+    } catch {
+      return; // malformed policy on disk: leave the file alone, as saveHistory does
+    }
+    if (
+      expect !== undefined &&
+      canonicalLimits(current?.limits ?? {}) !== canonicalLimits(expect)
+    ) {
+      throw new SpendPolicyConflictError();
+    }
+    this.save({ limits, history: current?.history ?? [] });
   }
 }
 
@@ -136,7 +358,7 @@ export class InMemorySpendControlStorage implements SpendControlStorage {
   load(): { limits: SpendLimits; history: SpendRecord[] } | null {
     return this.data
       ? {
-          limits: { ...this.data.limits },
+          limits: cloneLimits(this.data.limits),
           history: this.data.history.map((r) => ({ ...r })),
         }
       : null;
@@ -144,8 +366,21 @@ export class InMemorySpendControlStorage implements SpendControlStorage {
 
   save(data: { limits: SpendLimits; history: SpendRecord[] }): void {
     this.data = {
-      limits: { ...data.limits },
+      limits: cloneLimits(data.limits),
       history: data.history.map((r) => ({ ...r })),
+    };
+  }
+
+  saveLimits(limits: SpendLimits, expect?: SpendLimits): void {
+    if (
+      expect !== undefined &&
+      canonicalLimits(this.data?.limits ?? {}) !== canonicalLimits(expect)
+    ) {
+      throw new SpendPolicyConflictError();
+    }
+    this.data = {
+      limits: cloneLimits(limits),
+      history: this.data?.history.map((r) => ({ ...r })) ?? [],
     };
   }
 }
@@ -155,11 +390,26 @@ export interface SpendControlOptions {
   now?: () => number;
 }
 
+/**
+ * How long an unsettled pre-sign reservation holds budget. Longer than any
+ * payment round trip, short enough that a process killed mid-payment does not
+ * leave the window shut for the rest of the hour.
+ */
+const RESERVATION_TTL_MS = 2 * 60 * 1000;
+
 export class SpendControl {
   private limits: SpendLimits = {};
   private history: SpendRecord[] = [];
   private sessionSpent: number = 0;
   private sessionCalls: number = 0;
+  private pending = new Map<string, { amount: number; expiresAt: number }>();
+  private reservationSeq = 0;
+  /** Limits we loaded and have not changed; history-only saves must not clobber operator edits. */
+  private limitsDirty = false;
+  /** The limits this instance last read from or wrote to storage — the compare-and-swap baseline. */
+  private diskLimits: SpendLimits = {};
+  /** Set when spending.json held an unusable policy list: refuse every payment. */
+  private policyFileBroken?: string;
   private readonly storage: SpendControlStorage;
   private readonly now: () => number;
 
@@ -174,19 +424,183 @@ export class SpendControl {
       throw new Error("Limit must be a finite positive number");
     }
     this.limits[window] = amount;
+    this.limitsDirty = true;
     this.save();
   }
 
   clearLimit(window: SpendWindow): void {
     delete this.limits[window];
+    this.limitsDirty = true;
+    this.save();
+  }
+
+  setPolicy(list: PolicyList, values: string[]): void {
+    if (!isPolicyList(list)) {
+      throw new Error(`Unknown policy list: ${String(list)}`);
+    }
+    if (!isValidPolicyValues(values) || values.length === 0) {
+      throw new Error("Policy list must be a non-empty array of non-empty strings");
+    }
+    this.limits[list] = normalizePolicyValues(list, values);
+    this.limitsDirty = true;
+    this.save();
+  }
+
+  clearPolicy(list: PolicyList): void {
+    if (!isPolicyList(list)) {
+      throw new Error(`Unknown policy list: ${String(list)}`);
+    }
+    delete this.limits[list];
+    this.limitsDirty = true;
     this.save();
   }
 
   getLimits(): SpendLimits {
-    return { ...this.limits };
+    return cloneLimits(this.limits);
   }
 
-  check(estimatedCost: number): CheckResult {
+  /**
+   * Why spending.json could not be loaded, or undefined when it is usable.
+   * While set, every setter mutates memory only: save() refuses to rewrite a
+   * file it could not fully parse, so callers must check this before
+   * reporting a change as applied.
+   */
+  getPolicyFileError(): string | undefined {
+    return this.policyFileBroken;
+  }
+
+  /**
+   * Re-read limits from storage, keeping this instance's history and open
+   * reservations. Used on an in-process proxy restart so a hand-edit to
+   * spending.json made while the process was running still applies, without
+   * resetting the rolling windows. Fails closed exactly like the constructor:
+   * a malformed file refuses every payment until repaired, and a repaired
+   * file clears that refusal.
+   */
+  reloadLimits(): void {
+    let data: { limits: SpendLimits; history: SpendRecord[] } | null;
+    try {
+      data = this.storage.load();
+    } catch (err) {
+      if (err instanceof UnreadableSpendPolicyError) {
+        // The constructor can start fresh on an unreadable file because it has
+        // nothing to lose. A reload does: dropping the live limits here would
+        // widen what the agent may pay because a read failed. Keep enforcing
+        // what is already loaded and leave any refusal state alone.
+        console.error(`${err.message} — keeping the limits already in effect`);
+        return;
+      }
+      if (!(err instanceof MalformedSpendPolicyError)) throw err;
+      this.policyFileBroken = err.message;
+      console.error(`[ClawRouter] ${err.message}`);
+      return;
+    }
+    this.policyFileBroken = undefined;
+    this.limits = data ? cloneLimits(data.limits) : {};
+    this.diskLimits = cloneLimits(this.limits); // the CAS baseline follows what was just read
+    this.limitsDirty = false;
+  }
+
+  check(estimatedCost: number, counterparty?: CounterpartyInfo): CheckResult {
+    if (this.policyFileBroken !== undefined) {
+      return {
+        allowed: false,
+        reason: `Spend policy is unreadable, refusing all payments: ${this.policyFileBroken}`,
+      };
+    }
+    const payeePolicySet =
+      (this.limits.blockedPayees && this.limits.blockedPayees.length > 0) ||
+      (this.limits.allowedPayees && this.limits.allowedPayees.length > 0);
+    if (payeePolicySet) {
+      if (counterparty?.payTo === undefined) {
+        return {
+          allowed: false,
+          blockedByPolicy: this.limits.blockedPayees?.length ? "blockedPayees" : "allowedPayees",
+          reason: "Payee policy is configured but no payTo was provided to check()",
+        };
+      }
+      const payTo = normalizePayee(counterparty.payTo);
+      if (this.limits.blockedPayees?.includes(payTo)) {
+        return {
+          allowed: false,
+          blockedByPolicy: "blockedPayees",
+          reason: `Payee is blocked by policy: ${counterparty.payTo}`,
+        };
+      }
+      if (
+        this.limits.allowedPayees &&
+        this.limits.allowedPayees.length > 0 &&
+        !this.limits.allowedPayees.includes(payTo)
+      ) {
+        return {
+          allowed: false,
+          blockedByPolicy: "allowedPayees",
+          reason: `Payee is not in the configured allowlist: ${counterparty.payTo}`,
+        };
+      }
+    }
+
+    if (this.limits.allowedNetworks && this.limits.allowedNetworks.length > 0) {
+      if (counterparty?.network === undefined) {
+        return {
+          allowed: false,
+          blockedByPolicy: "allowedNetworks",
+          reason: "Network policy is configured but no network was provided to check()",
+        };
+      }
+      if (!this.limits.allowedNetworks.includes(counterparty.network)) {
+        return {
+          allowed: false,
+          blockedByPolicy: "allowedNetworks",
+          reason: `Network is not in the configured allowlist: ${counterparty.network}`,
+        };
+      }
+    }
+
+    if (this.limits.allowedAssets && this.limits.allowedAssets.length > 0) {
+      if (counterparty?.asset === undefined) {
+        return {
+          allowed: false,
+          blockedByPolicy: "allowedAssets",
+          reason: "Asset policy is configured but no asset was provided to check()",
+        };
+      }
+      if (!this.limits.allowedAssets.includes(normalizePayee(counterparty.asset))) {
+        return {
+          allowed: false,
+          blockedByPolicy: "allowedAssets",
+          reason: `Asset is not in the configured allowlist: ${counterparty.asset}`,
+        };
+      }
+    }
+
+    return this.checkAmount(estimatedCost);
+  }
+
+  /**
+   * The amount windows alone, with no counterparty to inspect.
+   *
+   * `perRequest` / `hourly` / `daily` / `session` are denominated in USD and
+   * say nothing about how the money moves, so they are the part of the policy
+   * that means the same thing on the API-key rail as on the wallet rail — a
+   * daily cap is as sensible against account credit as against USDC, and both
+   * are read from the same `spending.json` (#329). The counterparty lists are
+   * the part that does NOT translate: `blockedPayees`, `allowedPayees`,
+   * `blockedNetworks` and `allowedAssets` presuppose a payee, a network and an
+   * asset, and on the key rail there is one counterparty and no on-chain asset.
+   * They are vacuous there rather than missing, which is why `check()` layers
+   * them on top of this instead of the other way round.
+   */
+  checkAmount(estimatedCost: number): CheckResult {
+    // Repeated from `check()` so this stays fail-closed when called directly:
+    // a policy we could not read is not a policy that allows everything.
+    if (this.policyFileBroken !== undefined) {
+      return {
+        allowed: false,
+        reason: `Spend policy is unreadable, refusing all payments: ${this.policyFileBroken}`,
+      };
+    }
+
     const now = this.now();
 
     if (this.limits.perRequest !== undefined) {
@@ -201,7 +615,7 @@ export class SpendControl {
     }
 
     if (this.limits.hourly !== undefined) {
-      const hourlySpent = this.getSpendingInWindow(now - HOUR_MS, now);
+      const hourlySpent = this.getSpendingInWindow(now - HOUR_MS, now, now);
       const remaining = this.limits.hourly - hourlySpent;
       if (estimatedCost > remaining) {
         const oldestInWindow = this.history.find((r) => r.timestamp >= now - HOUR_MS);
@@ -219,7 +633,7 @@ export class SpendControl {
     }
 
     if (this.limits.daily !== undefined) {
-      const dailySpent = this.getSpendingInWindow(now - DAY_MS, now);
+      const dailySpent = this.getSpendingInWindow(now - DAY_MS, now, now);
       const remaining = this.limits.daily - dailySpent;
       if (estimatedCost > remaining) {
         const oldestInWindow = this.history.find((r) => r.timestamp >= now - DAY_MS);
@@ -237,13 +651,14 @@ export class SpendControl {
     }
 
     if (this.limits.session !== undefined) {
-      const remaining = this.limits.session - this.sessionSpent;
+      const sessionSpent = this.sessionSpent + this.pendingTotal();
+      const remaining = this.limits.session - sessionSpent;
       if (estimatedCost > remaining) {
         return {
           allowed: false,
           blockedBy: "session",
           remaining,
-          reason: `Session limit exceeded: $${(this.sessionSpent + estimatedCost).toFixed(2)} > $${this.limits.session.toFixed(2)} max`,
+          reason: `Session limit exceeded: $${(sessionSpent + estimatedCost).toFixed(2)} > $${this.limits.session.toFixed(2)} max`,
         };
       }
     }
@@ -270,21 +685,104 @@ export class SpendControl {
     this.save();
   }
 
-  private getSpendingInWindow(from: number, to: number): number {
-    return this.history
+  /** True when any window that this module can compare an amount against is set. */
+  hasAmountLimits(): boolean {
+    return (
+      this.limits.perRequest !== undefined ||
+      this.limits.hourly !== undefined ||
+      this.limits.daily !== undefined ||
+      this.limits.session !== undefined
+    );
+  }
+
+  /** True when a window spans more than one request, so reservations matter. */
+  hasAggregateLimits(): boolean {
+    return (
+      this.limits.hourly !== undefined ||
+      this.limits.daily !== undefined ||
+      this.limits.session !== undefined
+    );
+  }
+
+  /**
+   * Hold `amount` against the aggregate windows before a payment is signed.
+   *
+   * Reservations live in memory only and are never persisted: an unsettled
+   * reservation is not spend, and writing it to disk is what made a failed
+   * signer permanently consume budget. They expire on their own so a caller
+   * that never settles or releases (process killed mid-payment, a transport
+   * that hangs past the payment timeout) cannot wedge the window shut.
+   */
+  reserve(amount: number): string {
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw new Error("Reservation amount must be a non-negative finite number");
+    }
+    const id = `${this.now()}-${(this.reservationSeq += 1)}`;
+    this.pending.set(id, { amount, expiresAt: this.now() + RESERVATION_TTL_MS });
+    return id;
+  }
+
+  /** Convert a reservation into recorded spend (the payment was signed). */
+  settleReservation(id: string, metadata?: { model?: string; action?: string }): void {
+    const held = this.pending.get(id);
+    if (!held) return; // already released, settled, or expired
+    this.pending.delete(id);
+    this.record(held.amount, metadata);
+  }
+
+  /** Drop a reservation without recording spend (the payment was never signed). */
+  releaseReservation(id: string): void {
+    this.pending.delete(id);
+  }
+
+  /** Total currently held but not yet settled. */
+  private pendingTotal(): number {
+    this.expireReservations();
+    let total = 0;
+    for (const held of this.pending.values()) {
+      total += held.amount;
+    }
+    return total;
+  }
+
+  private expireReservations(): void {
+    const now = this.now();
+    for (const [id, held] of this.pending) {
+      if (held.expiresAt <= now) {
+        this.pending.delete(id);
+      }
+    }
+  }
+
+  // `now` is the single clock reading the caller already took to build the
+  // window; it must be passed in, not re-read here. In-flight reservations are
+  // "now" holds, so they count only against a window that reaches the present
+  // (`to >= now`). The bug this guards against: reading the clock a SECOND time
+  // inside this method (the old `to >= this.now()`) could land a millisecond
+  // after the caller's `now`, flip the guard false, and silently drop the
+  // pending total from the hourly/daily check — letting two concurrent payments
+  // both clear the same remaining budget. Threading the caller's `now` keeps the
+  // guard meaningful (a genuinely historical window with `to < now` still
+  // excludes live holds) without a second, racing read. Every existing test
+  // injects a frozen clock (`now: () => clock`), so the two reads always matched
+  // and the sub-ms window went uncaught; see the live-clock test in
+  // spend-control.test.ts.
+  private getSpendingInWindow(from: number, to: number, now: number): number {
+    const recorded = this.history
       .filter((r) => r.timestamp >= from && r.timestamp <= to)
       .reduce((sum, r) => sum + r.amount, 0);
+    return recorded + (to >= now ? this.pendingTotal() : 0);
   }
 
   getSpending(window: "hourly" | "daily" | "session"): number {
     const now = this.now();
     switch (window) {
       case "hourly":
-        return this.getSpendingInWindow(now - HOUR_MS, now);
+        return this.getSpendingInWindow(now - HOUR_MS, now, now);
       case "daily":
-        return this.getSpendingInWindow(now - DAY_MS, now);
+        return this.getSpendingInWindow(now - DAY_MS, now, now);
       case "session":
-        return this.sessionSpent;
+        return this.sessionSpent + this.pendingTotal();
     }
   }
 
@@ -296,11 +794,11 @@ export class SpendControl {
 
   getStatus(): SpendingStatus {
     const now = this.now();
-    const hourlySpent = this.getSpendingInWindow(now - HOUR_MS, now);
-    const dailySpent = this.getSpendingInWindow(now - DAY_MS, now);
+    const hourlySpent = this.getSpendingInWindow(now - HOUR_MS, now, now);
+    const dailySpent = this.getSpendingInWindow(now - DAY_MS, now, now);
 
     return {
-      limits: { ...this.limits },
+      limits: cloneLimits(this.limits),
       spending: {
         hourly: hourlySpent,
         daily: dailySpent,
@@ -309,7 +807,10 @@ export class SpendControl {
       remaining: {
         hourly: this.limits.hourly !== undefined ? this.limits.hourly - hourlySpent : null,
         daily: this.limits.daily !== undefined ? this.limits.daily - dailySpent : null,
-        session: this.limits.session !== undefined ? this.limits.session - this.sessionSpent : null,
+        session:
+          this.limits.session !== undefined
+            ? this.limits.session - (this.sessionSpent + this.pendingTotal())
+            : null,
       },
       calls: this.sessionCalls,
     };
@@ -320,6 +821,16 @@ export class SpendControl {
     return limit ? records.slice(0, limit) : records;
   }
 
+  /**
+   * Reset the session window. `sessionSpent`/`sessionCalls` are instance state
+   * that is never persisted, so this used to happen implicitly: every
+   * startProxy() built a fresh SpendControl. The process-wide ledger outlives
+   * an in-process proxy restart, which would silently redefine `session` as
+   * "since the gateway booted" — docs/configuration.md and the /policy help
+   * both promise "session resets on restart". The restart path in index.ts
+   * calls this to keep that promise. History and the rolling hourly/daily
+   * windows are deliberately untouched.
+   */
   resetSession(): void {
     this.sessionSpent = 0;
     this.sessionCalls = 0;
@@ -331,20 +842,360 @@ export class SpendControl {
   }
 
   private save(): void {
+    if (this.policyFileBroken !== undefined) {
+      return; // never rewrite a file we could not fully parse
+    }
+    if (!this.limitsDirty && this.storage.saveHistory) {
+      this.storage.saveHistory([...this.history]);
+      return;
+    }
+    if (this.limitsDirty && this.storage.saveLimits) {
+      // Limits changed: write them without this instance's history snapshot,
+      // and only if storage still holds what this instance last read — a
+      // whole-object replace from a stale copy would drop another writer's
+      // edit. On conflict, adopt what landed and let the caller decide;
+      // nothing of this instance's change reaches disk.
+      try {
+        this.storage.saveLimits(cloneLimits(this.limits), cloneLimits(this.diskLimits));
+      } catch (err) {
+        if (err instanceof SpendPolicyConflictError) {
+          // Adopt what actually landed. load() can now throw (the file went
+          // unreadable between the conflict check and here), and reconciling
+          // against nothing would clear the limits and report the wrong error
+          // to /policy. Leave this instance as it is and let the conflict
+          // surface — the caller re-reads and retries either way.
+          try {
+            const current = this.storage.load();
+            this.limits = cloneLimits(current?.limits ?? {});
+            this.diskLimits = cloneLimits(this.limits);
+            this.limitsDirty = false;
+          } catch {
+            /* keep the in-memory limits; the conflict below is still the right answer */
+          }
+        }
+        throw err;
+      }
+      this.diskLimits = cloneLimits(this.limits);
+      this.limitsDirty = false;
+      return;
+    }
     this.storage.save({
-      limits: { ...this.limits },
+      limits: cloneLimits(this.limits),
       history: [...this.history],
     });
   }
 
   private load(): void {
-    const data = this.storage.load();
+    let data: { limits: SpendLimits; history: SpendRecord[] } | null;
+    try {
+      data = this.storage.load();
+    } catch (err) {
+      if (err instanceof UnreadableSpendPolicyError) {
+        // Unchanged startup behaviour: begin with no limits, and say loudly
+        // that whatever the file configured is not in effect.
+        console.error(
+          `${err.message} — starting fresh (any configured spend policy is NOT in effect until this file is repaired)`,
+        );
+        return;
+      }
+      if (!(err instanceof MalformedSpendPolicyError)) throw err;
+      // Refuse every paid request rather than either (a) running with the
+      // policy silently dropped, or (b) throwing out of the constructor and
+      // taking the whole proxy down — which would kill free models too, for a
+      // file that only governs payments.
+      this.policyFileBroken = err.message;
+      console.error(`[ClawRouter] ${err.message}`);
+      console.error(
+        "[ClawRouter] All paid requests will be refused until spending.json is repaired. Free models are unaffected.",
+      );
+      return;
+    }
     if (data) {
-      this.limits = data.limits;
+      this.limits = cloneLimits(data.limits);
+      this.diskLimits = cloneLimits(data.limits);
       this.history = data.history;
       this.cleanup();
     }
   }
+}
+
+export type SpendPolicyAbort = { abort: true; reason: string };
+
+/**
+ * The ledger lives on `process`, not in a module variable, for the same reason
+ * `__clawrouterProxyStarted` and the other startup flags in index.ts do: a
+ * global install and an npm-projects install can both be resolved in one
+ * gateway, and two module copies each holding their own `sharedControl` would
+ * enforce every window twice over -- once per copy -- which is exactly the
+ * per-surface split this singleton exists to end.
+ */
+type ProcessWithSharedSpendControl = NodeJS.Process & {
+  __clawrouterSharedSpendControl?: SpendControl;
+};
+
+const sharedControlHost = (): ProcessWithSharedSpendControl =>
+  process as ProcessWithSharedSpendControl;
+
+/**
+ * The process-wide SpendControl instance: ONE ledger for every signing surface
+ * (the proxy's x402 hook, the Polymarket tools, doctor). Per-surface instances
+ * enforced each window once per surface and last-writer-won spending.json
+ * history — aggregate caps only hold against a single shared instance.
+ */
+export function getSharedSpendControl(): SpendControl {
+  const host = sharedControlHost();
+  host.__clawrouterSharedSpendControl ??= new SpendControl();
+  return host.__clawrouterSharedSpendControl;
+}
+
+/** Replace the shared instance. Tests inject in-memory storage here. */
+export function setSharedSpendControl(control: SpendControl): void {
+  sharedControlHost().__clawrouterSharedSpendControl = control;
+}
+
+/**
+ * Thrown from the pre-sign hook when policy or an amount window refuses.
+ *
+ * A deliberate refusal must never be mistaken for a transient upstream fault:
+ * the proxy's fallback loop retries provider errors across every paid model
+ * and then silently lands on a free one, which would hide the denial from the
+ * caller entirely. Callers classify on `instanceof` (see `proxy.ts`), so the
+ * message text is free to change. It keeps the `Payment creation aborted:`
+ * prefix that `@x402/core` uses for its own aborts so existing log greps and
+ * error matchers still see a familiar string.
+ */
+export class SpendPolicyError extends Error {
+  readonly blockedBy?: SpendWindow;
+  readonly blockedByPolicy?: PolicyList;
+
+  constructor(reason: string, blocked?: { blockedBy?: SpendWindow; blockedByPolicy?: PolicyList }) {
+    super(`Payment creation aborted: ${reason}`);
+    this.name = "SpendPolicyError";
+    this.blockedBy = blocked?.blockedBy;
+    this.blockedByPolicy = blocked?.blockedByPolicy;
+  }
+}
+
+/** Server-quoted amounts are canonical decimal micro-USDC strings, nothing else. */
+const CANONICAL_AMOUNT = /^\d+$/;
+
+/**
+ * Read the payment amount the signer is about to authorize, in USD.
+ *
+ * `Number.parseInt(v, 10)` is NOT safe here. `@x402/core` validates `amount`
+ * as a non-empty string with no digit-format check, while the EVM exact scheme
+ * signs `BigInt(value)` off the same raw string — and the two disagree on every
+ * radix prefix `BigInt` accepts:
+ *
+ *   parseInt("0x1DCD6500", 10) === 0   BigInt("0x1DCD6500") === 500000000n
+ *
+ * A gateway quoting hex therefore reads as $0.000000 against every cap while
+ * the wallet authorizes the full amount. Returns undefined for anything that
+ * is not a canonical decimal integer so the caller can fail closed.
+ *
+ * x402 v1 carries the cost in `maxAmountRequired`; v2 renamed it to `amount`.
+ */
+function parseQuotedAmountUsd(selected: {
+  amount?: string;
+  maxAmountRequired?: string;
+}): number | undefined {
+  const raw = selected.amount ?? selected.maxAmountRequired;
+  if (typeof raw !== "string" || !CANONICAL_AMOUNT.test(raw)) {
+    return undefined;
+  }
+  const micros = Number(raw);
+  if (!Number.isSafeInteger(micros)) {
+    return undefined;
+  }
+  return micros / 1_000_000;
+}
+
+/** Requirements as they reach the pre-sign hook (v2 `amount`, v1 `maxAmountRequired`). */
+export type QuotedRequirements = {
+  payTo?: string;
+  network?: string;
+  asset?: string;
+  amount?: string;
+  maxAmountRequired?: string;
+};
+
+/**
+ * Evaluate policy and amount windows for a pending payment.
+ *
+ * Returns a reservation id when the payment may proceed and an aggregate
+ * window is configured; the caller must settle or release it. Throws
+ * `SpendPolicyError` when the payment must not be signed.
+ */
+export function assertSpendPolicyAllows(
+  control: SpendControl,
+  selected: QuotedRequirements,
+): string | undefined {
+  const quoted = parseQuotedAmountUsd(selected);
+  if (quoted === undefined && control.hasAmountLimits()) {
+    // Fail closed: we cannot compare an amount we could not parse against a
+    // cap the operator configured.
+    throw new SpendPolicyError(
+      `Payment quote carries no usable amount (${JSON.stringify(
+        selected.amount ?? selected.maxAmountRequired,
+      )}); refusing to sign against a configured spend limit`,
+    );
+  }
+  const estimatedCost = quoted ?? 0;
+  const result = control.check(estimatedCost, {
+    payTo: selected.payTo,
+    network: selected.network,
+    asset: selected.asset,
+  });
+  if (!result.allowed) {
+    throw new SpendPolicyError(result.reason ?? "blocked by spend policy", {
+      blockedBy: result.blockedBy,
+      blockedByPolicy: result.blockedByPolicy,
+    });
+  }
+  if (!control.hasAggregateLimits()) {
+    return undefined;
+  }
+  // Reserve synchronously — no await between check() and reserve() — so two
+  // concurrent payments cannot both clear the same remaining budget.
+  return control.reserve(estimatedCost);
+}
+
+/**
+ * Register the fail-closed spend-policy hook on an x402 client.
+ *
+ * Reservations are keyed on the `selectedRequirements` object, which
+ * `@x402/core` passes by reference to the before / after / failure hooks of
+ * the same `createPaymentPayload` call, so concurrent payments never settle
+ * each other's reservation.
+ */
+export function registerSpendPolicyHook(x402: x402Client, control: SpendControl): void {
+  const reservations = new WeakMap<object, string>();
+
+  x402.onBeforePaymentCreation(async (ctx) => {
+    const selected = ctx.selectedRequirements as unknown as QuotedRequirements;
+    const reservationId = assertSpendPolicyAllows(control, selected);
+    if (reservationId !== undefined) {
+      reservations.set(ctx.selectedRequirements as unknown as object, reservationId);
+    }
+  });
+
+  // Signed: the wallet has authorized this payment, so the reservation becomes
+  // real spend. Conservative by design — a payment that is signed but never
+  // settles upstream still counts against the window.
+  x402.onAfterPaymentCreation(async (ctx) => {
+    const key = ctx.selectedRequirements as unknown as object;
+    const id = reservations.get(key);
+    if (id !== undefined) {
+      reservations.delete(key);
+      control.settleReservation(id, { action: "x402 payment" });
+    }
+  });
+
+  // Never signed: release, or the window drains on failures that cost nothing.
+  x402.onPaymentCreationFailure(async (ctx) => {
+    const key = ctx.selectedRequirements as unknown as object;
+    const id = reservations.get(key);
+    if (id !== undefined) {
+      reservations.delete(key);
+      control.releaseReservation(id);
+    }
+  });
+}
+
+type PayFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+/**
+ * The gateway's settled charge for a response, in USD, or undefined.
+ *
+ * Absent is NOT zero: BlockRun writes a genuine zero charge as "0.000000" and
+ * omits the header when nothing has settled yet (the chat path commits the
+ * charge after the response). A caller must fall back to its own estimate
+ * rather than record $0 against a call that really was billed.
+ */
+function settledChargeUsd(response: Response): number | undefined {
+  const raw = response.headers.get("x-blockrun-cost-usd");
+  if (raw === null) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined; // Number("") is 0, not NaN
+  const value = Number(trimmed);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Enforce the amount windows on a rail that never signs anything (#329).
+ *
+ * On the wallet rail the policy lives inside the signer: `registerSpendPolicyHook`
+ * refuses before a USDC authorization is created. The API-key rail has no
+ * signature to refuse — `createApiKeyFetch` sets a bearer header and dispatches
+ * — so a `daily=5` written while on a wallet went on reading like a $5/day cap
+ * after `clawrouter login`, while the real ceiling was the account balance.
+ *
+ * This moves the same windows to that rail's only equivalent choke point: the
+ * fetch itself, which every paid call goes through, so there is no per-endpoint
+ * site to forget. The counterparty lists stay wallet-only on purpose — see
+ * `checkAmount`.
+ *
+ * `consumeEstimateUsd` returns what the caller published for the dispatch it is
+ * about to make, and CONSUMES it, which is what distinguishes a billable call
+ * from the follow-ups it spawns:
+ *
+ *   - a published number (0 when ClawRouter cannot price the route locally)
+ *     means "this call gets billed": it is checked against the windows, held
+ *     against the aggregate ones for the duration, and recorded afterwards
+ *   - undefined means "not a billable dispatch" — the status polls of an async
+ *     image, audio or video job. Those are neither checked nor recorded, so a
+ *     job cannot be charged once at submit and again on the poll that finishes
+ *     it, and a long poll loop cannot drain a daily window on its own.
+ *
+ * Two things differ from the signing hook, both in the operator's favour:
+ *
+ *   - what gets recorded is what the gateway actually charged
+ *     (`x-blockrun-cost-usd`) when it says so; the estimate is the fallback for
+ *     chat and async media, which settle after the response
+ *   - a failed call records nothing. The wallet rail is conservative because a
+ *     signed payment can settle even if the request then fails; account credit
+ *     is not debited for a request the gateway rejected.
+ */
+export function withSpendPolicy(
+  inner: PayFetch,
+  control: SpendControl,
+  consumeEstimateUsd: () => number | undefined,
+): PayFetch {
+  return async (input, init) => {
+    const published = consumeEstimateUsd();
+    if (published === undefined || !control.hasAmountLimits()) return inner(input, init);
+
+    const estimate = Number.isFinite(published) && published > 0 ? published : 0;
+
+    const result = control.checkAmount(estimate);
+    if (!result.allowed) {
+      throw new SpendPolicyError(result.reason ?? "blocked by spend policy", {
+        blockedBy: result.blockedBy,
+      });
+    }
+
+    // Reserve synchronously — no await between checkAmount() and reserve() —
+    // so two concurrent calls cannot both clear the same remaining budget.
+    const reservationId = control.hasAggregateLimits() ? control.reserve(estimate) : undefined;
+
+    let response: Response;
+    try {
+      response = await inner(input, init);
+    } catch (err) {
+      if (reservationId !== undefined) control.releaseReservation(reservationId);
+      throw err;
+    }
+
+    const settled = settledChargeUsd(response);
+    // A rejected request is not a charge. When the gateway does report one on a
+    // non-2xx (a partial, or a job that settled and then failed), believe it.
+    const charged = response.ok ? (settled ?? estimate) : (settled ?? 0);
+
+    if (reservationId !== undefined) control.releaseReservation(reservationId);
+    if (charged > 0) control.record(charged, { action: "BlockRun account charge" });
+
+    return response;
+  };
 }
 
 export function formatDuration(seconds: number): string {

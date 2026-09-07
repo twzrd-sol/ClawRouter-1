@@ -8,7 +8,8 @@
  *   # Install the plugin
  *   openclaw plugins install @blockrun/clawrouter
  *
- *   # Fund your wallet with USDC on Base (address printed on install)
+ *   # Fund your wallet with USDC (Solana for new installs, Base for existing ones;
+ *   # the funding address is printed on install)
  *
  *   # Use smart routing (auto-picks cheapest model)
  *   openclaw models set blockrun/auto
@@ -32,14 +33,24 @@ import type {
 } from "./types.js";
 import { blockrunProvider, setActiveProxy } from "./provider.js";
 import { startProxy, getProxyPort } from "./proxy.js";
+import {
+  isValidApiKey,
+  maskApiKey,
+  resolveApiKey,
+  PORTAL_CREDITS_URL,
+  PORTAL_KEYS_URL,
+} from "./api-key.js";
 import { BLOCKRUN_EXA_PROVIDER_ID, blockrunExaWebSearchProvider } from "./web-search-provider.js";
 import {
   resolveOrGenerateWalletKey,
+  resolveExistingWalletKey,
   setupSolana,
   savePaymentChain,
   resolvePaymentChain,
   WALLET_FILE,
   MNEMONIC_FILE,
+  CORE_WALLET_FILE,
+  CORE_SOLANA_WALLET_FILE,
 } from "./auth.js";
 import type { WalletResolution } from "./auth.js";
 import type { RoutingConfig } from "./router/index.js";
@@ -70,105 +81,43 @@ import {
   readdirSync,
   mkdirSync,
   copyFileSync,
+  chmodSync,
   renameSync,
+  unlinkSync,
 } from "node:fs";
 import { readFile as readFileAsync } from "node:fs/promises";
 import { readTextFileSync } from "./fs-read.js";
 import { TOP_MODELS } from "./top-models.js";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { VERSION } from "./version.js";
 import { privateKeyToAccount } from "viem/accounts";
 import { getStats } from "./stats.js";
 import { buildPartnerTools, PARTNER_SERVICES } from "./partners/index.js";
 import { buildPolymarketTool } from "./polymarket/tool.js";
+import { getSharedSpendControl } from "./spend-control.js";
 import { createStatsCommand } from "./commands/stats.js";
 import { createExcludeCommand } from "./commands/exclude.js";
+import { createPolicyCommand } from "./commands/policy.js";
 import { BLOCKRUN_MCP_SERVER_NAME, removeManagedBlockrunMcpServerConfig } from "./mcp-config.js";
+import { BLOCKRUN_PLUGIN_ID, prepareBlockRunPluginConfig } from "./openclaw-plugin-config.js";
 
-function getPackageRoot(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "..");
+function writePrivateJsonSync(path: string, value: unknown): void {
+  const temporary = `${path}.tmp.${randomUUID()}`;
+  try {
+    writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 });
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } finally {
+    if (existsSync(temporary)) unlinkSync(temporary);
+  }
 }
 
-/**
- * Install ClawRouter skills into OpenClaw's workspace skills directory.
- *
- * OpenClaw agents discover skills by scanning {workspaceDir}/skills/ for SKILL.md
- * files. While the plugin manifest (`openclaw.plugin.json`) exposes skills for
- * OpenClaw's internal registry, agents often try to read skills from the workspace
- * path directly. This copies our bundled skills so they're always resolvable.
- *
- * Workspace path follows OpenClaw's convention:
- *   - Default: ~/.openclaw/workspace/skills/
- *   - With profile: ~/.openclaw/workspace-{profile}/skills/
- *
- * Only copies if the skill is missing or the content has changed.
- */
-function installSkillsToWorkspace(logger: {
-  info: (msg: string) => void;
-  warn: (msg: string) => void;
-}) {
-  try {
-    // Resolve the package root: dist/index.js -> package root
-    const packageRoot = getPackageRoot();
-    const bundledSkillsDir = join(packageRoot, "skills");
-
-    if (!existsSync(bundledSkillsDir)) {
-      // Skills directory not bundled (dev mode or stripped package)
-      return;
-    }
-
-    // Match OpenClaw's workspace resolution: ~/.openclaw/workspace[-{profile}]/
-    const profile = (process["env"].OPENCLAW_PROFILE ?? "").trim().toLowerCase();
-    const workspaceDirName =
-      profile && profile !== "default" ? `workspace-${profile}` : "workspace";
-    const workspaceSkillsDir = join(homedir(), ".openclaw", workspaceDirName, "skills");
-    mkdirSync(workspaceSkillsDir, { recursive: true });
-
-    // Scan bundled skills: each subdirectory contains a SKILL.md
-    // Skip internal-only skills (release is for ClawRouter maintainers, not end users)
-    const INTERNAL_SKILLS = new Set(["release"]);
-    const entries = readdirSync(bundledSkillsDir, { withFileTypes: true });
-    let installed = 0;
-
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-
-      const skillName = entry.name;
-      if (INTERNAL_SKILLS.has(skillName)) continue;
-      const srcSkillFile = join(bundledSkillsDir, skillName, "SKILL.md");
-      if (!existsSync(srcSkillFile)) continue;
-
-      // Use original skill name as folder (matches what agents expect)
-      const destDir = join(workspaceSkillsDir, skillName);
-      const destSkillFile = join(destDir, "SKILL.md");
-
-      // Check if update needed: compare content
-      let needsUpdate = true;
-      if (existsSync(destSkillFile)) {
-        try {
-          const srcContent = readTextFileSync(srcSkillFile);
-          const destContent = readTextFileSync(destSkillFile);
-          if (srcContent === destContent) needsUpdate = false;
-        } catch {
-          // Can't read — overwrite
-        }
-      }
-
-      if (needsUpdate) {
-        mkdirSync(destDir, { recursive: true });
-        copyFileSync(srcSkillFile, destSkillFile);
-        installed++;
-      }
-    }
-
-    if (installed > 0) {
-      logger.info(`Installed ${installed} skill(s) to ${workspaceSkillsDir}`);
-    }
-  } catch (err) {
-    logger.warn(`Failed to install skills: ${err instanceof Error ? err.message : String(err)}`);
-  }
+function hasConfiguredWallet(): boolean {
+  return Boolean(
+    process["env"].BLOCKRUN_WALLET_KEY || existsSync(CORE_WALLET_FILE) || existsSync(WALLET_FILE),
+  );
 }
 
 /**
@@ -233,6 +182,36 @@ function isBlockrunWebSearchDisabled(config?: unknown): boolean {
  * grandchildren were leaking). The scrub only removes entries matching the
  * managed shape; user-defined `blockrun` MCP servers are left alone.
  */
+/**
+ * Did a pre-rename @blockrun/clawrouter really occupy the `clawrouter` id?
+ *
+ * The same on-disk proof `clawrouter setup` uses (src/cli.ts): a legacy package
+ * directory whose package.json names @blockrun/clawrouter. Config fields can be
+ * absent on a perfectly ordinary BlockRun install; this cannot be produced by
+ * OpenClaw's own bundled router, which ships inside OpenClaw and never writes
+ * `~/.openclaw/extensions/clawrouter`.
+ *
+ * Missing, unreadable, or non-BlockRun reads as "not ours" — this only ever
+ * grants a migration, so failing closed costs a stale key and never touches
+ * someone else's plugin.
+ */
+function legacyPackageIsBlockRun(): boolean {
+  for (const dir of [
+    join(homedir(), ".openclaw", "extensions", "clawrouter"),
+    join(homedir(), ".openclaw", "npm", "node_modules", "@blockrun", "clawrouter"),
+  ]) {
+    try {
+      const metadata = JSON.parse(readTextFileSync(join(dir, "package.json"))) as {
+        name?: unknown;
+      };
+      if (metadata.name === "@blockrun/clawrouter") return true;
+    } catch {
+      // Not installed there, or not readable — no evidence, not a refutation.
+    }
+  }
+  return false;
+}
+
 function injectModelsConfig(
   logger: { info: (msg: string) => void },
   options: { forceWrite?: boolean } = {},
@@ -451,6 +430,55 @@ function injectModelsConfig(
     }
   }
 
+  // Plugin-id migration (#305) on the gateway-start path.
+  //
+  // `prepareBlockRunPluginConfig` is otherwise reached only from `clawrouter
+  // setup`/`update`/`reinstall` (src/cli.ts). v0.12.265 ran this migration on
+  // every gateway start, and dropping that leaves the `npm update -g` + restart
+  // path unmigrated — the same way the plugin silently never loaded before that
+  // release. Restore it here, where the write is already `isGatewayMode()`-gated
+  // below and so cannot trip OpenClaw's install-time baseHash check.
+  //
+  // Gate it on evidence rather than running unconditionally: that id belongs to
+  // OpenClaw's bundled router now, so migrating an entry we did not write would
+  // reconfigure an unrelated official plugin.
+  //
+  // Two kinds of evidence, because config fields alone miss the ordinary case
+  // (#319). OpenClaw's installer commits `{ enabled: true }` and nothing else
+  // for an enabledByDefault plugin, and the wallet lives at
+  // `~/.openclaw/blockrun/wallet.key` rather than in openclaw.json — so a
+  // pre-rename BlockRun install usually carries a bare
+  // `"clawrouter": { "enabled": true }` with no `walletKey` and no `routing`.
+  // Requiring those fields left exactly those users unmigrated on the
+  // `npm update -g` + restart path, and the stale key then either enabled a
+  // bundled router they never configured or, for a pre-rename opt-out,
+  // inverted it: `clawrouter` disabled, `blockrun-clawrouter` enabled by the
+  // installer default, and the proxy back up on a machine where it was off.
+  //
+  // So also accept what `clawrouter setup` already treats as proof: a legacy
+  // package directory whose package.json names @blockrun/clawrouter. That is
+  // unambiguous in a way config fields are not, and it does not widen the
+  // heuristic #313 deliberately narrowed — an entry OpenClaw wrote for its own
+  // router has no such directory behind it.
+  const legacyEntry = (
+    (config.plugins as Record<string, unknown> | undefined)?.entries as
+      Record<string, unknown> | undefined
+  )?.clawrouter as Record<string, unknown> | undefined;
+  const legacyEntryConfig = legacyEntry?.config as Record<string, unknown> | undefined;
+  const legacyBlockRunInstall = Boolean(
+    legacyEntry &&
+    ((["walletKey", "routing"] as const).some(
+      (key) => key in legacyEntry || (legacyEntryConfig ? key in legacyEntryConfig : false),
+    ) ||
+      legacyPackageIsBlockRun()),
+  );
+  if (legacyBlockRunInstall && prepareBlockRunPluginConfig(config, { legacyBlockRunInstall })) {
+    needsWrite = true;
+    logger.info(
+      `Migrated legacy BlockRun plugin config to ${BLOCKRUN_PLUGIN_ID} (renamed from clawrouter; see #305)`,
+    );
+  }
+
   // web_search: set `enabled = true` (safe — boolean, no provider validator),
   // but DELETE any persisted `provider` value. OpenClaw 2026.5.2+ runs a
   // strict known-providers validator on `tools.web.search.provider` at
@@ -523,8 +551,9 @@ function injectModelsConfig(
     }
     try {
       const tmpPath = `${configPath}.tmp.${process.pid}`;
-      writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+      writeFileSync(tmpPath, JSON.stringify(config, null, 2), { mode: 0o600 });
       renameSync(tmpPath, configPath);
+      chmodSync(configPath, 0o600);
       logger.info("Smart routing enabled (blockrun/auto)");
     } catch (err) {
       logger.info(`Failed to write config: ${err instanceof Error ? err.message : String(err)}`);
@@ -533,9 +562,104 @@ function injectModelsConfig(
 }
 
 /**
+ * Repair the per-agent model cache OpenClaw keeps at
+ * `~/.openclaw/agents/<agent>/agent/models.json`.
+ *
+ * This is a THIRD model-list plane, distinct from the two in `openclaw.json`
+ * (`models.providers.blockrun.models` = the picker, `agents.defaults.models` =
+ * the allowlist). Nothing synced it, so it rotted independently: a machine whose
+ * openclaw.json `injectModelsConfig` had just repaired to the current 47 still
+ * had 155 entries here — 127 long-retired models (gpt-5.2, gpt-4.1, o1 …) plus
+ * duplicate `free` / `moonshot/kimi-k2.5` rows, and none of the current
+ * flagships. That is what surfaces as stale and duplicated rows in the picker.
+ *
+ * Only rewrites when the cache already has a `blockrun` provider — we repair our
+ * own entry, never introduce one — and leaves every other provider and each
+ * provider's non-`models` fields (baseUrl/api/apiKey) untouched.
+ *
+ * Gated like `injectModelsConfig`: outside gateway mode this is a no-op unless
+ * forced. `openclaw plugins install` runs activation hooks inside a transaction,
+ * and writing OpenClaw's own state from under it is what stranded users before
+ * (see the baseHash note on the config write above).
+ */
+function syncAgentModelCache(
+  logger: { info: (msg: string) => void },
+  options: { forceWrite?: boolean } = {},
+): void {
+  if (!isGatewayMode() && !options.forceWrite) return;
+
+  const agentsDir = join(homedir(), ".openclaw", "agents");
+  if (!existsSync(agentsDir)) return;
+
+  let agentDirs: string[];
+  try {
+    agentDirs = readdirSync(agentsDir);
+  } catch {
+    return;
+  }
+
+  const expectedIds = VISIBLE_OPENCLAW_MODELS.map((m) => m.id);
+
+  for (const agent of agentDirs) {
+    const cachePath = join(agentsDir, agent, "agent", "models.json");
+    if (!existsSync(cachePath)) continue;
+
+    try {
+      const raw = readTextFileSync(cachePath).trim();
+      if (!raw) continue;
+      const cache = JSON.parse(raw) as {
+        providers?: Record<string, { models?: Array<{ id?: string }> } | unknown>;
+      };
+      if (!cache || typeof cache !== "object" || Array.isArray(cache)) continue;
+
+      const blockrun = cache.providers?.blockrun;
+      if (!blockrun || typeof blockrun !== "object" || Array.isArray(blockrun)) continue;
+
+      const entry = blockrun as { models?: Array<{ id?: string }> };
+      const current = entry.models;
+      // Positional compare: order is what the picker renders, so a set-equal but
+      // reordered list still needs the rewrite.
+      const upToDate =
+        Array.isArray(current) &&
+        current.length === expectedIds.length &&
+        current.every((m, i) => m?.id === expectedIds[i]);
+      if (upToDate) continue;
+
+      const staleCount = Array.isArray(current) ? current.length : 0;
+      entry.models = VISIBLE_OPENCLAW_MODELS;
+
+      const tmpPath = `${cachePath}.tmp.${process.pid}`;
+      writeFileSync(tmpPath, JSON.stringify(cache, null, 2), { mode: 0o600 });
+      renameSync(tmpPath, cachePath);
+      logger.info(
+        `Repaired ${agent} model cache: ${staleCount} → ${expectedIds.length} BlockRun models`,
+      );
+    } catch (err) {
+      // A corrupt or unreadable cache is OpenClaw's to regenerate — never fail setup over it.
+      logger.info(
+        `Skipped ${agent} model cache: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
+
+/**
  * Inject dummy auth profile for BlockRun into agent auth stores.
- * OpenClaw's agent system looks for auth credentials even if provider has auth: [].
- * We inject a placeholder so the lookup succeeds (proxy handles real auth internally).
+ *
+ * The legacy ``auth-profiles.json`` write is now deliberately narrow:
+ *
+ * - Wherever ``openclaw-agent.sqlite`` exists, the SQLite auth store is
+ *   authoritative. Writing the legacy JSON beside it is at best ignored, at
+ *   worst a failed-closed migration trigger: since OpenClaw 2026.8.1 a
+ *   leftover legacy file beside a store that holds no profiles fails auth
+ *   migration for the whole agent fleet. So we never write there, and we
+ *   clean up the placeholder we previously injected.
+ * - The shared auth-owner directory (``main``) is managed by OpenClaw
+ *   itself; a placeholder written there can shadow that state. The
+ *   provider's real auth comes from the x402 proxy (and the apiKey
+ *   injectModelsConfig writes into openclaw.json), so nothing is lost.
+ * - Only on very old installs with no SQLite store at all do we keep the
+ *   original JSON bootstrap, which those releases import.
  */
 function injectAuthProfile(logger: { info: (msg: string) => void }): void {
   const agentsDir = join(homedir(), ".openclaw", "agents");
@@ -566,6 +690,22 @@ function injectAuthProfile(logger: { info: (msg: string) => void }): void {
     for (const agentId of agents) {
       const authDir = join(agentsDir, agentId, "agent");
       const authPath = join(authDir, "auth-profiles.json");
+      const sqlitePath = join(authDir, "openclaw-agent.sqlite");
+
+      // SQLite store exists: it is authoritative, and the legacy JSON is
+      // obsolete. Remove our own placeholder and never rewrite it.
+      if (existsSync(sqlitePath)) {
+        removeInjectedAuthPlaceholder(authPath, logger, agentId);
+        continue;
+      }
+
+      // Never write into the shared auth-owner directory. OpenClaw manages
+      // its credentials centrally, and a leftover legacy file there is what
+      // fails dispatch closed on 2026.8.1+ when that store is empty.
+      if (agentId === "main") {
+        removeInjectedAuthPlaceholder(authPath, logger, agentId);
+        continue;
+      }
 
       // Create agent dir if needed
       if (!existsSync(authDir)) {
@@ -610,7 +750,7 @@ function injectAuthProfile(logger: { info: (msg: string) => void }): void {
       };
 
       try {
-        writeFileSync(authPath, JSON.stringify(store, null, 2));
+        writePrivateJsonSync(authPath, store);
         logger.info(`Injected BlockRun auth profile for agent: ${agentId}`);
       } catch (err) {
         logger.info(
@@ -620,6 +760,42 @@ function injectAuthProfile(logger: { info: (msg: string) => void }): void {
     }
   } catch (err) {
     logger.info(`Auth injection failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Remove a legacy ``auth-profiles.json`` — but only when it contains nothing
+ * but the exact placeholder this plugin injects. A real user credential file
+ * is never touched.
+ */
+function removeInjectedAuthPlaceholder(
+  authPath: string,
+  logger: { info: (msg: string) => void },
+  agentId: string,
+): void {
+  try {
+    if (!existsSync(authPath)) return;
+    const parsed = JSON.parse(readTextFileSync(authPath)) as {
+      profiles?: Record<string, unknown>;
+    };
+    const profiles = parsed?.profiles;
+    if (!profiles || typeof profiles !== "object" || Array.isArray(profiles)) return;
+    const keys = Object.keys(profiles);
+    if (keys.length !== 1 || keys[0] !== "blockrun:default") return;
+    const entry = profiles["blockrun:default"];
+    if (!entry || typeof entry !== "object") return;
+    const profile = entry as { type?: unknown; provider?: unknown; key?: unknown };
+    if (
+      profile.type !== "api_key" ||
+      profile.provider !== "blockrun" ||
+      profile.key !== "x402-proxy-handles-auth"
+    ) {
+      return;
+    }
+    unlinkSync(authPath);
+    logger.info(`Removed legacy BlockRun auth placeholder for agent: ${agentId}`);
+  } catch {
+    // Unreadable or not our file — leave it alone.
   }
 }
 
@@ -748,32 +924,62 @@ async function startProxyInBackground(
     proc.__clawrouterStartupPhase = "starting";
   }
 
-  // Resolve wallet key: plugin config → saved file → env var → auto-generate.
+  // An API key, if the user has one, is resolved before any wallet is touched.
+  // resolveOrGenerateWalletKey() below *generates* a wallet as a side effect,
+  // and a customer paying by card must not end up with a private key they never
+  // asked for and a "back this up" warning they cannot act on.
+  const pluginApiKey = api.pluginConfig?.apiKey as string | undefined;
+  // A configured-but-invalid key is refused rather than ignored, for the same
+  // reason resolveApiKey() refuses one: "look elsewhere" ends at a different
+  // account or at resolveOrGenerateWalletKey(), which mints a wallet and spends
+  // USDC the user meant to bill to their account. An empty value is "unset",
+  // not "invalid" — clearing a config field is a normal way to turn it off.
+  if (typeof pluginApiKey === "string" && pluginApiKey.trim() && !isValidApiKey(pluginApiKey)) {
+    throw new Error(
+      `pluginConfig.apiKey is set but is not a BlockRun key (expected brk_…). ` +
+        `Fix it or remove it — refusing to fall back to another credential.`,
+    );
+  }
+  const resolvedApiKey =
+    typeof pluginApiKey === "string" && isValidApiKey(pluginApiKey)
+      ? { key: pluginApiKey.trim(), source: "config" as const }
+      : await resolveApiKey();
+  const apiKey = resolvedApiKey?.key;
+
+  // Resolve wallet key: plugin config → explicit env → BlockRun Core → legacy migration → generate.
   // pluginConfig.walletKey is declared in openclaw.plugin.json configSchema but
   // was previously never read here — that was a bug.
   const configKey = api.pluginConfig?.walletKey as string | undefined;
-  let wallet: WalletResolution;
+  let wallet: WalletResolution | undefined;
 
-  if (typeof configKey === "string" && /^0x[0-9a-fA-F]{64}$/.test(configKey)) {
+  if (apiKey) {
+    api.logger.info(
+      `Using BlockRun API key ${maskApiKey(apiKey)} (from ${resolvedApiKey!.source}) — billing account credit, no wallet`,
+    );
+  } else if (typeof configKey === "string" && /^0x[0-9a-fA-F]{64}$/.test(configKey)) {
     const account = privateKeyToAccount(configKey as `0x${string}`);
     wallet = { key: configKey, address: account.address, source: "config" };
   } else {
     if (configKey !== undefined) {
       api.logger.warn(
-        `pluginConfig.walletKey is set but invalid (expected 0x + 64 hex chars) — falling back to saved wallet`,
+        `pluginConfig.walletKey is set but invalid (expected 0x + 64 hex chars) — falling back to the BlockRun wallet`,
       );
     }
     wallet = await resolveOrGenerateWalletKey();
   }
 
   // Log wallet source
-  if (wallet.source === "generated") {
+  if (!wallet) {
+    // API-key mode — nothing to report, the line above already said so.
+  } else if (wallet.source === "generated") {
     api.logger.warn(`════════════════════════════════════════════════`);
     api.logger.warn(`  NEW WALLET GENERATED — BACK UP YOUR KEY NOW!`);
     api.logger.warn(`  Address : ${wallet.address}`);
     api.logger.warn(`  Run /wallet export to get your private key`);
     api.logger.warn(`  Losing this key = losing your USDC funds`);
     api.logger.warn(`════════════════════════════════════════════════`);
+  } else if (wallet.source === "core") {
+    api.logger.info(`Using BlockRun Core wallet: ${wallet.address}`);
   } else if (wallet.source === "saved") {
     api.logger.info(`Using saved wallet: ${wallet.address}`);
   } else if (wallet.source === "config") {
@@ -799,13 +1005,30 @@ async function startProxyInBackground(
     );
   }
 
+  // Restart semantics for the process-wide ledger. The rolling hourly/daily
+  // windows and the history behind them survive an in-process proxy restart —
+  // that is the point of a shared ledger. Two things must NOT survive it:
+  //   - limits, which are re-read so a hand-edit to spending.json made while
+  //     the proxy was up still applies
+  //   - the session window, which docs/configuration.md and the /policy help
+  //     both define as resetting on restart. It used to reset by accident
+  //     (every startProxy built its own SpendControl); with one ledger for the
+  //     whole process it has to be reset on purpose, or `session` quietly
+  //     becomes "since the gateway booted".
+  const sharedControl = getSharedSpendControl();
+  sharedControl.reloadLimits();
+  sharedControl.resetSession();
   const proxy = await startProxy({
-    wallet,
+    ...(apiKey ? { apiKey } : { wallet: wallet! }),
     routingConfig,
     maxCostPerRunUsd,
     maxCostPerRunMode,
+    // The process-wide ledger: the polymarket tool and the /policy command
+    // registered below use the same instance, so hourly/daily/session windows
+    // cover every surface and a /policy write reaches the live signer.
+    spendControl: sharedControl,
     onReady: (port) => {
-      api.logger.info(`BlockRun x402 proxy listening on port ${port}`);
+      api.logger.info(`BlockRun ${apiKey ? "API-key" : "x402"} proxy listening on port ${port}`);
     },
     onError: (error) => {
       api.logger.error(`BlockRun proxy error: ${error.message}`);
@@ -815,6 +1038,14 @@ async function startProxyInBackground(
       const saved = (decision.savings * 100).toFixed(0);
       api.logger.info(
         `[${decision.tier}] ${decision.model} $${cost} (saved ${saved}%) | ${decision.reasoning}`,
+      );
+    },
+    onShadowRouted: (comparison) => {
+      api.logger.info(
+        `[router-shadow] executed=${comparison.executed.model} (${comparison.executed.method}) ` +
+          `candidate=${comparison.shadow.model} (${comparison.shadow.method}) ` +
+          `same=${comparison.sameModel} tools=${comparison.hasTools} ` +
+          `vision=${comparison.hasVision} structured=${comparison.requiresStructuredOutput}`,
       );
     },
     onLowBalance: (info) => {
@@ -852,11 +1083,18 @@ async function startProxyInBackground(
   api.logger.info(`ClawRouter ready — smart routing enabled`);
   api.logger.info(`Pricing: Simple ~$0.001 | Code ~$0.01 | Complex ~$0.05 | Free: $0`);
 
+  // API-key mode has no wallet balance to check and no address to fund: the
+  // gateway holds the books and refuses with a 402 that names the top-up page.
+  if (apiKey) {
+    api.logger.info(`Billing: BlockRun account credit — top up at ${PORTAL_CREDITS_URL}`);
+    return true;
+  }
+
   // Non-blocking balance check AFTER proxy is ready (won't hang startup)
   // Uses the proxy's chain-aware balance monitor and matching active-chain address.
   const currentChain = await resolvePaymentChain();
   const displayAddress =
-    currentChain === "solana" && proxy.solanaAddress ? proxy.solanaAddress : wallet.address;
+    currentChain === "solana" && proxy.solanaAddress ? proxy.solanaAddress : wallet!.address;
   const network = currentChain === "solana" ? "Solana" : "Base";
   proxy.balanceMonitor
     .checkBalance()
@@ -1082,17 +1320,28 @@ function parseGenArgs(raw: string): {
  * with OpenClaw's native image generation UI.
  * Delegates to the local proxy (which handles x402 payment).
  */
-function buildImageGenerationProvider(): ImageGenerationProviderPlugin {
+export function buildImageGenerationProvider(): ImageGenerationProviderPlugin {
   return {
     id: "blockrun",
     label: "BlockRun",
     defaultModel: "google/nano-banana",
+    // Must stay in sync with IMAGE_PRICING (proxy.ts). OpenClaw sends the
+    // picked id straight to /v1/images/generations, which forwards the body
+    // verbatim with no alias resolution, so a retired id here is a guaranteed
+    // upstream 400. dall-e-3 (delisted 2026-05-25) and flux-1.1-pro (no
+    // gateway entry) were dropped in v0.12.227 and had lingered here.
+    // Kept as a hand-written array (not spread from IMAGE_MODEL_IDS) because
+    // this is the picker's curated display order — default model first, which
+    // IMAGE_PRICING declaration order does not give — and because the
+    // lifecycle tests fully mock ./proxy.js. Set-equality is enforced by
+    // src/index.image-provider.test.ts, which pins the two lists together.
     models: [
       "google/nano-banana",
+      "google/nano-banana-2",
       "google/nano-banana-pro",
       "openai/gpt-image-1",
-      "openai/dall-e-3",
-      "black-forest/flux-1.1-pro",
+      "openai/gpt-image-2",
+      "bytedance/seedream-5-pro",
       "xai/grok-imagine-image",
       "xai/grok-imagine-image-pro",
       "zai/cogview-4",
@@ -1107,25 +1356,33 @@ function buildImageGenerationProvider(): ImageGenerationProviderPlugin {
       // Only openai/gpt-image-1 supports edit server-side; OpenClaw's UI picks a
       // compatible model at edit time via /v1/images/image2image.
       edit: { enabled: true },
+      // Union of every size the gateway accepts across the models above,
+      // live-probed 2026-08-23 (the gateway validates size per-model BEFORE
+      // payment and 400s unknown ones — 1216x832 / 1792x1024 / 1024x1792 were
+      // accepted by no model and are gone with dall-e-3). Pinned against
+      // IMAGE_MODEL_SIZES (proxy.ts) by src/index.image-provider.test.ts.
       geometry: {
         sizes: [
           "512x512",
           "768x768",
           "768x1344",
           "1024x1024",
-          "1216x832",
+          "1024x1536",
+          "1280x720",
           "1344x768",
           "1440x1440",
           "1536x1024",
-          "1024x1536",
-          "1792x1024",
-          "1024x1792",
+          "1600x2848",
+          "1728x2304",
+          "2048x1024",
           "2048x2048",
+          "2304x1728",
+          "2848x1600",
           "4096x4096",
         ],
       },
     },
-    isConfigured: () => existsSync(WALLET_FILE),
+    isConfigured: hasConfiguredWallet,
     generateImage: async (req: ImageGenerationRequest) => {
       const port = getProxyPort();
       const body = JSON.stringify({
@@ -1190,7 +1447,7 @@ function buildMusicGenerationProvider(): MusicGenerationProviderPlugin {
       supportsFormat: true,
       supportedFormats: ["mp3"],
     },
-    isConfigured: () => existsSync(WALLET_FILE),
+    isConfigured: hasConfiguredWallet,
     generateMusic: async (req: MusicGenerationRequest) => {
       const port = getProxyPort();
       const body = JSON.stringify({
@@ -1265,6 +1522,8 @@ function buildVideoGenerationProvider(): VideoGenerationProviderPlugin {
       "bytedance/seedance-1.5-pro",
       "bytedance/seedance-2.0-fast",
       "bytedance/seedance-2.0",
+      "bytedance/seedance-2.0-mini",
+      "bytedance/seedance-2.5",
     ],
     capabilities: {
       maxVideos: 1,
@@ -1279,7 +1538,7 @@ function buildVideoGenerationProvider(): VideoGenerationProviderPlugin {
         supportedDurationSeconds: [5, 8, 10],
       },
     },
-    isConfigured: () => existsSync(WALLET_FILE),
+    isConfigured: hasConfiguredWallet,
     generateVideo: async (req: VideoGenerationRequest) => {
       const port = getProxyPort();
       const imageUrl = req.inputImages?.[0]?.url;
@@ -1377,27 +1636,48 @@ function createWalletCommand(api?: OpenClawPluginApi): OpenClawPluginCommandDefi
     handler: async (ctx: PluginCommandContext) => {
       const subcommand = ctx.args?.trim().toLowerCase() || "status";
 
-      // Read wallet key if it exists
-      let walletKey: string | undefined;
-      let address: string | undefined;
-      try {
-        if (existsSync(WALLET_FILE)) {
-          walletKey = readTextFileSync(WALLET_FILE).trim();
-          if (walletKey.startsWith("0x") && walletKey.length === 66) {
-            const account = privateKeyToAccount(walletKey as `0x${string}`);
-            address = account.address;
-          }
-        }
-      } catch {
-        // Wallet file doesn't exist or is invalid
+      // API-key mode has no wallet, no chain and no key to export. Answer with
+      // the account instead of resolving (and, for the chain subcommands,
+      // silently GENERATING) wallet material this user will never spend from.
+      const activeApiKey = (await resolveApiKey())?.key;
+      if (activeApiKey) {
+        return {
+          text: [
+            "**BlockRun account** (API key)",
+            "",
+            `**Key:** \`${maskApiKey(activeApiKey)}\``,
+            "**Billing:** account credit — no wallet, no payment chain, no gas.",
+            "",
+            `**Add credit:** ${PORTAL_CREDITS_URL}`,
+            `**Usage & keys:** ${PORTAL_KEYS_URL}`,
+            "",
+            "To pay with a USDC wallet over x402 instead, run `clawrouter logout` and restart.",
+          ].join("\n"),
+        };
       }
 
-      if (!walletKey || !address) {
+      let wallet: WalletResolution | undefined;
+      try {
+        wallet =
+          subcommand === "status" || subcommand === "export"
+            ? await resolveExistingWalletKey()
+            : await resolveOrGenerateWalletKey();
+      } catch (error) {
         return {
-          text: `No ClawRouter wallet found.\n\nRun \`openclaw plugins install @blockrun/clawrouter\` to generate a wallet.`,
+          text: `Could not load the BlockRun wallet: ${error instanceof Error ? error.message : String(error)}`,
           isError: true,
         };
       }
+      if (!wallet) {
+        return {
+          text: "No BlockRun wallet found. Run `clawrouter setup` or connect an agent in ClawRouter Desktop to create one.",
+          isError: true,
+        };
+      }
+      const walletKey = wallet.key;
+      const address = wallet.address;
+      const resolvedSolanaKey = wallet.solanaPrivateKeyBytes;
+      const walletPath = wallet.source === "core" ? CORE_WALLET_FILE : WALLET_FILE;
 
       if (subcommand === "export") {
         // Export private key + mnemonic for backup
@@ -1442,13 +1722,30 @@ function createWalletCommand(api?: OpenClawPluginApi): OpenClawPluginCommandDefi
           // No mnemonic - EVM-only wallet
         }
 
+        if (!hasMnemonic && resolvedSolanaKey) {
+          try {
+            const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+            const signer = await createKeyPairSignerFromPrivateKeyBytes(resolvedSolanaKey);
+            lines.push(
+              "",
+              "**Solana:**",
+              `  Address: \`${signer.address}\``,
+              wallet.source === "core"
+                ? `  Private key managed by BlockRun Core: \`${CORE_SOLANA_WALLET_FILE}\``
+                : "  Private key is managed by the configured wallet source.",
+            );
+          } catch {
+            // Base export remains usable if Solana address derivation is unavailable.
+          }
+        }
+
         lines.push(
           "",
           "**To restore on a new machine:**",
           "1. Set the environment variable before running OpenClaw:",
           `   \`export BLOCKRUN_WALLET_KEY=${walletKey}\``,
           "2. Or save to file:",
-          `   \`mkdir -p ~/.openclaw/blockrun && echo "${walletKey}" > ~/.openclaw/blockrun/wallet.key && chmod 600 ~/.openclaw/blockrun/wallet.key\``,
+          `   \`mkdir -p ~/.blockrun && echo "${walletKey}" > ~/.blockrun/.session && chmod 600 ~/.blockrun/.session\``,
         );
 
         if (hasMnemonic) {
@@ -1466,6 +1763,23 @@ function createWalletCommand(api?: OpenClawPluginApi): OpenClawPluginCommandDefi
         // If no mnemonic, set up Solana wallet first.
         try {
           let solanaAddr: string | undefined;
+
+          if (resolvedSolanaKey) {
+            await savePaymentChain("solana");
+            const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
+            const signer = await createKeyPairSignerFromPrivateKeyBytes(resolvedSolanaKey);
+            solanaAddr = signer.address;
+            if (api) restartProxyForChainSwitch(api);
+            return {
+              text: [
+                "✓ Payment chain switched to **Solana**.",
+                api ? "Proxy restarting in background (~2s)." : "Restart the gateway to apply.",
+                "",
+                `**Solana Address:** \`${solanaAddr}\``,
+                `**Fund with USDC on Solana:** https://solscan.io/account/${solanaAddr}`,
+              ].join("\n"),
+            };
+          }
 
           // Check if Solana wallet is already set up (mnemonic exists)
           if (existsSync(MNEMONIC_FILE)) {
@@ -1551,13 +1865,9 @@ function createWalletCommand(api?: OpenClawPluginApi): OpenClawPluginCommandDefi
 
       const solanaPromise = (async () => {
         try {
-          if (!existsSync(MNEMONIC_FILE)) return "";
-          const { deriveSolanaKeyBytes } = await import("./wallet.js");
-          const mnemonic = readTextFileSync(MNEMONIC_FILE).trim();
-          if (!mnemonic) return "";
-          const solKeyBytes = deriveSolanaKeyBytes(mnemonic);
+          if (!resolvedSolanaKey) return "";
           const { createKeyPairSignerFromPrivateKeyBytes } = await import("@solana/kit");
-          const signer = await createKeyPairSignerFromPrivateKeyBytes(solKeyBytes);
+          const signer = await createKeyPairSignerFromPrivateKeyBytes(resolvedSolanaKey);
           const solAddr = signer.address;
 
           let solBalanceText = "Balance: (could not check)";
@@ -1633,7 +1943,7 @@ function createWalletCommand(api?: OpenClawPluginApi): OpenClawPluginCommandDefi
           solanaSection,
           usageSection,
           "",
-          `**Key File:** \`${WALLET_FILE}\``,
+          `**Key File:** \`${walletPath}\``,
           "",
           "**Commands:**",
           "• `/wallet` - Show this status",
@@ -1650,9 +1960,23 @@ function createWalletCommand(api?: OpenClawPluginApi): OpenClawPluginCommandDefi
   };
 }
 
+/**
+ * This plugin's OpenClaw id. NOT "clawrouter" — OpenClaw bundles its own plugin
+ * under that id since the 2026.7.1 line, and a duplicate loses to the bundled
+ * one. Kept as one constant so the manifest, the plugin definition and the
+ * config migration can never drift apart. See #305.
+ */
+export { BLOCKRUN_PLUGIN_ID } from "./openclaw-plugin-config.js";
+
 const plugin: OpenClawPluginDefinition = {
-  id: "clawrouter",
-  name: "ClawRouter",
+  // NOT "clawrouter". OpenClaw bundles its own plugin under that id since the
+  // 2026.7.1 line (vendored at dist/extensions/clawrouter, provider `clawrouter/*`,
+  // CLAWROUTER_API_KEY, clawrouter.openclaw.ai). A duplicate id loses to the
+  // bundled one — "global plugin will be overridden by bundled plugin" — so this
+  // plugin silently never loaded and the local proxy never started. Different
+  // product, different id. See #305.
+  id: BLOCKRUN_PLUGIN_ID,
+  name: "BlockRun ClawRouter",
   description: "Smart LLM router — 55+ models, x402 micropayments, 78% cost savings",
   version: VERSION,
 
@@ -1665,10 +1989,6 @@ const plugin: OpenClawPluginDefinition = {
       api.logger.info("ClawRouter disabled (CLAWROUTER_DISABLED=true). Using default routing.");
       return;
     }
-
-    // Install skills into OpenClaw workspace so agents can discover them
-    // Must run before completion short-circuit so skills are available even on first install
-    installSkillsToWorkspace(api.logger);
 
     // Guard against repeated proxy startup within the same process.
     // OpenClaw calls register() multiple times (discovery, activation, per-session)
@@ -1714,6 +2034,10 @@ const plugin: OpenClawPluginDefinition = {
     // Inject models config into OpenClaw config file
     // This persists the config so models are recognized on restart
     injectModelsConfig(api.logger);
+
+    // Repair OpenClaw's separate per-agent model cache, which openclaw.json's
+    // two planes do not feed and which otherwise keeps serving retired models.
+    syncAgentModelCache(api.logger);
 
     // Inject dummy auth profiles into agent auth stores
     // OpenClaw's agent system looks for auth even if provider has auth: []
@@ -1781,6 +2105,10 @@ const plugin: OpenClawPluginDefinition = {
       // blockrun_polymarket is a LOCAL trading tool (signs CLOB orders with the
       // ClawRouter wallet key), not an HTTP-proxy partner tool — register it
       // separately so real-money betting works out of the box.
+      // No deps: the tool's signing paths resolve the same process-wide ledger
+      // themselves, at call time. Passing it here instead would construct the
+      // SpendControl — and read spending.json off disk — on every plugin
+      // registration, including for the many installs that never place a bet.
       api.registerTool(buildPolymarketTool());
       if (partnerTools.length > 0 && shouldLogRegistration) {
         api.logger.info(
@@ -1853,7 +2181,7 @@ const plugin: OpenClawPluginDefinition = {
         const parsed = parseGenArgs(ctx.args ?? "");
         if (!parsed.prompt) {
           return {
-            text: "Usage: `/cr-imagegen <prompt> [--model=<alias>] [--size=1024x1024] [--n=1]`\n\nAliases: `nano-banana` (default), `banana-pro`, `dalle`, `gpt-image`, `flux`, `grok-imagine`, `grok-imagine-pro`, `cogview`.",
+            text: "Usage: `/cr-imagegen <prompt> [--model=<alias>] [--size=1024x1024] [--n=1]`\n\nAliases: `nano-banana` (default), `banana-2` (Gemini 3.1 Flash quality), `banana-pro`, `dalle`, `gpt-image`, `flux`, `grok-imagine`, `grok-imagine-pro`, `cogview`.",
           };
         }
         const model = resolveModelAlias(parsed.model ?? "nano-banana");
@@ -1907,7 +2235,7 @@ const plugin: OpenClawPluginDefinition = {
         const parsed = parseGenArgs(ctx.args ?? "");
         if (!parsed.prompt) {
           return {
-            text: "Usage: `/videogen <prompt> [--model=<alias>] [--duration=5|8|10]`\n\nAliases: `seedance` (1.5-pro, default — cheapest), `seedance-2-fast`, `seedance-2`, `grok-video`.\n\n⏱️  Generation takes 60–180 seconds. Payment settles only on success.",
+            text: "Usage: `/videogen <prompt> [--model=<alias>] [--duration=5|8|10]`\n\nAliases: `seedance` (1.5-pro, default — cheapest), `seedance-2-fast`, `seedance-2`, `seedance-2-mini` (720p + audio, half the flagship rate), `seedance-2.5` (720p + synced audio, long-form), `grok-video`.\n\n⏱️  Generation takes 60–180 seconds. Payment settles only on success.",
           };
         }
         const model = resolveModelAlias(parsed.model ?? "seedance");
@@ -2044,9 +2372,17 @@ const plugin: OpenClawPluginDefinition = {
     }
     api.registerCommand(createStatsCommand());
     api.registerCommand(createExcludeCommand());
+    api.registerCommand(
+      createPolicyCommand({
+        liveControl: () =>
+          (process as ProcessWithClawRouterState).__clawrouterProxyStarted
+            ? getSharedSpendControl()
+            : undefined,
+      }),
+    );
     if (shouldLogRegistration) {
       api.logger.info(
-        "Commands registered: /wallet, /blockrun, /stats, /exclude, /partners, /cr-imagegen, /videogen, /cr-call",
+        "Commands registered: /wallet, /blockrun, /stats, /exclude, /policy, /partners, /cr-imagegen, /videogen, /cr-call",
       );
     }
 
@@ -2081,28 +2417,64 @@ const plugin: OpenClawPluginDefinition = {
       if (shouldLogRegistration) {
         // Generate wallet on first install (even outside gateway mode)
         // This ensures users can see their wallet address immediately after install
-        resolveOrGenerateWalletKey()
-          .then(({ address, source }) => {
-            if (source === "generated") {
-              api.logger.warn(`════════════════════════════════════════════════`);
-              api.logger.warn(`  NEW WALLET GENERATED — BACK UP YOUR KEY NOW!`);
-              api.logger.warn(`  Address : ${address}`);
-              api.logger.warn(`  Run /wallet export to get your private key`);
-              api.logger.warn(`  Losing this key = losing your USDC funds`);
-              api.logger.warn(`════════════════════════════════════════════════`);
-            } else if (source === "saved") {
-              api.logger.info(`Using saved wallet: ${address}`);
-            } else if (source === "config") {
-              api.logger.info(`Using wallet from plugin config: ${address}`);
-            } else {
-              api.logger.info(`Using wallet from BLOCKRUN_WALLET_KEY: ${address}`);
-            }
-          })
-          .catch((err) => {
-            api.logger.warn(
-              `Failed to initialize wallet: ${err instanceof Error ? err.message : String(err)}`,
+        //
+        // ...unless the user pays by card. resolveOrGenerateWalletKey() MINTS a
+        // key as a side effect, so running it unconditionally handed an API-key
+        // customer a private key they never asked for plus a "back this up or
+        // lose your USDC" warning they cannot act on — and broke the documented
+        // promise that API-key mode never generates, reads or signs with one.
+        // The gateway-mode path (startProxyInBackground) has always resolved the
+        // key before touching a wallet; this path had not.
+        void (async () => {
+          // resolveApiKey() THROWS when a key is present but malformed, and
+          // that refusal is the point: falling through would resolve the next
+          // credential instead, which can be a different account or a funded
+          // wallet. Catching it here would silently undo exactly that
+          // protection, so a malformed key stops this path rather than
+          // downgrading to "generate a wallet and spend USDC". Reported and
+          // returned, not rethrown — an unhandled rejection inside plugin
+          // registration takes OpenClaw down with it, and the user needs to
+          // read the reason.
+          let keyResolution: Awaited<ReturnType<typeof resolveApiKey>>;
+          try {
+            keyResolution = await resolveApiKey();
+          } catch (error) {
+            api.logger.error(
+              `BlockRun API key is configured but unusable: ${error instanceof Error ? error.message : String(error)}`,
             );
-          });
+            api.logger.error(
+              `Not falling back to a wallet — fix the key, or run "clawrouter logout" to pay from the wallet deliberately.`,
+            );
+            return;
+          }
+          if (keyResolution) {
+            api.logger.info(
+              `Using BlockRun API key ${maskApiKey(keyResolution.key)} (from ${keyResolution.source}) — billing account credit, no wallet`,
+            );
+            return;
+          }
+          const { address, source } = await resolveOrGenerateWalletKey();
+          if (source === "generated") {
+            api.logger.warn(`════════════════════════════════════════════════`);
+            api.logger.warn(`  NEW WALLET GENERATED — BACK UP YOUR KEY NOW!`);
+            api.logger.warn(`  Address : ${address}`);
+            api.logger.warn(`  Run /wallet export to get your private key`);
+            api.logger.warn(`  Losing this key = losing your USDC funds`);
+            api.logger.warn(`════════════════════════════════════════════════`);
+          } else if (source === "core") {
+            api.logger.info(`Using BlockRun Core wallet: ${address}`);
+          } else if (source === "saved") {
+            api.logger.info(`Using saved wallet: ${address}`);
+          } else if (source === "config") {
+            api.logger.info(`Using wallet from plugin config: ${address}`);
+          } else {
+            api.logger.info(`Using wallet from BLOCKRUN_WALLET_KEY: ${address}`);
+          }
+        })().catch((err) => {
+          api.logger.warn(
+            `Failed to initialize wallet: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
         api.logger.info("Not in gateway mode — proxy will start when gateway runs");
       }
       return;
@@ -2210,7 +2582,7 @@ const plugin: OpenClawPluginDefinition = {
         removeManagedBlockrunMcpServerConfig(config as OpenClawConfig);
 
         // Remove plugin entries (all case variants)
-        for (const key of ["clawrouter", "ClawRouter", "@blockrun/clawrouter"]) {
+        for (const key of [BLOCKRUN_PLUGIN_ID, "ClawRouter", "@blockrun/clawrouter"]) {
           if (config.plugins?.entries?.[key]) delete config.plugins.entries[key];
           if (config.plugins?.installs?.[key]) delete config.plugins.installs[key];
         }
@@ -2218,7 +2590,18 @@ const plugin: OpenClawPluginDefinition = {
         // Remove from plugins.allow
         if (Array.isArray(config.plugins?.allow)) {
           config.plugins.allow = config.plugins.allow.filter(
-            (p: string) => p !== "clawrouter" && p !== "ClawRouter" && p !== "@blockrun/clawrouter",
+            (p: string) =>
+              p !== BLOCKRUN_PLUGIN_ID && p !== "ClawRouter" && p !== "@blockrun/clawrouter",
+          );
+        }
+
+        // A previous uninstall/disable may have left the managed id denied.
+        // Remove only BlockRun-owned aliases; the official `clawrouter` id is
+        // intentionally preserved.
+        if (Array.isArray(config.plugins?.deny)) {
+          config.plugins.deny = config.plugins.deny.filter(
+            (p: string) =>
+              p !== BLOCKRUN_PLUGIN_ID && p !== "ClawRouter" && p !== "@blockrun/clawrouter",
           );
         }
 
@@ -2240,8 +2623,9 @@ const plugin: OpenClawPluginDefinition = {
 
         // Atomic write
         const tmpPath = `${configPath}.tmp.${process.pid}`;
-        writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+        writeFileSync(tmpPath, JSON.stringify(config, null, 2), { mode: 0o600 });
         renameSync(tmpPath, configPath);
+        chmodSync(configPath, 0o600);
         api.logger.info("ClawRouter config cleaned up");
       }
     } catch (err) {
@@ -2260,7 +2644,7 @@ const plugin: OpenClawPluginDefinition = {
             const store = JSON.parse(readTextFileSync(authPath));
             if (store.profiles?.["blockrun:default"]) {
               delete store.profiles["blockrun:default"];
-              writeFileSync(authPath, JSON.stringify(store, null, 2));
+              writePrivateJsonSync(authPath, store);
             }
           } catch {
             // Skip corrupt auth files
@@ -2281,7 +2665,7 @@ export default plugin;
 export { startProxy, getProxyPort } from "./proxy.js";
 
 // Re-export setup helpers for the `clawrouter setup` CLI command
-export { injectModelsConfig, injectAuthProfile, isBlockrunWebSearchDisabled };
+export { injectModelsConfig, injectAuthProfile, syncAgentModelCache, isBlockrunWebSearchDisabled };
 export type {
   ProxyOptions,
   ProxyHandle,
@@ -2295,6 +2679,7 @@ export { blockrunProvider } from "./provider.js";
 export {
   OPENCLAW_MODELS,
   BLOCKRUN_MODELS,
+  VISIBLE_OPENCLAW_MODELS,
   buildProviderModels,
   MODEL_ALIASES,
   resolveModelAlias,
@@ -2307,9 +2692,17 @@ export {
   DEFAULT_ROUTING_CONFIG,
   getFallbackChain,
   getFallbackChainFiltered,
+  filterCandidatesByCapacity,
+  inferToolRequirement,
   calculateModelCost,
 } from "./router/index.js";
-export type { RoutingDecision, RoutingConfig, Tier } from "./router/index.js";
+export type {
+  RoutingDecision,
+  RoutingConfig,
+  RouterOptions,
+  TaskType,
+  Tier,
+} from "./router/index.js";
 export { logUsage } from "./logger.js";
 export type { UsageEntry } from "./logger.js";
 export { RequestDeduplicator } from "./dedup.js";
@@ -2323,10 +2716,19 @@ export {
   FileSpendControlStorage,
   InMemorySpendControlStorage,
   formatDuration,
+  registerSpendPolicyHook,
+  SpendPolicyError,
+  MalformedSpendPolicyError,
+  UnreadableSpendPolicyError,
+  CAIP2_BASE,
+  CAIP2_SOLANA_MAINNET,
+  PAYABLE_NETWORKS,
 } from "./spend-control.js";
 export type {
   SpendWindow,
+  PolicyList,
   SpendLimits,
+  CounterpartyInfo,
   SpendRecord,
   SpendingStatus,
   CheckResult,

@@ -4,6 +4,1371 @@ All notable changes to ClawRouter.
 
 ---
 
+## v0.12.276 — September 6, 2026
+
+### Fixed — Gemini 3.8 Flash was routable but uncatalogued, which is a cost-cap hole
+
+`google/gemini-3.8-flash` has been live in the BlockRun catalog (chat, reasoning, coding, vision; $0.75/$3.75, 1M context) while `src/models.ts` carried no entry for it. Anything that pins it by id reached the gateway and got an answer, so it looked healthy — but `estimateAmount()` returns `undefined` for an id this catalog does not carry, and three guards read that as "free":
+
+- the pre-request balance check never runs, so an underfunded wallet gets an x402 failure mid-request instead of a fallback to a free model
+- strict `maxCostPerRun` projects `$0` for the request, so the cap cannot trip on it
+- session spend never accumulates, so the cap reads `$0.00` no matter how many of these calls have gone out
+
+This is the failure mode already documented on `zai/glm-5.3-flash`: an uncatalogued routing target is a cost-cap hole, not a logging gap. Surfaced by [ClawRouter-Hermes #40](https://github.com/BlockRunAI/ClawRouter-Hermes/pull/40), which pinned the model from the Hermes picker — the first curated picker entry this catalog did not carry.
+
+Added to `BLOCKRUN_MODELS`, to `src/top-models.json` above `gemini-3.6-flash` (Google runs descending after the pro) and to the README pricing table. No alias shorthands: `clawrouter.aliases` is published in the brand artifact and asserted here, so `gemini-3.8` / `gemini-3.8-flash` shorthands wait on that number moving upstream.
+
+## v0.12.275 — September 5, 2026
+
+### Added — a collision gate pinned to an OpenClaw version that actually collides
+
+The existing container harness pins `openclaw@2026.5.4` — the release before OpenClaw began bundling its own `clawrouter` plugin — so the id collision from #305 cannot occur there, and every other harness floats on `@latest`, which cannot hold a version-specific regression still. The unit tests mock `homedir` and never see the installer, while both production failures were installer-shaped.
+
+`npm run test:e2e:openclaw-collision` drives the real installer against a pinned 2026.8.2. Opt-in, not wired into CI; it sandboxes `HOME` and strips `BLOCKRUN_WALLET_KEY` and the `OPENCLAW_*` overrides from the child environment, so it cannot touch a real wallet or config. From [#320](https://github.com/BlockRunAI/ClawRouter/pull/320) by [@twzrd-sol](https://github.com/twzrd-sol).
+
+### Fixed — the wallet rails never said which gateway they were using
+
+Three rails, three gateways: an API key goes to `api.blockrun.ai`, a Solana wallet to `sol.blockrun.ai`, a Base wallet to `blockrun.ai`. Only two of them said so. `/health` reported `gateway` in API-key mode only, and startup logged the chain for Solana but printed nothing at all for Base — so the default rail was the one that never announced itself.
+
+Which gateway a request went to is the single most useful fact when a paid call fails, and its absence cost a round trip on every report that needed it. All three now name it, in both `/health` and the startup log.
+
+## v0.12.274 — September 5, 2026
+
+### Fixed — `clawrouter policy` spend limits now hold on the API-key rail
+
+`SpendControl` was reached only through the x402 pre-sign hook, so on the API-key rail none of it ran. Someone who set `daily=5` on a wallet and then ran `clawrouter login` kept a config file that read like a $5/day cap and got their account balance instead. The startup warning was the only thing standing between those two readings.
+
+The amount windows — `perRequest`, `hourly`, `daily`, `session` — are denominated in USD and say nothing about how money moves, so they mean the same thing on both rails and are now enforced on both, from the same `spending.json`. The key rail has no signature to refuse, so they moved to its only equivalent choke point: the fetch every paid call goes through.
+
+Two things there work out better than on the wallet rail. What gets recorded is what the gateway actually **charged** (`x-blockrun-cost-usd`) when it says so, not a local estimate; and a request the gateway rejected costs the window nothing, because account credit is not debited for it. An async image, audio or video job is billed once at submit — its status polls are neither checked nor recorded, so a long poll loop cannot drain a daily window on its own.
+
+The counterparty lists (`blockedPayees`, `allowedPayees`, `allowedNetworks`, `allowedAssets`) stay wallet-only, on purpose: they presuppose a payee, a network and an on-chain asset, and account credit has one counterparty and no asset. They are vacuous on that rail rather than missing. The startup warning narrowed to say exactly that, and now also states plainly that the amount limits **do** apply.
+
+Reported by [@twzrd-sol](https://github.com/twzrd-sol) in [#329](https://github.com/BlockRunAI/ClawRouter/issues/329).
+
+### Fixed — the plugin-id migration missed the config an ordinary pre-rename install actually has
+
+Since [#313](https://github.com/BlockRunAI/ClawRouter/pull/313) the gateway-start migration asked for BlockRun-owned fields (`walletKey`, `routing`) under `plugins.entries.clawrouter` before touching that entry. OpenClaw's installer commits `{ "enabled": true }` and nothing else for an `enabledByDefault` plugin, and the wallet lives at `~/.openclaw/blockrun/wallet.key` rather than in `openclaw.json` — so the common case carries neither field and was never migrated on the `npm update -g` + restart path.
+
+Verified against a real `openclaw@2026.8.2`, that left two shapes on disk. A legacy `{ enabled: true }` ended up explicitly enabling **OpenClaw's own bundled router**, a product the user never configured. Worse, a legacy `{ enabled: false }` — a pre-rename opt-out — was **inverted**: the bundled router went off, BlockRun came on by the installer default, and the proxy started on a machine where the user had turned it off.
+
+The gate now also accepts what `clawrouter setup` already treats as proof: a legacy package directory whose `package.json` names `@blockrun/clawrouter`. That is unambiguous where config fields are not, and it does not widen the heuristic #313 narrowed — an entry OpenClaw wrote for its own router has no such directory behind it. Without either kind of evidence the entry is still left alone.
+
+Reported by [@twzrd-sol](https://github.com/twzrd-sol) in [#319](https://github.com/BlockRunAI/ClawRouter/issues/319).
+
+### Fixed — the EADDRINUSE reuse path checked the payment chain and nothing else
+
+v0.12.273 bound proxy reuse to the credential, but only on the pre-listen probe. `startProxy` reaches a running proxy a second way: the EADDRINUSE branch taken when another process wins the bind in between. That branch compared the payment chain alone, so an API-key caller landing on a Base wallet proxy reused it and got back a handle reporting `authMode: "api-key"` and the key's masked label — while every request was paid in USDC from the wallet. It also tested the reported wallet for truthiness, and an API-key proxy publishes an empty one, so that case fell through to a non-`Error` throw.
+
+Both paths now run the same validator: auth mode, API key and payment chain, one rule instead of two.
+
+Found by [@KillerQueen-Z](https://github.com/KillerQueen-Z) in [#343](https://github.com/BlockRunAI/ClawRouter/pull/343), the remaining finding on that PR after v0.12.273 landed the rest.
+
+### Fixed — two different wallets no longer swap silently
+
+`resolveExistingWalletKey` prefers BlockRun Core over ClawRouter's legacy `wallet.key`, and the legacy→Core migration copies only when Core is absent — so in the common case both hold the same key and the precedence is invisible. It becomes visible when Core was written independently by another BlockRun product while ClawRouter already had its own funded wallet: payment moved on upgrade, requests started failing on an empty balance, and the funded wallet sat idle with nothing having said so.
+
+Core still wins. Preferring legacy would make Desktop display and fund one address while the proxy spent from another, and refusing outright would turn a working install into a hard failure for anyone legitimately holding two wallets. What was wrong was the silence: startup now names both addresses and the one line that keeps paying from the old one. `~/.blockrun/.chain` overriding this install's own saved chain — a different signer and a different gateway — is reported the same way.
+
+Reported in [#315](https://github.com/BlockRunAI/ClawRouter/issues/315).
+
+---
+
+## v0.12.273 — September 5, 2026
+
+### Fixed — a second API key could attach to a proxy billing the first account
+
+Proxy reuse compared wallet-vs-key but never **which** key, while its own comment claimed to "never reuse across credentials". So `clawrouter login` with a second key, against a port already serving the first, attached silently: the new process printed the new key and reported `listening`, and every request went on being charged to the previous account.
+
+Reproduced on the shipped v0.12.272 — a proxy started with key A kept answering `/health` as key A while a second process configured for key B reported success on the same port. Cross-account billing behind a success message.
+
+Reuse is now bound to the credential: the masked label `/health` publishes must match, and an older proxy that reports no label is refused rather than assumed to match, because an unverifiable credential on a money path is not a match. Same-key reuse — one machine, one key, a second client attaching — is unaffected.
+
+Reported by [@KillerQueen-Z](https://github.com/KillerQueen-Z) in [#343](https://github.com/BlockRunAI/ClawRouter/pull/343).
+
+---
+
+## v0.12.272 — September 5, 2026
+
+### Added — the API key is pinned to one origin, and never falls back to a wallet by accident
+
+Rebase of [#338](https://github.com/BlockRunAI/ClawRouter/pull/338) by [@KillerQueen-Z](https://github.com/KillerQueen-Z), whose security work this is.
+
+The bearer token is now pinned to a single origin and `redirect: "error"` refuses to follow a redirect — a redirect being the quiet way a credential leaves the host it was minted for. The account URL must be HTTPS (loopback excepted) with no credentials, query or fragment, validated once at startup rather than per call. Payment headers are stripped by pattern rather than exact name, so a new x402 spelling cannot ride along on a rail that signs nothing.
+
+**A malformed key is now fatal instead of skipped.** Skipping fell through to the _next_ credential, and the next credential can be a different account or a funded wallet — spending USDC because a key file was corrupt is worse than refusing to start. An empty `BLOCKRUN_API_KEY` still counts as unset, since `FOO=""` is the ordinary way to clear a variable in CI.
+
+Authenticated responses carry `Cache-Control: no-store`, keyed on the credential rather than the route: downstream caches key on URL, so two API keys on one proxy port could otherwise share `/v1/phone/numbers` — which answers "which numbers do I own" and which upstream marks `public, max-age=3600`.
+
+Account-rail async jobs (`202` + `poll_url`) are driven to completion by polling the signed URL, never by resubmitting — a resubmit would be a second _paid_ job. And the long tail of non-chat account services is forwarded verbatim and streamed, so payload, status and SSE contract survive.
+
+### Fixed — image, video and audio calls were journaled at $0 on the API-key rail
+
+The media branches computed their cost as `paymentStore.getStore()?.amountUsd ?? <estimate>`, and `??` does not catch **0**. On the API-key rail no x402 payment happens, the store reports `0`, and `0 ?? estimate` is `0` — so every image, img2img, audio and video call landed in the journal at zero and `/stats` showed `IMAGE: {count: 4, cost: 0}` while the account was really charged $0.0525 per image.
+
+The same shape as the 152x chat overstatement fixed in v0.12.271, in the other direction: spend that silently is not there. Found by the ClawRouter-Hermes session live-testing 0.12.271, not by a test — `??` versus `||` on a legitimately-zero value is invisible to typecheck and to every test that only exercises the wallet rail.
+
+These routes are luckier than the rest: the gateway puts the settled amount in the response body as `price.amount`, so the true figure is recoverable even where the cost header is absent. All six media sites now resolve cost in order — the `x-blockrun-cost-usd` header, then `price.amount`, then a **non-zero** x402 payment, then the local estimate as a last resort — and record the gateway request id so these calls are reconcilable too.
+
+Verified live: one `google/nano-banana` image now journals `cost: 0.0525` with a request id, against `0` before.
+
+### Added — `clawrouter reconcile`, so a bill can be checked without a dashboard
+
+Two records of the same spend exist and they are not the same thing: the local journal is what ClawRouter _believed_ each call cost, and BlockRun's ledger is what it actually _charged_. Until now the only way to see the second was to log into the portal.
+
+`clawrouter reconcile` diffs them, joined on the gateway's own request id (recorded per call since the previous release). It reports amount mismatches, charges with no local record, local records with no settled charge, and rows still pending pricing — which are excluded from the totals rather than counted as a settled $0, since a pending charge can still be repriced.
+
+Run against this session's own traffic it immediately re-found both billing bugs fixed in v0.12.271, from the ledger side: a `gpt-4o-mini` call journalled at `$0.001000` against `$0.000007` actually charged, and `surf/market/price` journalled at `$0` against `$0.0075`. That is the point of it — a local price table can always drift, and only the ledger settles the argument.
+
+Exits `2` when the gateway charged for calls this machine has no record of, so a scheduled check can alert on it. That case is expected when one key is shared across machines or products, and worth investigating when it is not.
+
+Journal entries with no request id — free models, cache hits, anything written before ids were recorded — are counted and reported separately rather than shown as discrepancies. Absence of a join key is not a mismatch.
+
+### Added — warn before the account credit runs out, not after
+
+A card-paying user had no warning at all: the first sign of trouble was a call failing with `402`, while wallet users have had a live balance all along. BlockRun now publishes `x-blockrun-credit-remaining-usd`, and ClawRouter warns once when it drops to $1.00 or below — the same threshold the wallet rail uses — re-arming after a top-up so the next drop is reported too. Once per crossing, not once per call, so a busy agent does not get the same line on every request.
+
+Two properties of the header decide whether it is safe to act on, and both are honoured. **Absent means "nothing to report", never zero**: the gateway omits it entirely on ungated accounts, which have no allowance to run down, so reading absence as `0` would announce "credit exhausted" at an account with no limit at all. A genuine zero balance is written `0.000000`, and the parser keeps the two distinguishable by returning `number | undefined`. The figure is also derived net of every concurrent in-flight hold, so it can understate what is left but never overstate it — for a warning that is the right error direction.
+
+`Number("")` is `0`, not `NaN`, so an empty header value would otherwise parse as a settled zero. Empty, malformed and negative all read as absent.
+
+### Fixed — "the 402 quote is always authoritative" was wrong across rails
+
+A heading in `skills/surf/SKILL.md` said a 402 quote is _always_ authoritative. The paragraph under it scoped that to the wallet rail; the heading did not, and a heading is what an agent skims. The API-key rail issues no 402 at all, and a wallet-rail quote includes the chain transaction fee that account credit does not pay — so carrying a Base 402 across quotes $0.0085 for something billed $0.0075. That mistake was made for real by another BlockRun client the same day.
+
+Now scoped: authoritative **for the rail that issued it, and only that rail**, with an explicit warning against reading one rail's quote as the other's price.
+
+Both files also now state that the Base/Solana Surf difference is deliberate — the $0.001 is Base's transaction fee and Solana omitting it is a migration incentive. Solana being _cheaper_ is expected; Solana priced **above** Base would be the bug worth reporting, since estimates generally assume the Base figure is the ceiling. Two sessions filed the spread as a defect before it was written down.
+
+---
+
+## v0.12.271 — September 5, 2026
+
+### Fixed — API-key calls were logged at up to 152x their real cost
+
+On the wallet rail `logUsage` records the actual x402 payment. On the API-key rail no x402 payment ever happens, so `actualPayment` was always 0 and every call fell through to a local estimate that adds a 5% server margin, a $0.001 per-transaction settlement fee and router-core's `MIN_PAYMENT_USD` floor. All three are x402 concepts — the fee covers on-chain gas, the floor is the CDP facilitator's minimum — and account credit settles none of them.
+
+Measured against the gateway's own ledger by diffing `spent_usd` across a single call: a 12-in/8-out `gpt-4o-mini` call was billed **$0.0000066** while `/stats` reported **$0.001**. API-key mode now prices a call the way the gateway does, using the token counts the response actually reports: `(inputTokens × inputPrice + outputTokens × outputPrice) / 1e6`. Re-measured after the fix — gateway charged $0.00000675, ClawRouter logged $0.00000675, delta zero.
+
+**If you pay by API key, the numbers `/stats` reports will drop sharply after upgrading.** The old ones were wrong; the new ones reconcile against the gateway to the cent. Wallet mode is unchanged — it still logs the real x402 amount.
+
+### Fixed — paid partner calls were logged at $0 on the API-key rail
+
+The mirror of the same bug. `getActualPaymentUsd()` returns the x402 payment, which never happens on the API-key rail, so Surf, Exa, prediction-market, image and speech calls all landed in the journal at zero and were invisible in `/stats`. Unlike chat there is no local price model for these services, so the gateway's own figure is the only truthful source: ClawRouter now reads `x-blockrun-cost-usd` when BlockRun sends it.
+
+Its contract is that **absent means "no charge settled at response time", not "the call was free"** — chat is always absent, since the charge commits after the response is sent — so absence falls back rather than asserting $0.
+
+### Added — `clawrouter status` shows account credit
+
+BlockRun now publishes a key-readable credit position, so the balance a card-paying user could previously only see by logging into the dashboard is available from the CLI, and on `/health?full=true`.
+
+`remaining_usd` is legitimately null on an ungated account (no prepaid allowance), so it renders as `spent $4.29 — no prepaid limit` rather than a fabricated `$0.00`; a prepaid account shows `$12.50 remaining (spent $4.29)`. Also surfaces the account's blocked flag.
+
+### Added — the gateway request id is recorded for billing reconciliation
+
+Every `cost` in the usage journal is a local estimate, so it drifts whenever the local price table does. Reconciling against a server-side ledger needs a key both sides share, and the gateway already returns one on every response. `UsageEntry.requestId` now captures it. It cannot be backfilled, so it is recorded ahead of the ledger API that will consume it.
+
+### Fixed — every paid Solana call failed on hosts that cannot reach the public Solana RPC
+
+Signing an x402 payment on Solana fetches the asset's mint account from a Solana RPC, defaulting to `api.mainnet-beta.solana.com`. A host with blocked egress — or one the public node refuses — therefore failed **every** paid Solana call with a bare `fetch failed`, while the gateway itself answered fine and free models kept working. Indistinguishable from a gateway outage, and the reason [ClawRouter-Hermes#38](https://github.com/BlockRunAI/ClawRouter-Hermes/issues/38) looked like a Solana gateway fault.
+
+`CLAWROUTER_SOLANA_RPC_URL` now applies to payment signing, not just the balance monitor. `registerExactSvmScheme` cannot forward an RPC (it constructs `new ExactSvmScheme(config.signer)` and drops the rest), so the override re-registers `solana:*` and the v1 compat networks directly; `_registerScheme` keys on version+network+scheme, so the later registration wins and everything else the helper sets up survives.
+
+`describeFetchError` also unwraps undici's three-word `fetch failed` into the errno, host and port it hides on `cause`, so the failing endpoint is named in both the response body and the proxy log rather than left to guesswork.
+
+### Fixed — the gateway request id was read under a name two of the three gateways don't use
+
+`blockrunRequestId()` read only `x-blockrun-request-id`. Measured across the three gateways: `api.blockrun.ai` sends that plus `x-request-id` and `request-id`; **`sol.blockrun.ai` sends `x-request-id` only**; `blockrun.ai` sends none at all.
+
+Two consequences, both real. The reconciliation join key added in `f927cd8` was silently always-undefined on **both wallet rails** — it only ever worked on the API-key rail, which is where it was tested. And a failing paid call had no id to report, which is exactly what the #38 reporter hit: a paid 500 with nothing to hand anyone, on either side.
+
+The failure path now carries the id through to the caller — appended to the `All N models failed` log line and returned as an `x-blockrun-request-id` response header, because whoever hits this is usually reading an agent transcript rather than our proxy log.
+
+Two theories ruled out while investigating, recorded so they are not re-tested: the reporter's low SOL balance is not the trigger (a wallet holding **0.0 SOL** settles paid calls fine — the facilitator pays the fee), and their wallet is healthy on-chain (USDC ATA initialized, standard Tokenkeg program).
+
+---
+
+## v0.12.270 — September 5, 2026
+
+### Fixed — the Grok rate sync was docs-only; the code still quoted the old prices
+
+`d9fb986` corrected three Grok rows in the README and stopped there. `src/models.ts` still carried the pre-repricing numbers, and it carried them for **six** SKUs, not three — the README had also been left stale on `gemini-3.6-flash` and both `gpt-5.6-sol` tiers. Diffed against the live gateway catalog:
+
+| Model                     | Was           | Now               |
+| ------------------------- | ------------- | ----------------- |
+| `openai/gpt-5.6-sol`      | $5 / $30      | **$4 / $20**      |
+| `openai/gpt-5.6-sol-pro`  | $5 / $30      | **$4 / $20**      |
+| `google/gemini-3.6-flash` | $1.50 / $7.50 | **$0.75 / $3.75** |
+| `xai/grok-4.3`            | $1.50 / $4.00 | **$1.25 / $2.50** |
+| `xai/grok-4.5`            | $2.50 / $9.00 | **$2.00 / $6.00** |
+| `xai/grok-build-0.1`      | $1.50 / $3.00 | **$1.00 / $2.00** |
+
+Not cosmetic: `inputPrice`/`outputPrice` are published through `GET /v1/models` (which Pi persists into `~/.pi/agent/models.json`, so a wrong number becomes durable downstream), drive per-request cost accounting behind `/stats`, and feed the pre-flight estimate behind balance pre-checks and `maxCostPerRun` — overstated output by up to 50%, so strict mode could refuse a Grok request that was actually affordable.
+
+`src/top-models.json` carries no prices and needed no change. A repo-vs-gateway diff over the whole catalog now reports zero drift across 100 live entries.
+
+### Fixed — API-key mode could still mint a wallet you never asked for
+
+`resolveOrGenerateWalletKey()` creates a private key as a side effect, so every call site has to resolve the BlockRun API key first. Three of the four did. The fourth — the plugin's non-gateway-mode branch of `register()` — called it unconditionally, so a card-paying user installing the OpenClaw plugin got a freshly minted key plus a `NEW WALLET GENERATED — BACK UP YOUR KEY NOW / losing this key = losing your USDC` banner for a wallet that would never be used. That contradicted the documented promise that API-key mode "never generates, reads or signs with a private key". The branch now resolves the key first and returns before touching a wallet, and `src/index.api-key-no-wallet.test.ts` guards every call site so a fifth one cannot be added unguarded.
+
+### Fixed — endpoints the gateway serves returned "All models in fallback chain failed"
+
+Every `/v1/*` path the proxy did not explicitly route fell through to the chat handler, whose attempt loop is `modelsToTry = modelId ? [modelId] : []`. A body with no routable `model` therefore produced an empty chain, issued **no upstream request at all**, and answered `502 All models in fallback chain failed` — blaming the model catalog for what was really an unrouted URL.
+
+Two real endpoints were caught by this in **both wallet and API-key mode**:
+
+- `/v1/messages` — the Anthropic-shaped chat surface, which the README already listed as supported
+- `/v1/audio/speech` — TTS, distinct from the `/v1/audio/generations` music route that _was_ handled
+
+Both now forward verbatim through the existing paid-passthrough, verified live against `api.blockrun.ai` and `blockrun.ai/api`. Anything still unrouted gets an honest `404 unsupported_endpoint` naming what the proxy does serve, instead of a misleading 502.
+
+### Fixed — the API-key docs described a gateway that no longer exists
+
+The 404 hint and the README both said `api.blockrun.ai` "currently carries chat and text completions" and that "image, video, audio and the partner APIs are still wallet-only". Probing the live gateway on 2026-09-05 disproved it: chat, `/v1/messages`, `/v1/models`, image generation, speech, video, Surf, Exa, prediction markets and phone lookup/fraud **all work on an API key**, and so do all <!-- br:models.free -->7<!-- /br:models.free --> free models. The genuine wallet-only exceptions are the routes that bind a lease or a position to a payer address — buying/renewing/releasing phone numbers, and Polymarket trading — and those are now what the hint names.
+
+### Changed — Solana is the stated preference, without stranding Base wallets
+
+New installs have persisted `payment-chain=solana` since v0.12.246, but everything that _described_ the product still led with Base, and `loadPaymentChain()` fell back to `base` for any install with no chain file. That fallback now resolves to **solana** — except when a wallet already exists on disk (or in `BLOCKRUN_WALLET_KEY`), where it stays on **base**, because a pre-v0.12.246 install has its USDC in the Base wallet and flipping it would point every call at a gateway its money is not on. An explicitly recorded choice and `CLAWROUTER_PAYMENT_CHAIN` still win over both. README, docs and skills now name Solana first.
+
+### Changed — skills no longer assume a wallet
+
+Every skill told the agent "payment is deducted from the user's BlockRun wallet" and, on a 402, "tell the user to fund their wallet at blockrun.ai" — advice that sends a card-paying user to a page that cannot fix their error. `imagegen`, `phone`, `surf`, `predexon` and `clawrouter` now describe both rails and tell the agent to read `authMode` from `GET /health` before naming a fix. The `phone` skill also records that wallet-owned number leases are wallet-mode only.
+
+### Changed — README says where to sign up
+
+The card rail is now signposted from the hero, the pay-rails table, the funding list and the support table, with the actual top-up fee (5.5% + $0.30, charged once at purchase, then provider list price with nothing per call).
+
+---
+
+## v0.12.269 — September 4, 2026
+
+### Fixed — one spend ledger for every signing surface, and a `session` cap that still means what the docs say
+
+The proxy, the Polymarket tool and `doctor` each constructed their own `SpendControl`. Amount windows were therefore enforced once per surface, and `saveHistory()` was last-writer-wins on disk: LLM spend through the proxy did not count against a Polymarket order, and either could overwrite the other's history. `getSharedSpendControl()` is now the single default; `startProxy`, `buildPolymarketTool`, `createDoctorX402Client` and `/policy`'s `liveControl` all resolve to it. Injection is unchanged — every surface still accepts an explicit `spendControl`.
+
+The ledger lives on `process`, not in a module variable, for the same reason the startup flags do: a global install and an npm-projects install can both be resolved in one gateway, and two module copies each holding their own singleton would enforce every window twice over.
+
+**One trap the shared ledger opened, closed in the same release.** `sessionSpent` is instance state that is never persisted, so `session` used to reset by accident — every `startProxy()` built a fresh `SpendControl`. A ledger that outlives an in-process restart quietly redefines `session` as "since the gateway booted", and leaves it asymmetric: a gateway restart still reset it, an in-process restart no longer did. `docs/configuration.md` and the `/policy` help both promise "session resets on restart", and `supersedeEmptyConfigStartup` puts ordinary boots through two starts, so this was not a corner case. The restart path now calls `resetSession()` on purpose. History and the rolling hourly/daily windows still survive, which is the point of sharing the ledger.
+
+Also in this area:
+
+- A torn or unreadable `spending.json` no longer gets **overwritten with empty limits** by a history save. `load()` throws `UnreadableSpendPolicyError` instead of returning null, and both writers leave the file alone. A reload keeps enforcing the limits already in effect rather than widening what the agent may pay because a read failed.
+- `buildPolymarketTool()` takes no deps at the registration site. It was handed `getSharedSpendControl()`, which is exactly what the tool already falls back to — so the argument bought nothing and cost a synchronous read of `spending.json` on every plugin registration, including the installs that never place a bet.
+
+### Fixed — `onPayment` actually fires
+
+`ProxyOptions.onPayment` was public, documented, and invoked nowhere. It now fires at the layer that owns both paid paths — the normal 402 → signed retry, and the cached pre-auth → paid first request — gated on the v2 `PAYMENT-RESPONSE` or v1 `X-PAYMENT-RESPONSE` settlement header, so a rejected 402 does not fire it. An observer that throws is contained after settlement: its failure must not turn a paid response into a retryable request and risk a second charge.
+
+The API-key rail does not notify, deliberately: it is billed server-side against account credit, so there is no per-request settlement for an observer to report.
+
+### Added — the README says what BlockRun is
+
+The README explained ClawRouter thoroughly and mentioned BlockRun exactly once, in passing, as the thing that issues API keys. **BlockRun lets agents pay for the outcome — every LLM, tool and data source, best value per dollar.** That definition now leads, before "Why ClawRouter exists", with the surface behind each claim and a `What is BlockRun?` FAQ entry. Every figure is a brand-numbers marker, including three new to the file (`models.video`, `models.speech`, `chains.rpc`).
+
+### Fixed — a `node_modules` symlink was committed to the repo
+
+v0.12.268's follow-up merge carried `node_modules` into git as a **symlink to an absolute path on one machine**. Pulling main dropped that link into your working tree, where it shadows the real install and breaks `npm ci`, `tsup` and every `.bin/*` lookup with "too many levels of symbolic links". Untracked here, with `.gitignore` now listing both `node_modules/` and `node_modules` — the trailing slash matches a directory and only a directory, which is exactly how a symlink of that name got past it.
+
+If you pulled `main` between v0.12.268 and this release, run `rm -f node_modules && npm ci` once. npm package installs were never affected: `files` in `package.json` is an allowlist and never included it.
+
+Thanks to @twzrd-sol for the shared spend ledger (#322 → #331) and the `onPayment` fix (#321, #325 → #330). Both branches were rebased onto the v0.12.268 API-key rail and landed with their authorship preserved.
+
+---
+
+## v0.12.268 — September 3, 2026
+
+### Added — API keys, so a person can pay with a card instead of a wallet
+
+BlockRun now runs a customer portal at **user.blockrun.ai** and an OpenAI-compatible gateway at **api.blockrun.ai**: sign in, top up with a credit card, mint a `brk_live_…` key. ClawRouter speaks that rail now, alongside x402.
+
+Wallets remain the default and the reason ClawRouter exists — an agent that can sign a transaction can pay for itself with no account anywhere. But that is a bad answer for a person who just wants to use the router, and "get USDC onto Base or Solana first" was the whole onboarding for them. Both rails now work, and they are one command apart:
+
+```bash
+clawrouter login brk_live_...   # bill account credit via api.blockrun.ai
+clawrouter logout               # back to signing x402 payments from the wallet
+```
+
+Or `BLOCKRUN_API_KEY=brk_live_…` for CI and containers, or the plugin's new `apiKey` config field. Resolution order is env → `~/.blockrun/.api-key` (shared with other BlockRun products) → `~/.openclaw/blockrun/api-key`.
+
+**A key wins over a wallet whenever both are present.** A machine holding a legacy wallet and a key the user just added means "bill my account", not "keep spending my USDC" — and nothing is deleted, so `clawrouter logout` reverses it.
+
+What changes inside the proxy is narrower than it sounds. In API-key mode `startProxy` builds no x402 client, registers no EVM or Solana signer and installs no pre-sign spend hook — there is nothing to sign — and the upstream fetch attaches a bearer token instead of settling a 402. Everything downstream of that is untouched: the same model ids, the same 15-dimension classifier, the same fallback chains, `/exclude`, `maxCostPerRun`, the response cache and the OpenAI-compatible surface.
+
+Three things were deliberate rather than obvious:
+
+- **The bearer token REPLACES the client's `authorization` header, it does not default to it.** The proxy forwards request headers verbatim, and OpenClaw and the OpenAI SDK both send a placeholder key. Setting rather than defaulting is the difference between working and 401-ing every call.
+- **No wallet is generated in API-key mode, by any path.** `resolveOrGenerateWalletKey()` mints a private key as a side effect, so both the CLI and the plugin resolve the API key _before_ touching it — and `clawrouter doctor` does too. A customer paying by card must never find a key they did not ask for and a "back this up now" banner they cannot act on.
+- **There is no local balance gate, on purpose.** api.blockrun.ai publishes no key-readable balance and the account's books live server-side, so ClawRouter does not guess: it makes the call, and a `402 insufficient_quota` naming the top-up page is the answer when credit runs out. Guessing zero would have silently downgraded a paying customer to the free tier, which is what the wallet-mode fallback does when a wallet is empty.
+
+`/health` reports `authMode` with the key masked and no payment chain, and two ClawRouters on one port now refuse to reuse each other across auth modes — the same rule that already applied across chains, for the same reason: they bill different accounts.
+
+api.blockrun.ai currently carries `/v1/chat/completions`, `/v1/messages`, `GET /v1/models` and `GET /v1/images/models`. Media and partner endpoints stay wallet-only for now; ClawRouter passes every path through and rewrites the gateway's `Unsupported endpoint` 404 into an explanation, so they light up on this rail the day BlockRun publishes them, with no ClawRouter release needed. 401 and 402 get the same treatment — the portal URL that fixes them, appended to the gateway's own message, with the status and error `code` an SDK branches on left untouched.
+
+---
+
+## v0.12.267 — September 2, 2026
+
+### Fixed — a lost response on the pre-auth path could sign a second payment
+
+`payment-preauth.ts` reuses a cached authorization to skip the 402 round trip. The `try` around that fast path wrapped not only the signing but the send that already carried the signed payment, and its `catch` fell through to the normal flow — which requests a fresh challenge and signs a **new** authorization.
+
+So when the pre-auth send failed _after_ the gateway had received and settled the payment — a connection reset, a socket hang-up, a TLS error, an upstream that closes after settling — the client could not tell that from "the request never arrived". It took the second reading and paid again. One user request, two USDC charges.
+
+Nothing else caught it. The proxy's 30-second response dedup keys on the request body and catches a client retrying a whole request, but this double payment happens inside a single `payFetch` call, so no second proxy request ever exists. Replay protection cannot help either: the second charge is a genuinely fresh authorization with an unused nonce, so every guard correctly passes it.
+
+The ambiguity is now resolved the safe way. Once a request carrying a signed payment has left the process, a failure surfaces to the caller instead of silently authorizing another one. A 402 still falls through, because a 402 is an answer — the gateway declined the payment, so nothing settled and re-signing is safe — and a signing failure before anything is sent still falls through too, since no payment can have been made. The cost is that a transient network error on the pre-auth send now fails the request rather than retrying it invisibly, which is the right trade when the alternative is charging twice.
+
+The existing tests could not have caught this: the harness only ever made a paid request _return_ a 402, never _reject_, so the branch was exercised for signing failures only — exactly what its comment described. Both cases are covered now.
+
+Reported by @aurumflux20, with the analysis of why the dedup, abort and replay guards each miss it (#317).
+
+---
+
+## v0.12.266 — September 2, 2026
+
+### Added — ClawRouter Desktop, a macOS control plane for local coding agents
+
+A macOS app under `apps/desktop` that connects OpenClaw, Codex, Hermes, DeepSeek Harness and Pi to a local ClawRouter in one click: it installs and supervises the proxy, writes each agent's provider config, and restores the original on disconnect. It also shows Base and Solana USDC balances, switches the payment chain, and opens a wallet-bound Coinbase Onramp.
+
+The app ships outside the npm package — `@blockrun/clawrouter` is unchanged in size and contents — and the packaged build stages a frozen, version-pinned runtime so the UI and the router cannot drift apart. It is an unsigned developer preview; Developer ID signing and notarization are still release-pipeline work.
+
+The security surface was reviewed rather than assumed: `contextIsolation` on, `nodeIntegration` off, `sandbox` on, `will-navigate` and `setWindowOpenHandler` both guarded, a CSP in the renderer, every IPC handler behind a trusted-renderer check plus a parser, no shell in process spawning, config writes at `0600` with a symlink-cycle guard, and no private key or mnemonic ever reaching the renderer. Agent configuration additionally requires an authenticated proxy identity and proof that the process holding the port is the one Desktop spawned.
+
+### Changed — `/v1/models` now serves the real catalog metadata
+
+`GET /v1/models` returned four fields (`id`, `object`, `created`, `owned_by`). It now also carries `name`, `context_window`, `max_output`, `input_price`, `output_price`, `reasoning`, `vision`, `agentic` and `tool_calling`, resolved through the alias map to the canonical registry entry.
+
+This replaced a 2,441-line catalog that had been bundled into the Desktop app. That copy had drifted to 197 field disagreements across 110 ids — 16 of them understating price, `claude-opus-5` and the whole `gpt-5.6` family missing outright, and six of the seven free models absent. Pi persists these values into `~/.pi/agent/models.json`, where a wrong `vision` flag makes an image-capable model text-only, so the drift was durable rather than cosmetic. Deleting the bundle removes the class of bug instead of refreshing one instance of it.
+
+### Fixed — the plugin-id migration is back on the gateway-start path
+
+v0.12.265 migrated the renamed plugin id on every gateway start. That had moved to `clawrouter setup`/`update`/`reinstall` only, which left `npm update -g` followed by a gateway restart unmigrated — the same silent non-load v0.12.265 shipped to fix.
+
+It runs from the config-injection hook again, where the write is already behind the gateway-mode guard and so cannot trip OpenClaw's install-time `baseHash` rollback. It fires only when BlockRun-owned fields prove the legacy entry is ours, so OpenClaw's own bundled `clawrouter` entry is never touched on the strength of its id alone.
+
+### Fixed — the install scripts no longer widen `openclaw.json` to `0644`
+
+The `atomicWrite` helper embedded in `scripts/reinstall.sh` and `scripts/update.sh` wrote its temp file at the default mode and let `rename` carry it onto the target. Probed on macOS: `600` before, `644` after. That file can hold a wallet private key — `openclaw.plugin.json` declares `walletKey` as sensitive, and these scripts move it between plugin entries. Every write now passes `{ mode: 0o600 }` and re-`chmod`s after the rename.
+
+### Added — `clawrouter policy` and `/policy`
+
+`SpendControl`'s limits and counterparty lists were library-only: configuring them meant hand-editing `spending.json`. One implementation now backs both a CLI subcommand and a plugin command, with all validation ahead of any write, so a rejected argument leaves the file byte-identical. `/policy` reaches the live signer while a proxy is running rather than only the copy on disk, and limit writes are compare-and-swap, so a stale writer cannot clobber a concurrent update.
+
+Emptying an allow-list is refused rather than silently performed — an emptied `allowedPayees` stops meaning "only these" and starts meaning "everyone" — and every write that leaves a key unset now says what becomes permitted as a result.
+
+### Housekeeping
+
+- Desktop balance reads are cached with stale-on-error fallback instead of hitting shared public RPC endpoints on every 15-second refresh.
+- Runtime installs are version-pinned and run with `--ignore-scripts`; CLI preflight `openclaw` calls are bounded by a timeout.
+- Read-only wallet commands no longer create a wallet as a side effect, and rollback reporting distinguishes an actual rollback from a preflight failure.
+
+Thanks to @KillerQueen-Z for the Desktop control plane and the plugin-config migration, which corrected two real bugs in the v0.12.265 migration — it had deleted `plugins.entries.clawrouter`, a key that belongs to OpenClaw's bundled plugin after the rename, and renamed `plugins.installs.clawrouter` into a key upstream wants removed (#313). Thanks to @twzrd-sol for the policy surface (#303, closes #301).
+
+---
+
+## v0.12.265 — September 2, 2026
+
+### Fixed — the plugin silently never loaded on OpenClaw 2026.7.1 and newer
+
+OpenClaw bundles its own plugin under the id `clawrouter` since the 2026.7.1 line. This plugin declared the same id, so OpenClaw resolved the duplicate in favour of the bundled one:
+
+```text
+duplicate plugin id detected; global plugin will be overridden by bundled plugin
+pluginId: clawrouter
+```
+
+BlockRun's plugin never loaded. `clawrouter setup` reported success, `openclaw plugins list` showed only the bundled plugin, and the local proxy on `127.0.0.1:8402` was never started. They are separate products: OpenClaw's uses `clawrouter/*`, `CLAWROUTER_API_KEY` and a hosted endpoint; this one uses `blockrun/*`, a local proxy and a self-custodial wallet.
+
+Confirmed against the published artifact, not the report alone — `openclaw@2026.8.2` vendors `dist/extensions/clawrouter/package.json` (`@openclaw/clawrouter`) declaring `id: "clawrouter"`. Worth recording the trap: `npm view @openclaw/clawrouter` 404s and it is not a dependency of `openclaw`, so a dependency check wrongly says there is no collision. Only unpacking the tarball shows it.
+
+The plugin id is now `blockrun-clawrouter`, display name **BlockRun ClawRouter**. The npm package (`@blockrun/clawrouter`), the CLI command (`clawrouter`) and the install directory are deliberately unchanged — none of them collide, and changing them would strand every existing install.
+
+**Existing installs are migrated on the next gateway start.** A pre-rename config carries the old id in up to three places, and all three are handled:
+
+- `plugins.entries` — moved to the new key, preserving the enabled/disabled choice. Left alone it would have explicitly enabled _OpenClaw's_ router while this plugin lost its entry.
+- `plugins.allow` — the new id is **added**. This list is an exclusive allowlist ("the installed plugin id must be in that list before the plugin can load"), so a user who had allow-listed the old id would otherwise have had this plugin blocked outright. The old id is left in place, since it may now also be permitting OpenClaw's bundled plugin.
+- `plugins.deny` — mirrored, so an explicit decision to keep this plugin off is honoured rather than silently reversed.
+- `plugins.installs` — renamed outright; install provenance is unambiguously ours.
+
+The write goes through the existing gateway-mode guard, so it cannot trip the install-time `baseHash` rollback. Probed against real OpenClaw 2026.5.2: the renamed config loads (exit 0, `blockrun` provider still effective).
+
+Reported by @KillerQueen-Z (#305).
+
+### Fixed — a synced brand script would have made the package uninstallable
+
+`scripts/sync-brand-numbers.mjs`, vendored from blockrun, now shells out to `git ls-files` to honour its own "only git-tracked files are rewritten" contract. That pulls in `node:child_process`, and everything under `scripts/` ships in the npm tarball — which OpenClaw's plugin scanner rejects, the same failure that made v0.12.222 uninstallable.
+
+`scripts/smoke-dist.mjs` caught it and refused the build before publish. The script is now excluded from the tarball via `package.json` `files`, as `smoke-dist.mjs` already was. It is a CI tool; npm consumers never run it (#306).
+
+---
+
+## v0.12.264 — September 2, 2026
+
+### Fixed — five signing paths spent the user's capital without consulting the spend policy
+
+`registerSpendPolicyHook` had exactly one call site, on the proxy's x402 client. Five other places signed with the same wallet and never consulted it, so a strict `allowedPayees` / `allowedNetworks` list refused every payee on the proxy while governing nothing here: `doctor`'s paid probe, and the Polymarket fund, order, withdraw and redeem paths.
+
+All five now run the same check before the signer, throwing the proxy's `SpendPolicyError` if the counterparty or amount is refused. The withdraw gate is the notable one: policy sees the **destination** leg (the agent-chosen `to_address`, Base, USDC) rather than the one-time bridge address, because the bridge cannot be allowlisted and `to_address` is what an operator's payee list has to govern.
+
+Amounts are canonicalised to micro-USDC and fail closed: `NaN`, `Infinity`, negatives and values past `Number.MAX_SAFE_INTEGER` all fail the `/^\d+$/` check and are refused whenever any amount cap is configured.
+
+The one-time approval batch in `setup.ts` stays deliberately ungated, and now says so in the module header. Gating it would be actively harmful — the spenders are Polymarket's own exchange contracts, so an operator running a tight `allowedPayees` list naming only their payout addresses would have setup refused. It is bounded already: targets come from `readApprovals()`, never agent input, and it is confirm-gated behind an explicit preview.
+
+Thanks to @twzrd-sol (#304).
+
+### Fixed — non-positive and non-numeric `amount_usd` reached the Polymarket signer
+
+`executeTrade()`'s market-buy path and `withdrawFunds()` accepted any `amount_usd`. A negative became the order's notional, and since `reserveBet()` is `ledger.totalUsd += notional`, a negative _lowered_ the running total — leaving `ledger.totalUsd + notional > sessionCap` satisfiable indefinitely and silently defeating `POLYMARKET_MAX_SESSION_USD` for every later order. On withdraw, `amountRaw > balanceRaw` is false for zero or negative, so it sailed past the balance check into the bridge transfer.
+
+Both now reject with `Number.isFinite(x) && x > 0`, not merely `x <= 0`. Nothing validates these fields at runtime — `tool.ts` hands them over as `params.amount_usd as number | undefined`, a compile-time cast over `Record<string, unknown>` — so `NaN` and strings arrive intact and both `NaN <= 0` and `"abc" <= 0` are false. That case was worse than the negative one: a `NaN` notional poisons `ledger.totalUsd` permanently, because `totalUsd + NaN > cap` stays false forever.
+
+Limit orders are covered too. Their notional is `price * size`, and the existing minimum-size check could not catch a negative: `book.min_order_size` is often absent, so `parseFloat(undefined || "0")` is `0` and the `minSize > 0` term short-circuits the guard. The new check sits in the cross-field block, before any network call.
+
+Thanks to @erhnysr (#294).
+
+### Fixed — a stray code-block indent turned CI red for every open PR
+
+The v0.12.263 CHANGELOG used aligned trailing comments inside a fenced block, which Prettier collapses, so `prettier --check .` failed on `main` and every PR branched from it inherited a red `Lint & Typecheck` (#300).
+
+---
+
+## v0.12.263 — September 1, 2026
+
+### Fixed — a live-clock race let in-flight reservations vanish from the spend caps
+
+`SpendControl.getSpendingInWindow()` decided whether in-flight reservations counted toward the hourly/daily spend by reading the clock a **second** time and comparing it against a window bound the caller had already built from a **first** read:
+
+```ts
+const now = this.now(); // read #1
+const hourlySpent = this.getSpendingInWindow(now - HOUR_MS, now);
+// ...inside:
+return recorded + (to >= this.now() ? this.pendingTotal() : 0); // read #2
+```
+
+On the production clock (`() => Date.now()`), a millisecond ticking between the two reads makes `this.now() > to`, the guard goes false, and the whole pending total is silently dropped from the figure the cap is checked against. Reservations are the concurrency-safety mechanism — the x402 pre-sign hook does check-then-`reserve()` synchronously precisely so two concurrent payments cannot both clear the same remaining budget. With the pending total missing, they can: a $5 hold disappears and a second $5 payment sees the full $5 of an already-exhausted $5 cap.
+
+The caller's single `now` is threaded through instead. Every existing test injected a frozen clock, so the two reads always matched and the sub-millisecond window went uncaught; there is now a live-clock test.
+
+### Fixed — `?days=` on /stats silently zeroed or mislabeled the report
+
+`GET /stats?days=` ran user input through `parseInt(...)` then `Math.min(days, 30)`, and both steps pass bad input straight through JS's numeric coercion. `?days=abc` became `NaN`, survived `Math.min`, and turned `getStats`' `slice(0, NaN)` into `slice(0, 0)` — the endpoint reported **zero usage** instead of falling back to the default window. `?days=-1` survived `Math.min(-1, 30)`, and `slice(0, -1)` **dropped the newest day** while the response labelled itself "last -1 days".
+
+A single `resolveStatsDays()` guard (mirroring the existing `resolveMaxTokens` precedent) covers non-numeric, `NaN`, zero and negative alike. Local, read-only diagnostic endpoint — wrong numbers, not a security boundary.
+
+### Fixed — `logs --days -1` dropped the newest day instead of showing more history
+
+The sibling of the above on the path that does **not** go over HTTP. `clawrouter logs --days <n>` parses with `parseInt(raw, 10) || 1`; `NaN` is falsy so a typo fell back to 1, but a **negative is truthy** and reached `logFiles.slice(0, days)`. Log files are newest-first and a negative second argument to `slice` trims from the end, so `--days -1` cut the **newest** day — the opposite of asking for more history — and the header rendered "last -1 days".
+
+Guarded at the sink in `formatRecentLogs` rather than at the CLI parse site, so every caller is covered rather than the one that happens to exist today. Worth recording: `clawrouter stats --days` sends `/stats?days=` over HTTP and was therefore already covered by the `resolveStatsDays` guard above; `logs` reads the files locally and was the one path left uncovered.
+
+- Thanks to @erhnysr for the spend-control clock race (#286) and the `/stats` window validation (#285).
+
+---
+
+## v0.12.262 — August 31, 2026
+
+### Added — four live catalog models that were never in the picker
+
+`google/gemini-3.6-flash`, `google/gemini-3.5-flash-lite`, `tencent/hy3` and `xiaomi/mimo-v2.5-pro` have had entries in `src/models.ts` and have been visible in the live BlockRun catalog, but none of them was ever added to `src/top-models.json`. Everything that curates against that file — the picker, and every downstream consumer of `TOP_MODELS` — has been blind to all four.
+
+Placement follows the existing grouping, with no reordering of current entries: the two Gemini flash tiers beside their siblings, `mimo-v2.5-pro` after `mimo-v2.5`, `hy3` after the Qwen pair. 51 → 55 entries.
+
+Surfaced from downstream. ClawRouter-Hermes curates its Telegram/gateway picker against this file and had to park all four in an exemption set to get its own mirror guard green ([Hermes #32](https://github.com/BlockRunAI/ClawRouter-Hermes/pull/32)); that exemption is now removed, and the two catalogs are identical entry for entry and in order.
+
+---
+
+## v0.12.261 — August 31, 2026
+
+### Fixed — image requests were skipping the cheapest model that can handle them
+
+`google/gemini-2.5-flash-lite` reads images. blockrun's catalog does not tag it, so ClawRouter did not either, and `filterByVision()` excluded the **cheapest paid model in the catalog** ($0.10/$0.40) from every request carrying an `image_url`. Image turns escalated past it to something dearer. It is also router-core's eco SIMPLE cheapest-paid rung, so the eco profile felt this most.
+
+Verified before flagging, not taken on report: 3 of 3 proxy probes with a 64×64 solid-red PNG answered "Red", each served as itself.
+
+The four other models flagged as under-tagged upstream — `claude-sonnet-4.6`, `claude-opus-4.5`, `claude-haiku-4.5`, `gemini-2.5-flash` — already carried `vision: true` here; ClawRouter has been ahead of blockrun's catalog on those since v0.12.233.
+
+### Confirmed — the free tier still has no working vision
+
+Re-probed both free models on Base with the same fixture: `llama-3.2-11b-vision` 0 of 3 ("I'm unable to see the image"), `nemotron-3-nano-omni` 0 of 3 ("white" for red twice). Base still strips image parts on the NVIDIA paths. The flags stay off, as shipped in v0.12.259.
+
+Two independent corrections arrived from the Solana gateway's owner that sharpen the record: `nemotron-3-nano-omni` **is not a vision model and never was** — the published sheets tagging it were wrong — and the free-tier image failures trace to a gateway-side unconditional `image_url` strip, not a model limitation. Neither changes what ClawRouter ships; both mean the v0.12.259 decision was right for a better reason than the one recorded.
+
+---
+
+## v0.12.260 — August 31, 2026
+
+### Fixed — the legacy auth placeholder bricked dispatch on OpenClaw 2026.8.1
+
+`injectAuthProfile()` wrote a placeholder `agent/auth-profiles.json` into every agent directory, including the shared auth-owner (`main`). On OpenClaw 2026.8.1 the SQLite auth store is authoritative, and a leftover legacy JSON beside an **empty** store fails auth migration closed — which takes message dispatch down for the whole agent fleet:
+
+```
+AuthProfileMigrationRequiredError: Auth profile store
+~/.openclaw/agents/main/agent/openclaw-agent.sqlite requires legacy credential migration
+```
+
+The write is now SQLite-aware. Where `openclaw-agent.sqlite` exists the legacy JSON is never written and our own previously-injected placeholder is removed; the shared `main` directory is never written into at all; only installs with no store keep the original bootstrap. Removal is deliberately narrow — a file is deleted only when it contains **nothing but** the exact `blockrun:default` placeholder, so a real credential file is never touched.
+
+**The rationale this replaces is now retired.** `injectAuthProfile` carried the comment "OpenClaw's agent system looks for auth credentials even if provider has `auth: []`" since it was written. Measured on 2026.5.2 before merging, via `openclaw agent --agent main --json` in three states — placeholder present, `blockrun:default` removed, and `auth-profiles.json` deleted outright — all three dispatched successfully with real token usage and zero errors. The placeholder was not load-bearing. What carries it is the `apiKey` `injectModelsConfig` writes into `openclaw.json` plus the provider's `auth: []` declaration.
+
+One trap worth recording for anyone auditing this path: the run reports `"authMode": "auth-profile"` in all three states, **including with the file deleted**. That field describes the configured mode, not that a profile was found — it is not evidence a profile is in use.
+
+New `src/auth.injection.test.ts` (5 tests) pins the matrix: legacy bootstrap kept with no store, `main` never written, no write beside an existing store, placeholder removed beside a store, and real credential files never removed. 797 tests pass.
+
+- Thanks to @0xCheetah1 for the fix, the 2026.8.1 reproduction, and the before/after `openclaw doctor --lint --all` verification (#288).
+
+---
+
+## v0.12.259 — August 31, 2026
+
+Corrections to v0.12.258 plus the same-night paid-catalog refresh, both found by checking claims instead of trusting catalogs. Neither would have surfaced as an error — both fail with HTTP 200.
+
+### Fixed — the new free tier 400'd on Solana, which is the default chain for new installs
+
+v0.12.258 rebuilt the free tier from blockrun's Base catalog. `sol.blockrun.ai` does not carry it: six of the seven return **HTTP 400 "Unknown model"** there, and only `nemotron-3-nano-omni` exists. Since v0.12.246 new installs default to Solana, so on a fresh install `/model free` and router-core's eco SIMPLE primary both pointed at a model their own gateway had never heard of.
+
+The gateways' never-retire redirect rule does not help here — it protects ids a gateway once shipped, and these were never shipped on sol, so they hard-400 rather than falling back.
+
+`loadGatewayCatalog()` now reads the active gateway's `/v1/models` once at startup and `pickFreeModel()` skips rungs that chain does not serve, so a Solana user degrades to the models sol actually has instead of collecting 400s. It is deliberately **advisory only**: it filters, it never chooses. The cascade head stays a committed literal because `free`, `FREE_MODELS[0]`, `FREE_MODEL` and router-core's `ecoTiers.SIMPLE.primary` must agree and `free-model-liveness.test.ts` checks that at build time — a runtime-derived head would make the invariant unverifiable. A failed or empty catalog read leaves every rung eligible: a catalog we could not read must never be able to switch the free tier off.
+
+The blockrun-sol owner is adding the four load-bearing ids to sol's in-flight rebuild, served as themselves rather than redirected, so the two chains converge.
+
+### Fixed — no free model claims `vision` any more; two of them were lying
+
+v0.12.258 set `vision: true` on `nemotron-3-nano-omni` and `llama-3.2-11b-vision`, mirroring both gateways' `categories` lists. Neither holds up against a 64×64 solid-red PNG:
+
+| model                           | result                                                                                                                                                         |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `nemotron-3-nano-omni` (Base)   | correct **1 of 4** — the others "I'm not able to view the image" or leaked reasoning                                                                           |
+| `nemotron-3-nano-omni` (Solana) | answered **"white"** for red, twice; one response's own `model` field read `nemotron-3-super-120b (fallback: …nano-omni)` — a silent fall back to a text model |
+| `llama-3.2-11b-vision` (Base)   | "I'm unable to see the image" **3 of 3**, while a plain-text control on the same id answered fine                                                              |
+
+Every one of those is an HTTP 200. The image is dropped and a confident wrong answer comes back with nothing for a caller to branch on. `vision` is not a description — it is what `filterByVision()` uses to _aim_ image turns at a model — so the flag was actively routing real traffic into that. It is now off on every free model (including the dead-but-pinnable `nemotron-nano-12b-v2-vl`), and image requests go to one of the 45 paid vision models. `src/models.test.ts` pins the absence.
+
+Worth recording how this was nearly missed: the **first** Base probe returned "Red" and I took it as verification. It took four samples to see that was luck. A catalog's capability list is a claim, not a measurement — and neither is a single sample. Independently confirmed on the Solana side by the blockrun-sol owner, who hit the same failure with the same fixture size.
+
+### Changed — paid catalog refresh + three real price moves (blockrun #449)
+
+Landed the same night, verified against `origin/main` rather than taken on report:
+
+- **`deepseek/deepseek-v4-pro` $0.435/$0.87 → $1.32/$3.96.** A 3x rise on a model sitting in four router chains (eco COMPLEX + REASONING, premium and agentic COMPLEX). Until now every one of those calls was accumulating a third of its real cost into `maxCostPerRun`.
+- `openai/gpt-5.6-terra-pro` $1/$6 → $2/$12 and `gpt-5.6-luna-pro` $0.10/$0.60 → $0.20/$1.20 — both were unroutable at the old numbers, not merely mispriced.
+- Three new models, each probe-verified upstream with a real completion **and** a real image: `qwen/qwen3.8-flash` ($0.15/$0.47, 1M), `deepseek/deepseek-v4-flash-vision-exp` ($0.44/$1.32 — DeepSeek's peak rate on purpose, since off-peak is half and listing that would sell under cost on weekday mornings), and `xiaomi/mimo-v2.5` ($0.14/$0.28).
+- Published counts: **76 chat models** (was 73) and the `auto` savings figure **88% → 84%** — that is a real move, not a re-estimate: `auto` is costed on DeepSeek V4 Pro, which just tripled. `eco` stays 98%.
+
+### Fixed — `mimo-v2.5` was billing 3x for the wrong model
+
+`"mimo-v2.5"` had long been an alias for `xiaomi/mimo-v2.5-pro`, which was harmless while nothing owned that name. blockrun then listed an actual `xiaomi/mimo-v2.5` — a **different**, natively-multimodal SKU at $0.14/$0.28 against Pro's $0.435/$0.87 and text-only. The alias would have sent anyone naming the cheaper multimodal model to the pricier text-only one. Retargeted. (`mimo`, `mimo-v2.5-pro` and `xiaomi` still resolve to Pro.)
+
+This is the near-miss worth remembering: adding a model can make an _existing_ alias wrong. Check the alias map against new ids, not just for collisions.
+
+### Fixed — a 200 with an empty `choices` array passed through as a success
+
+`detectDegradedSuccessResponse()` already caught a blank assistant turn, an upstream error delivered as HTTP 200, and placeholder/loop output. It did not catch `choices: []` — no answer at all — which went to the caller as a successful response. That is the shape a relay produces when it reports upstream congestion in the envelope rather than the body; blockrun measured it at roughly 3 in 15 calls on `nemotron-3-ultra-550b`, which is cascade rung 6. It now fails over like any other 5xx. Responses with no `choices` key at all (images, audio, embeddings) are untouched.
+
+### Fixed — the startup catalog read broke four test mocks
+
+`loadGatewayCatalog()` issues a bodyless GET to `${apiBase}/v1/models`, and four mock upstreams in the test suite called `JSON.parse` on every request body unconditionally. That throws "Unexpected end of JSON input" inside whichever test happened to be running when the read landed — it passed locally and failed CI, because the race resolves differently under load. The mocks now answer the catalog read and return instead of recording a phantom entry in the assertions. Kept the fetch unconditional: reconciling the free tier against whatever gateway the proxy points at is meaningful for any BlockRun-compatible endpoint, not just the two hosted ones.
+
+### Verified, not changed
+
+`cohere/north-mini-code` was reported by two other sessions as returning empty content when the token budget is tight — the theory being it spends the whole allowance reasoning and emits nothing. It does not reproduce on Base: 12 of 12 samples across `max_tokens` 200/400/1200/2000 returned non-empty content with `finish_reason: "stop"`, plus 5 of 5 clean streaming runs. Their measurements were on the Solana gateway's provider pool. Left at cascade rung 4; the empty-`choices` fix above and the existing empty-turn detection both fail it over if it does starve in the field.
+
+`nemotron-3-ultra-550b` stays at rung 6 — low on purpose, and now covered by the empty-`choices` guard.
+
+---
+
+## v0.12.258 — August 31, 2026
+
+### Fixed — the free tier was dead and nothing said so
+
+NVIDIA retired **four of the five visible free models in one sweep** (blockrun #448, 2026-08-30). `step-3.7-flash`, `nemotron-nano-9b-v2` and `nemotron-nano-12b-v2-vl` published HTTP 410 Gone; `mistral-nemotron` went the quiet way — still listed upstream, >150s and zero bytes. Only `nemotron-3-nano-omni` survived. `step-3.7-flash` was ClawRouter's `free` alias, `FREE_MODEL`, the head of the `FREE_MODELS` cascade **and** router-core's `ecoTiers.SIMPLE` primary.
+
+Nothing looked broken, and that is the point: BlockRun server-redirects retired free ids, so callers kept getting answers — from a different model. That is worse than a hard failure. It **silently defeats `/exclude`** (you exclude the id you can see, the router hands the request to it anyway, and the gateway answers from the redirect target), and it misreports the envelope — `free` advertised 131K while the model actually serving has 1M.
+
+The tier is rebuilt to blockrun's seven, each verified with a real completion through a locally-run proxy (non-streaming and streaming, `model` echoed back) rather than a catalog lookup:
+
+| Cascade order | Model                                         | Context | Why it sits there                                                                                                            |
+| ------------- | --------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| 1             | `free/nemotron-3.5-lightning`                 | 1M      | the free default — blockrun's own redirect target for the old head, so the proxy and the gateway never name different models |
+| 2             | `free/nemotron-3-nano-30b`                    | 131K    | fastest in the tier (~121 tok/s)                                                                                             |
+| 3             | `free/laguna-xs-2.1`                          | 131K    | coding, ~161 tok/s — on our own NVIDIA key                                                                                   |
+| 4             | `free/north-mini-code`                        | 256K    | coding, 607ms median — OpenRouter's $0 pool                                                                                  |
+| 5             | `free/nemotron-3-nano-omni-30b-a3b-reasoning` | 256K    | the only vision-capable free model                                                                                           |
+| 6             | `free/nemotron-3-ultra-550b`                  | 1M      | largest free model listed, but slow and 3/15 calls return an upstream error object                                           |
+| 7             | `free/llama-3.2-11b-vision`                   | 128K    | the only free Llama NVIDIA still serves; slowest, so last                                                                    |
+
+Rungs 3 and 4 are adjacent on purpose: they run on **different capacity pools**, so one provider's outage cannot take both coding rungs.
+
+**The free tier is no longer NVIDIA-only.** Two of the seven are hosted under their own maker's namespace upstream, which the blanket `free/X → nvidia/X` rewrite could not express — `free/north-mini-code` would have become `nvidia/north-mini-code` and 400'd on every request, quietly, because a failing rung just falls through to the next one. `toUpstreamModelId()` now consults `FREE_UPSTREAM_OVERRIDES` first, and `src/proxy.free-upstream-ids.test.ts` pins both entries.
+
+The four dead ids keep their catalog entries so pins stay routable (the gateway redirects them); they are gone from the picker, the cascade and every generic alias. `llama-free` points at a real free Llama again. `mistral-free` no longer advertises a Mistral — there is no free one left anywhere, which is what blockrun's own `/free-mistral` page now says.
+
+### Fixed — an uncatalogued routing target was bypassing `maxCostPerRun`
+
+router-core V3.5 made `zai/glm-5.3-flash` the eco **MEDIUM and COMPLEX primary**, but neither it nor `zai/glm-5.3` existed in `BLOCKRUN_MODELS`. `estimateAmount()` returns `undefined` for an id we do not carry, and both consumers fail open — the budget filter keeps the model (`if (!est) return true`) and the success path skips accounting (`if (costEst)`). So every eco user with a cost cap set had **no cap on their primary model, and its spend never entered the session total**. Same shape as the v0.12.232 `max_completion_tokens` bug: a telemetry-looking gap that is actually a money bug.
+
+Both models are added with blockrun's pricing, and `src/router/chain-models-in-catalog.test.ts` now fails the build if any model router-core can pick is one this repo cannot price.
+
+### Fixed — 36 stale context/output envelopes
+
+Prices were already correct; the envelopes had drifted across three blockrun releases. The ones that were truncating real requests: `claude-sonnet-4.6` 200K → **1M** context (and 64K → 128K output), `gpt-5.4`/`-pro` 400K → 1.05M, the four `grok-4*-fast` SKUs 131K → 2M, `deepseek-chat`/`-reasoner` 8192 → 65536 output, `gemini-3.1-flash-lite` 8192 → 65536. Every `gemini-*` context normalised to the real 1048576.
+
+### Changed — bare `glm` promoted 5.2 → 5.3
+
+Same rule as `opus` 4.8 → 5: the cost tradeoff is zero — identical $1.40/$4.40 and an identical 1M / 131072 envelope — so nothing can bill or truncate differently for a caller who never typed a version, and blockrun's own copy already names 5.3 the Z.AI flagship. `glm-5.2` and every other version pin still resolve to their own model.
+
+### Changed
+
+- `@blockrun/router-core` pinned to `5ee7c23`: eco SIMPLE opens on `nemotron-3.5-lightning` with `nemotron-3-nano-30b` behind it, three free backstop rungs retargeted, `model-capabilities.ts` regenerated from the live catalog.
+- Published counts: 73 chat models, 7 free (was 71 / 5); 253 aliases (was 229).
+- `docs/9-free-ai-models-zero-cost-blockrun.md` rebuilt — every model it named was dead. The slug is kept so existing links do not break.
+- The capacity-filter test fixture moved off `openai/gpt-5.3`, whose output cap rose to 128K in this resync and quietly stopped exercising the filter.
+
+---
+
+## v0.12.257 — August 31, 2026
+
+### Added — counterparty policy: control _who_ the agent may pay, not just how much
+
+`SpendLimits` already bounded how much an agent could spend per request, hour, day and session. It said nothing about **whom** it paid, or on which network and asset. Four optional, default-off lists close that: `allowedPayees`, `blockedPayees`, `allowedNetworks` and `allowedAssets`, with a block always beating an allow when an address is on both.
+
+Enforcement runs on the live payment path, not just in the SDK: `startProxy` registers an x402 `onBeforePaymentCreation` hook, so a refusal aborts **before** the scheme signer runs and no authorization is ever produced. A configured list with no matching value on the payment refuses rather than skipping the check. Networks are CAIP-2 only — `base` does not match `eip155:8453` and fails closed. EVM addresses are compared case-insensitively so checksummed and lowercase forms both match. State lives in `~/.openclaw/blockrun/spending.json`, documented in `docs/configuration.md`.
+
+A policy denial reaches the caller as HTTP 403 `spend_policy_denied` and is deliberately never retried against other models: it is a decision, not an outage. Treated as a retryable provider error it would have walked the entire paid fallback chain and then answered 200 from a free model, hiding the refusal completely.
+
+Four things found in review and fixed before merge, all on the money path:
+
+- **Amount quotes are validated, not coerced.** `Number.parseInt(amount, 10)` truncates at the first non-decimal character while `@x402/evm` signs `BigInt(value)`, and `@x402/core` validates the field as a non-empty string with no digit check. `parseInt("0x1DCD6500", 10)` is `0`; `BigInt("0x1DCD6500")` is `500000000`. A gateway quoting hex (or `0b`/`0o`) would have read as $0.000000 against every cap and still had the full amount authorized. Quotes must now be canonical decimal integers, and anything else refuses whenever a cap is set. x402 v1's `maxAmountRequired` is read too — v2 renamed it to `amount`, so v1 quotes had been parsing as free.
+- **Reservations are released.** The pre-sign hold is now in-memory rather than a persisted spend record: settled when the payment is signed, released when the signer fails, and expired after two minutes. Previously a failed signer, a rejected pre-authorization and every fallback attempt each consumed budget permanently for money that never moved.
+- **Recording a payment no longer erases policy.** History-only saves preserve the limits already on disk, writes are atomic (temp + rename), and an empty array means "not configured" instead of tripping the corruption guard. A torn write previously parsed as a failure and silently dropped configured lists — fail-open on the one file that must not do that.
+- **A malformed policy file no longer takes the proxy down.** It refuses every paid request and says so loudly, while the proxy stays up so free models keep working.
+
+`proxy.spend-policy.test.ts` pins the `startProxy` wiring itself: deleting the hook registration previously left the whole suite green, shipping a policy that governed nothing.
+
+Not covered, and documented as such: Polymarket funding and order placement, and `clawrouter doctor`'s probe, sign with the same wallet outside the proxy's x402 client. There is also no CLI command for `setPolicy` yet — edit `spending.json` and restart.
+
+- Thanks to @twzrd-sol for the design, the implementation, and two rounds of fast iteration (#268, closes #230).
+
+---
+
+## v0.12.256 — August 30, 2026
+
+### Fixed — multimodal retries now dedupe and cache-hit like text-only ones
+
+Timestamp stripping in the dedup and response-cache key functions only handled plain-string message `content`. For Anthropic-style array content (`[{type: "text", text}, {type: "image_url", …}]` — vision/multimodal messages), the OpenClaw-injected `[DAY YYYY-MM-DD HH:MM TZ]` prefix lives in the leading text block, so it stayed in the hash input: a retried multimodal request (timeout, network blip) never matched its original — the same request could be **paid twice** past the dedup window's protection, and every retry re-hit the upstream LLM instead of the response cache.
+
+Both key functions now strip the injected timestamp from array content — scoped to the **first** text block only, where OpenClaw actually injects. Later text blocks are user data (a pasted log line can legitimately start with a bracketed timestamp), and stripping those would have collided genuinely different requests onto one key — serving the wrong cached response for up to 10 minutes or wrongly deduping a distinct paid request. The shared logic (pattern + block stripper) moved to `src/timestamp-strip.ts` so dedup and cache normalization can't drift apart. Covered by the new `src/dedup.test.ts` and extended `src/response-cache.test.ts`, including regression tests pinning that non-leading text blocks are left untouched.
+
+- Thanks to @ygd58 for finding the gap, the isolated repro, and the core fix (#273) — the first-text-block scoping and shared helper were added in review.
+
+---
+
+## v0.12.255 — August 30, 2026
+
+### Fixed — img2img no longer misreports a client cancel as "Invalid request"
+
+The `/v1/images/image2image` parse path downloads source/mask URLs with the client-abort signal (v0.12.252), so a caller hanging up mid-download rejects that fetch with an `AbortError` — which the parse catch then misclassified as invalid input and answered with a 400 on the dead socket. The catch now returns silently when `clientAbort.signal.aborted` is set, and the paid upstream is never contacted. Covered by a new case in `src/proxy.img2img-abort.test.ts` (download socket observes the abort, no response is written, zero upstream hits). Closes #277.
+
+Also landed the remainder of PR #276 (same lineage): the three post-payment result-asset downloads — generations and img2img result images, video clips — now carry `clientAbort.signal` so a hung download is cancelled when the client leaves instead of running to the 5-minute fetch ceiling, and the chat-path `/imagegen` outer catch gained the same silent-return abort guard its `/img2img` sibling got in v0.12.253.
+
+- Thanks to @Sertug17 for both fixes (#276, #278) — rebased onto main, where the bulk of each had already landed in v0.12.252–253.
+
+---
+
+## v0.12.254 — August 30, 2026
+
+### Fixed — the chat path now cancels its paid upstream when the client disconnects
+
+The media handlers all abort their upstream on client disconnect (#251, v0.12.252–253), but the main `/v1/chat/completions` path — the highest-traffic one — never did. `proxyRequest` wired its abort to `req.on("close")`, and on Node (verified on v24.15.0) an `IncomingMessage` emits `"close"` when the request-body readable finishes, not when the client hangs up. The body is fully drained near the top of `proxyRequest`, so that event had already passed by the time the listener was attached far below — `onClientClose` never ran, the `globalController` was only ever aborted by the request timeout, and a caller that hung up mid-request left the paid x402 upstream running to completion for a response nobody would receive. The abort now hangs off `res.on("close")` (guarded by `!res.writableEnded`), exactly like every media handler. Covered by `src/proxy.chat-abort.test.ts` (upstream socket observes the abort after the client destroys its request).
+
+Two follow-ups landed in review on top of the contributed fix:
+
+- **Disconnects in the pre-attach window are caught too.** Several awaits (context compression, the up-to-2.5s balance check) run between draining the body and attaching the listener; a client that hung up in that window had already emitted `"close"`, so the listener alone would never fire. `proxyRequest` now also checks `res.destroyed` right after attaching and aborts immediately.
+- **A client cancel is no longer reported as a 300s timeout.** Once the abort path was live, every disconnect surfaced through the shared abort exits as `Request timed out after 300000ms` — hitting `onError`, printing a phantom timeout in the CLI, and invalidating the balance cache (an extra RPC read on the next request). The proxy now tells the two apart (`ClientDisconnectedError`), logs `Request cancelled — client disconnected`, and returns quietly. The regression test also asserts `onError` stays silent, and gates its disconnect on the upstream actually being reached instead of a fixed 500ms timer.
+
+- Thanks to @erhnysr for the diagnosis, fix and regression test (#279).
+
+---
+
+## v0.12.253 — August 29, 2026
+
+### Fixed — the last two paid handlers without a client-abort signal
+
+v0.12.252 fixed `/v1/images/image2image` charging the wallet after the caller disconnected (#251). Two more handlers had the same shape and were closed out here: `/v1/audio/generations`, and the chat-side `/img2img` command that reaches the same image2image endpoint. Both now create an `AbortController` on the response's `close` event and thread its signal through the paid upstream call (and, for audio, the post-generation track download), and swallow the resulting abort instead of logging a bogus 502. Every paid x402 handler in the proxy now carries this wiring. Covered by `src/proxy.audio-abort.test.ts`.
+
+---
+
+## v0.12.252 — August 29, 2026
+
+Two proxy fixes from community bug reports. Thanks to @Sertug17 for both (#251, #252).
+
+### Fixed — message truncation no longer splits a tool call from its results (#252)
+
+BlockRun caps a request at 200 messages, and `truncateMessages()` enforced that with a raw `slice(-N)` over the non-system turns. When the cut landed between an assistant `tool_calls` turn and the `role: "tool"` results that answer it, the request went upstream with orphaned results and the provider rejected it — Anthropic with `tool_use block without matching tool_result`, OpenAI with `tool_calls referenced but tool response missing`. A long agentic session would start 400ing exactly as it crossed the limit, at the point it had the most state to lose.
+
+The boundary now walks **forward** past any leading tool results (OpenAI `role: "tool"`, and Anthropic-style `tool_result` content blocks in a `user` turn), so a straddled exchange is dropped whole instead of half-kept. Walking forward rather than back keeps the result under the 200 cap in every case, including a parallel tool call with several contiguous results. Covered by `src/proxy.truncate-tool-pairs.test.ts` (boundary on a single result, mid-parallel-exchange, tool-heavy windows, system-message preservation).
+
+### Fixed — `/v1/images/image2image` cancels upstream when the client disconnects (#251)
+
+`/v1/images/generations` already carried a `clientAbort` controller so a caller that hung up mid-request stopped the upstream call before the x402 payment could settle. The img2img handler never got the same wiring: the upstream request ran to completion and the wallet was charged for an image nobody received. The handler now creates the controller before reading the body and threads its signal through both the source-image URL download and the paid upstream call; an abort is swallowed instead of logged as a 502. Covered by `src/proxy.img2img-abort.test.ts` (upstream socket observes the abort after the client destroys its request).
+
+---
+
+## v0.12.251 — August 29, 2026
+
+Repins the routing engine to Router Core **V3.5** (`@blockrun/router-core` @ `5d91187`). No ClawRouter code changed; the decision path did.
+
+### Changed — every chain names a model you can see on blockrun.ai/models
+
+V3.4's chains still leaned on ids the gateway had withheld from `/v1/models`: `moonshot/kimi-k2.7` was the MEDIUM primary in the auto, premium-SIMPLE and agentic sets, `xai/grok-4-1-fast-reasoning` opened both REASONING tiers, and the grok-4-fast pair closed half the fallback chains. V3.5 removes every hidden id from every rung and admits the current generation the catalog already sells — GPT-5.6 Terra/Luna, Gemini 3.6 Flash and 3.5 Flash-Lite, GLM-5.3 and 5.3-Flash, Grok 4.3, Kimi K3, Qwen 3.7 Plus, MiniMax M3 — as fallback rungs. Primaries moved only where router-core carries calibration evidence for the successor:
+
+| Tier / profile              | V3.4                           | V3.5                         |
+| --------------------------- | ------------------------------ | ---------------------------- |
+| AUTO MEDIUM                 | `moonshot/kimi-k2.7`           | `google/gemini-3.5-flash`    |
+| AUTO / ECO REASONING        | `xai/grok-4-1-fast-reasoning`  | `deepseek/deepseek-reasoner` |
+| ECO MEDIUM / COMPLEX        | `google/gemini-3.1-flash-lite` | `zai/glm-5.3-flash`          |
+| PREMIUM SIMPLE              | `moonshot/kimi-k2.7`           | `google/gemini-3.5-flash`    |
+| PREMIUM REASONING           | `anthropic/claude-sonnet-4.6`  | `anthropic/claude-sonnet-5`  |
+| AGENTIC MEDIUM              | `moonshot/kimi-k2.7`           | `openai/gpt-5-mini`          |
+| AGENTIC COMPLEX / REASONING | `anthropic/claude-sonnet-4.6`  | `anthropic/claude-sonnet-5`  |
+
+The capability snapshot behind the hard filters was regenerated from the public catalog (70 models; Haiku 4.5 was capped at 8K output and Sonnet 4.6 at 200K context) and the speed/reliability priors from a fresh 2026-08-29 gateway probe (66 models). `README.md`, `docs/routing-profiles.md`, `docs/configuration.md` and `docs/architecture.md` now describe the V3.5 chains; `brand-numbers.test.ts` pins the README tier table to the pinned config, as before.
+
+The `kimi` / `kimi-k2.7` aliases and `/model` pins are untouched — the gateway still serves those ids by direct name; only automatic routing stops choosing them.
+
+---
+
+## v0.12.250 — August 29, 2026
+
+Realigns every routing surface — code and docs — to Router Core V3.4 (`@blockrun/router-core` @ `d7bc10c`, already the pinned engine since v0.12.242) and the current model catalog.
+
+### Fixed — `/model free` was pinned to a model that has been dead upstream for two weeks
+
+`free` resolved to `free/gpt-oss-120b`. That model stopped completing on 2026-08-16 (NVIDIA still lists it; a completion hangs until the client gives up — blockrun #391 retargeted its whole free cascade off it the same day) and the gateway now answers `400 Unknown model` for the `free/` id. Every `/model free` call, the budget-cap free fallback (`FREE_MODEL`) and the head of the proxy's `FREE_MODELS` cascade all opened on it, and the picker label still promised "GPT-OSS 120B".
+
+All three now agree on **`free/step-3.7-flash`** — the same model router-core opens the eco SIMPLE tier on, live-probed 200 through the gateway. The cascade is now step-3.7-flash → nemotron-nano-9b-v2 → mistral-nemotron → nemotron-omni (vision) → nemotron-nano-12b-v2-vl (vision), mirroring router-core's free rungs; gpt-oss-120b/20b are dropped from it (dead, and hidden from the public catalog over NVIDIA's prompt-retention terms since 2026-04-28). Generic shorthands that had been parked on gpt-oss-120b (`nvidia`, `coder-free`, `qwen-coder`, `qwen-thinking`, `devstral`, `nemotron-ultra/-super/-49b/-120b/-253b`) follow the free default; pins that _name_ gpt-oss (`gpt-120b`, `gpt-oss-120b`, `nvidia/gpt-oss-120b`) stay routable and rely on the gateway redirect, as before.
+
+Invariant, now written down at all three sites: the `free` alias, `FREE_MODELS[0]` and router-core's `ecoTiers.SIMPLE.primary` must be one live model. `src/router/free-model-liveness.test.ts` already guards the router side; the alias/label tests in `models.test.ts` and `exclude-models.test.ts` were repointed.
+
+### Changed — routing docs describe the router that actually ships
+
+Since v0.12.242 the README, `docs/routing-profiles.md`, `docs/configuration.md`, `docs/architecture.md` and the OpenClaw skill still described the pre-extraction rules router: "Weighted Scorer → Tier → Best Model", a tier table with `kimi-k2.6` and `free/gpt-oss-120b`, a `src/router/config.ts` that no longer exists, a "Default Tier Mappings" table (`deepseek-chat` as MEDIUM primary, `o3-mini` for REASONING) that never matched any shipped config, an `agenticTask` weight of 0.10 (it is 0.04), a `reasoningConfidence` knob that does not exist, and a claim that ambiguous queries "hit the LLM classifier" — nothing in the proxy calls one. The README's Routing Profiles table had also been corrupted by a footnote spliced into the `auto` row.
+
+Rewritten against router-core's config and README:
+
+- **README** — "How It Works" now walks the four constraint-first stages (classify → hard filters → rank → recovery chain), the tier table gains the AGENTIC column with its ‡ footnote, the profiles table is repaired, and the V3.4 three-arm benchmark numbers (57% vs 49% task success, −6.4% cost per successful task, 8.9% of a pinned flagship's tokens) are cited with the caveat that they come from a frozen agent benchmark. `kimi-k3` moved out of the "Budget" table (it is $3/$15). The "1M-context DeepSeek V4 Flash" free-tier bullet — EOL'd 2026-08-12 — is gone.
+- **docs/routing-profiles.md** — full chains for AUTO / ECO / PREMIUM / AGENTIC straight from `DEFAULT_ROUTING_CONFIG`, the per-profile ranking weights and affinity floors, the `free` alias semantics, and the `strategy: "rules"` / `shadow` levers.
+- **docs/configuration.md** — `routing.strategy`, `routing.shadow`, per-tier merge semantics, `ecoTiers` / `premiumTiers` / `agenticTiers: null`, the real `overrides` keys (`maxTokensForceComplex`, `structuredOutputMinTier`, `ambiguousDefaultTier`, `agenticMode`), corrected scorer weights and sigmoid parameters, and a `route()` example that shows the V3 decision shape (`taskType`, `candidates`, `candidateScores`, `routerVersion`).
+- **docs/architecture.md** — Routing Engine section rewritten around router-core's four stages; file tree and key-files table no longer list `router/{rules,selector,config,types}.ts`.
+- **skills/clawrouter/SKILL.md** — "How Routing Works" matches the above; the `routing` config row says what it actually overrides.
+
+`docs/smart-llm-router-14-dimension-classifier.md` is a dated benchmark write-up and is deliberately untouched.
+
+---
+
+## v0.12.249 — August 25, 2026
+
+### Fixed — `/health?full=true` could hang forever on an unresponsive balance RPC
+
+The full health check awaited `balanceMonitor.checkBalance()` with no time bound. The surrounding `catch` covers a rejection but never a hang, so an unresponsive RPC held the response open indefinitely — on the one endpoint monitoring hits and the one that must always answer. The check is now bounded by the same `BALANCE_CHECK_TIMEOUT_MS` (2.5s) as the pre-request path and degrades to `balanceError`, which the response shape already carried.
+
+This is also why CI's `lifecycle` integration test had been failing: GitHub runners are slow enough to reach the RPC that the endpoint blew past the test's 5s limit. Covered by `src/proxy.health-balance-timeout.test.ts` (hanging monitor, asserts the answer lands well inside the RPC delay).
+
+### Fixed — live-gateway integration tests no longer gate the npm publish
+
+There was no `vitest.config.ts`, so `npm test` fell back to vitest's default glob and swept in `test/integration/**` — seven suites that stand up a proxy and send real requests to the live BlockRun gateway. On a GitHub runner those hang past even their own declared 30s timeouts, which meant a release could be blocked by runner networking rather than by anything wrong with the code (v0.12.249 was blocked twice this way). Ironically `vitest.integration.config.ts` already existed with the right 30s/15s timeouts and was wired to nothing.
+
+`npm test` is now hermetic (716 tests) and `npm run test:integration` runs the gateway-dependent suites (26 tests) on demand. Same 742 total; nothing dropped.
+
+### Fixed — `prettier --check` restored to green
+
+`docs/image-generation.md` and `skills/clawrouter/SKILL.md` landed unformatted in v0.12.247 (#254), leaving the Lint & Typecheck job red on every commit since. Formatting only.
+
+---
+
+## v0.12.248 — August 25, 2026
+
+### Fixed — agents went silent for the whole tool-using stretch of a conversation
+
+Any assistant turn carrying `tool_calls` had its `content` blanked to `""` before it reached the client, on both the streaming and non-streaming paths. The turn kept its tool call and lost its voice: an operator watching a long-running agent saw an unbroken run of bare `[Called function "exec" ...]` lines, and a plain question typed into the chat ("did you send it yet?") came back as another bare tool call with the answer deleted en route. Re-asking only produced more tool calls, because every reply the model wrote was discarded by the proxy rather than never written.
+
+Three sites blanked it: the SSE synthesizer (which then skipped emitting the content chunk entirely), the non-streaming native-`tool_calls` branch, and the non-streaming branch that synthesizes tool calls out of text. The third is the sharpest case — `extractTextualToolCalls` already computes `cleanedContent`, the model's prose with the raw `<tool_call>` markup stripped out, and it is unit-tested to preserve exactly that prose; `proxy.ts` never read it.
+
+All three now forward the prose, still running it through `stripThinkingTokens`, so tagged chain-of-thought (`<think>`, Kimi `<｜...｜>`) is stripped as before and raw tool-call syntax still never leaks into chat. This matches what OpenAI-compatible clients already expect: `content` and `tool_calls` on the same message. Set `CLAWROUTER_TOOL_CALL_PROSE=off` to restore the old suppression for models that dump untagged planning prose into `content`.
+
+The four tests that asserted the blanking were rewritten to assert delivery; `src/proxy.tool-call-prose.test.ts` covers the native, textual, streaming, thinking-token, and opt-out paths.
+
+---
+
+## v0.12.247 — August 23, 2026
+
+### Fixed — OpenClaw image picker no longer advertises delisted models (#254)
+
+`buildImageGenerationProvider()` still advertised `openai/dall-e-3` (delisted upstream 2026-05-25) and `black-forest/flux-1.1-pro` (no gateway entry) — both dropped from `IMAGE_PRICING` in v0.12.227 but missed in the picker, where a pick is forwarded to `/v1/images/generations` verbatim (no alias resolution) and 400s upstream. The inverse gap too: `gpt-image-2`, `nano-banana-2`, and `seedream-5-pro` were priced but never advertised, so unreachable from the picker. Picker resynced to the 9 servable ids, `IMAGE_MODEL_IDS` exported as the pinning source of truth, partner-registry tool description refreshed, `banana-2`/`nano-banana-2` shorthands added to `/cr-imagegen`, and a regression test pins picker ↔ `IMAGE_PRICING` in both directions. Live-verified 2026-08-23: the gateway rejects both dead ids pre-payment (`400 Unknown image model`) and quotes all 9 advertised ones.
+
+- Thanks to @memosr for #254 (including the follow-up alias + help fixes from review).
+
+### Fixed — `/cr-imagegen` now completes slow-model (202) jobs
+
+The chat-prefix imagegen path treated a `202 + poll_url` response as success with empty `data` (`Response.ok` is true for 202), so any model exceeding the gateway's 30s inline window — `gpt-image-2` is the canonical case — surfaced as "Image generation returned no results" with the job abandoned. The path now polls the job like the `/v1/images/generations` handler does (3s interval, 5min budget, client-abort guard so a disconnected chat client stops the poll loop before it settles the payment). The upload-failure hint no longer steers users toward a specific model.
+
+### Fixed — advertised image sizes live-verified against the gateway
+
+The gateway validates `size` **per model before payment** and rejects unknown ones. The picker's global size list still carried `1216x832`, `1792x1024`, and `1024x1792` — accepted by no current model (the latter two were dall-e-3's native sizes) — and was missing six sizes Seedream 5 Pro actually serves. `geometry.sizes` is now exactly the live-probed union (16 sizes), pinned by test against the new `IMAGE_MODEL_SIZES` export; Seedream's `IMAGE_PRICING` size map filled in from 402 quotes (`1280x720`/`2048x1024` at $0.045, the 2K portrait/landscape tiers at $0.09).
+
+### Changed — image-catalog drift-proofing
+
+- `IMAGE_MODEL_ALIASES` hoisted to module scope and exported; tests now pin every alias target to a servable id and the partner-registry description to the exact catalog + count. A prototype-key lookup (`--model constructor`) can no longer resolve to a function and send a model-less body upstream.
+- Doc surfaces resynced: `skills/clawrouter/SKILL.md` (8 → 9 image models, Nano Banana 2 listed), `skills/imagegen/SKILL.md` (banana-2 row; removed recommended sizes that 400 — e.g. nano-banana `1216x832`, banana-pro `1024x1792`), README `banana-2` row, `docs/image-generation.md` (still documented dall-e-3/flux as live and mapped `dall-e-3` → `openai/dall-e-3`; full 9-model refresh with per-model size lists), `scripts/reinstall.sh` example.
+
+---
+
+## v0.12.246 — August 22, 2026
+
+### Changed — new installs default to the Solana payment chain
+
+Brand-new wallets now persist `payment-chain = solana` at generation time (`generateAndSaveWallet` in `src/auth.ts`), so first-run users start on the Solana gateway (`sol.blockrun.ai`). **Existing installs are completely unaffected** — the `loadPaymentChain()` fallback for an absent `~/.openclaw/blockrun/payment-chain` file stays `base`, which is where pre-existing wallets hold their USDC.
+
+- The default is written **only when Solana address derivation succeeds** (it dynamically imports `@solana/kit`, which plugin installers sometimes drop — see the reinstall workaround in `scripts/update.sh`). If derivation fails, the write is skipped and the user stays on the Base fallback rather than being defaulted onto a chain the proxy can't sign for.
+- Recovery/import flows deliberately do NOT change the chain: `BLOCKRUN_WALLET_KEY` env restore, `wallet recover`, and the legacy `setupSolana` opt-in path all bypass wallet generation, so a restored wallet keeps resolving to wherever its funds already live.
+- `CLAWROUTER_PAYMENT_CHAIN` still overrides the persisted selection in both directions; `/wallet base` switches a new install back at any time.
+- New wallet banner now states the Solana default and how to switch back.
+- Tests: `src/auth.payment-chain-default.test.ts` (fresh generate → solana; saved/env/explicit-base paths untouched; env override wins) + `src/auth.payment-chain-default-failure.test.ts` (derivation-failure guard), and `test/smoke-wallet-scenarios.ts` now asserts the chain file on real disk.
+- Docs: removed the `/chain` command from README and `docs/configuration.md` — it was never a registered slash command (use `/wallet solana` / `/wallet base`); documented the new-install default in README, `docs/configuration.md`, and `skills/clawrouter/SKILL.md`.
+
+---
+
+## v0.12.245 — August 12, 2026
+
+Catch-up sync to blockrun: one free-model EOL (today's), ten model additions that had never been mirrored, and six stale prices. Catalog is now 70 chat-visible / 5 free, matching blockrun exactly.
+
+### Removed — `free/deepseek-v4-flash` is dead upstream (blockrun #367)
+
+NVIDIA published EOL for the whole `nvidia/deepseek-*` family: HTTP 410 ("has reached its end of life") on both of blockrun's live probe passes this morning, prod gate fired `[ALERT][free-model-dead] kind=gone` twice. It was the last free DeepSeek — and the last 1M-context free model.
+
+- Dropped from the picker (`top-models.json`, 6 → 5 free — again exactly blockrun's visible free set), the `FREE_MODELS` auto-pick cascade (8 → 7), and router-core's eco SIMPLE chain ([`18bf4ab`](https://github.com/BlockRunAI/router-core/commit/18bf4ab), pin bumped). Same `/exclude`-defeating failure mode as seed-oss-36b in v0.12.241, same fix.
+- Pins naming the model itself (`deepseek-v4-flash`, `v4-flash`, `nvidia/deepseek-v4-flash`) stay routable — the gateway redirects them to gpt-oss-120b. Generic shorthands (`deepseek-free`, `v4-pro`, `deepseek-v4-pro`, and the `deepseek-v3.2` ids whose redirects chained through flash) follow blockrun's own retarget to `free/gpt-oss-120b` instead of chaining through a dead model.
+- Note bare `deepseek` still resolves to the **paid** `deepseek/deepseek-chat`, as before — no free alias was silently moved onto a paid SKU.
+
+### Added — ten models blockrun shipped that ClawRouter never mirrored
+
+Seven chat (blockrun #329, 2026-08-03), two chat from 2026-07-25, one image, one video:
+
+| model                          | price (in/out $/M) | notes                                                                                           |
+| ------------------------------ | ------------------ | ----------------------------------------------------------------------------------------------- |
+| `openai/gpt-5.6-sol-pro`       | 5.00 / 30.00       | pro reasoning mode of each 5.6 tier                                                             |
+| `openai/gpt-5.6-terra-pro`     | 1.00 / 6.00        | half the standard Terra rate                                                                    |
+| `openai/gpt-5.6-luna-pro`      | 0.10 / 0.60        | budget deep-reasoning tier                                                                      |
+| `google/gemini-3.6-flash`      | 1.50 / 7.50        | newest Flash, 17% output cut vs 3.5                                                             |
+| `google/gemini-3.5-flash-lite` | 0.30 / 2.50        | high-throughput thinking tier                                                                   |
+| `qwen/qwen3.7-plus`            | 0.32 / 1.28        | 1M ctx; genuinely 131072 max output                                                             |
+| `qwen/qwen3.7-flash`           | 0.03 / 0.13        | cheapest Qwen tier                                                                              |
+| `tencent/hy3`                  | 0.132 / 0.528      | #1-usage open model, 262K ctx                                                                   |
+| `xiaomi/mimo-v2.5-pro`         | 0.435 / 0.87       | 1M ctx reasoning                                                                                |
+| `google/nano-banana-2`         | $0.09/image        | Gemini 3.1 Flash imagegen                                                                       |
+| `bytedance/seedance-2.0-mini`  | $0.079/s           | 720p + audio, 4–15s; blockrun signs the 3dp-floored rate, so we mirror 0.079 not the raw 0.0797 |
+
+- **toolCalling LIVE-VERIFIED** on all seven new chat models that carry the flag: qwen3.7-plus, qwen3.7-flash, hy3, mimo-v2.5-pro, gemini-3.6-flash, gemini-3.5-flash-lite, and gpt-5.6-luna-pro each returned a structured `tool_calls` array (name + valid JSON args, `finish_reason: "tool_calls"`) through the live gateway (~$0.003/probe, the qwen3.7-max pattern).
+- Generic aliases untouched: `gpt5`/`gpt-5.6` stay on standard Terra, bare `qwen` stays unbound, bare `nano-banana` and `seedance` stay on their cheaper originals. New pins: `sol-pro`/`terra-pro`/`luna-pro` (+ full forms), `qwen3.7-plus`/`-flash`, `hy3`/`tencent`/`hunyuan`, `mimo`/`xiaomi`, `gemini-3.6-flash`, `banana-2`, `seedance-2-mini`.
+
+### Fixed — six stale prices (telemetry + cost-cap accounting)
+
+| model                        | was          | now              | source                                             |
+| ---------------------------- | ------------ | ---------------- | -------------------------------------------------- |
+| `openai/gpt-5.6-terra`       | 2.50 / 15.00 | **2.00 / 12.00** | OpenAI's 2026-07-30 cut (blockrun #326)            |
+| `openai/gpt-5.6-luna`        | 1.00 / 6.00  | **0.20 / 1.20**  | same                                               |
+| `deepseek/deepseek-chat`     | 0.20 / 0.40  | **0.14 / 0.28**  | blockrun #354 (old rate was 1.43× real)            |
+| `deepseek/deepseek-reasoner` | 0.20 / 0.40  | **0.14 / 0.28**  | same                                               |
+| `zai/glm-5`                  | 0.60 / 1.92  | **1.00 / 3.20**  | blockrun #354                                      |
+| `google/gemini-3.5-flash`    | 0.50 / 3.00  | **1.50 / 9.00**  | blockrun #304 (was billed at 1/3 of Google's rate) |
+
+Charges are server-dictated via 402 as always, but these numbers feed `logUsage` and the strict-mode `maxCostPerRun` gate, so the two-month-stale gemini-3.5-flash row was letting capped wallets underestimate by 3×. README pricing tables re-tiered to match (luna drops to the budget table, glm-5 and gemini-3.5-flash move up to mid-range).
+
+### Changed — brand numbers 71 → 70 chat, 6 → 5 free; aliases 204 → 229
+
+Markers refreshed from blockrun's live catalog, plus the two plain-text surfaces the markers can't reach (`package.json` description, SKILL.md frontmatter). The alias count moves in blockrun's `src/lib/brand-numbers.ts` via [blockrun #371](https://github.com/BlockRunAI/blockrun/pull/371) — the local snapshot leads prod until that merges.
+
+---
+
+## v0.12.244 — August 8, 2026
+
+Syncs the Seedance video family to blockrun, which added a fourth model and repriced the other three.
+
+### Added — `bytedance/seedance-2.5`
+
+- 720p with synced audio, long-form (up to 30s vs the 12–15s ceiling on the rest of the family), multilingual, image-to-video capable. For 1080p or 4K, Seedance 2.0 Pro is still the one.
+- Reachable as `seedance-2.5` or `seedance-2-5`, and listed in `/videogen`.
+- **Bare `seedance` deliberately stays on 1.5-pro.** It is the cheapest of the family ($0.070/s vs 2.5's $0.315/s) and `/videogen` documents it as "default — cheapest"; repointing the short name at the newest tier would 4.5× the quote for everyone who typed it expecting the default. Same rule that keeps `kimi` on K2.7.
+- Note: 2.5 has no OpenRouter failover upstream, so a token360 outage surfaces as an error rather than quietly rendering on a different model.
+
+### Fixed — all three existing Seedance rates were stale
+
+blockrun repriced the family (blockrun #351/#354) and ClawRouter was still carrying the old numbers:
+
+| model               | was     | now       |
+| ------------------- | ------- | --------- |
+| `seedance-1.5-pro`  | 0.0875  | **0.070** |
+| `seedance-2.0-fast` | 0.22687 | **0.165** |
+| `seedance-2.0`      | 0.28358 | **0.227** |
+
+These are base rates; `estimateVideoCost` applies the 5% margin at use. **Telemetry only** — the charge comes from the x402 payment header, and this estimate is the fallback for when `paymentStore` is empty. So the impact was a skewed usage log, never a wrong bill.
+
+### Changed — published alias count 202 → 204
+
+The two new pins move the total, and `src/router/brand-numbers.test.ts` pins it against blockrun's artifact. That number is hand-maintained in blockrun (`src/lib/brand-numbers.ts`) because the alias table lives here and cannot be counted from there. Updated on both sides; the guard is what caught it.
+
+---
+
+## v0.12.243 — August 8, 2026
+
+Clears the last **high**-severity dependency alert. `npm audit` on this repo goes from 4 high / 17 low to **0 high / 17 low**.
+
+### Security — `bigint-buffer` is out of the tree
+
+- `bigint-buffer`'s native `toBigIntLE()` carries an unpatched buffer overflow ([GHSA-3gc7-fjrx-p6mg](https://github.com/advisories/GHSA-3gc7-fjrx-p6mg)). There is no fixed release anywhere: 1.1.5 is the last publish, from 2019, and `@trufflesuite/bigint-buffer@1.1.10` ships a **byte-identical** `src/bigint-buffer.c`, so overriding onto the fork would launder the advisory without fixing anything.
+- It reached us four levels down: `@blockrun/llm` → `@solana/spl-token` → `@solana/buffer-layout-utils` → `bigint-buffer`. ClawRouter never executes that path — it imports the EVM `createPaymentPayload`, not `createSolanaPaymentPayload`, and Solana payments go through `@x402/svm`. The package still landed in every consumer's lockfile because `@solana/spl-token` was an **optional dependency** of `@blockrun/llm`, and npm installs those automatically.
+- Fixed upstream in [`@blockrun/llm@3.10.0`](https://github.com/BlockRunAI/blockrun-llm-ts/releases/tag/v3.10.0): the Solana packages are now optional **peer** dependencies, which npm does _not_ auto-install. Consumers who make Solana payments through that SDK install `@solana/web3.js` and `@solana/spl-token` explicitly and get an actionable error if they forget.
+- ClawRouter's floor moves to `@blockrun/llm@^3.10.0` and the lockfile is regenerated. Verified: `npm ls bigint-buffer` returns empty, and `dist/` still contains zero references to `spl-token`, `buffer-layout-utils`, or `toBigIntLE`.
+- **Trap worth remembering:** bumping the dependency alone did not drop it. `npm install @blockrun/llm@^3.10.0` updated the SDK but kept the stale transitive entry — the optional-dependency-to-optional-peer change only takes effect after a full `rm -rf node_modules package-lock.json` regeneration. Same class as the override staleness in v0.12.240.
+- `@solana/kit` re-verified at **5.5.1** after the regeneration (the v5-vs-v6 split is what broke Solana signing back in March).
+
+Remaining: 17 low from the `elliptic` chain under `@polymarket/*` (ethers v5). 6.6.1 is the latest release and is still in the advisory's range, so there is nothing to move to.
+
+---
+
+## v0.12.242 — August 7, 2026
+
+Makes the deterministic **Router v3.4 portfolio strategy the default for Auto**, and moves the routing engine out of this repo into [`BlockRunAI/router-core`](https://github.com/BlockRunAI/router-core).
+
+Thanks to @KillerQueen-Z for the router work and the extraction (#238).
+
+### Changed — portfolio routing is the Auto default
+
+- Auto now classifies task shape locally, enforces tool / vision / structured-output / context constraints as hard filters, then ranks an ordered fallback portfolio. The previous path picked a fixed tier primary after rule classification. On a frozen 100-task, three-arm evaluation the new policy scored 57% vs 49% and cut normalized cost per successful task by 6.44%.
+- Routing stays **100% local and deterministic** — no extra model call, no network hop. Model capabilities are injected from ClawRouter's live catalog at proxy startup, so the product catalog remains authoritative.
+- `tool_choice: "none"` is authoritative, and host tool descriptions no longer create false per-turn tool requirements.
+- Rollback lever: set `routing.strategy = "rules"`. An optional local-only shadow mode compares the two strategies' metadata without issuing a second paid completion or persisting any prompt.
+
+### Changed — routing engine extracted to router-core
+
+- `src/router/{config,rules,selector,strategy,types}.ts` are gone; `src/router/index.ts` re-exports `@blockrun/router-core`, pinned to immutable commit `6a790eb`. `@blockrun/clawrouter/router` stays available as a subpath export for existing SDK consumers.
+- The dependency is **`devDependencies`, deliberately**: tsup's `noExternal` inlines it into `dist/`, so nothing imports it at runtime. Keeping it in `dependencies` would make every `npm install @blockrun/clawrouter` fetch a `codeload.github.com` tarball at install time — resolved from a bare URL with no lockfile-backed integrity, since the published package doesn't ship our lockfile, and broken whenever GitHub is unreachable. The packed tarball still declares zero non-registry dependencies.
+
+### Fixed — a stale build put the retired seed-oss-36b back in three fallback chains
+
+- `dist/router/index.js` shipped `free/seed-oss-36b` in three fallback chains even though router-core's pinned commit had already removed it. The committed artifact had been built against a pre-fix install. Rebuilt.
+- This is the same class of bug as v0.12.241: BlockRun **server-redirects** retired free ids, so routing to one **silently defeats `/exclude`** — the caller excludes a model, the router hands it the request anyway, and the gateway answers from the redirect target.
+- **A correct commit pin does not imply a correct committed `dist/`.** This repo ships `dist/`, so both have to be checked.
+
+### Added — free-model liveness guard
+
+- `src/router/free-model-liveness.test.ts` walks every tier container's `primary` and `fallback` entries and asserts each `free/*` id is still live. The allowed set is **derived from `src/top-models.json`** (plus the two deliberate `gpt-oss` defaults), so a future free-tier resync updates the guard automatically — models should never be added to it by hand.
+- It exists because router selection coverage left this repo along with the code (`selector.test.ts` and `strategy.test.ts` deleted, none added), and the stale-build regression above walked straight through the gap. Verified to fail against that exact regression, and it fails loudly rather than vacuously if the upstream config shape changes.
+
+---
+
+## v0.12.241 — August 7, 2026
+
+Finishes the free-tier resync that #232 started. That commit refreshed the **brand markers** to blockrun's live catalog (71 chat-visible / 6 free) but touched no code, so the router kept routing to a model that has been dead upstream since 2026-08-03.
+
+### Fixed — `free/seed-oss-36b` is EOL and was still in the auto-pick cascade
+
+- blockrun's probe got **HTTP 410 Gone** from NVIDIA on both passes (2026-08-03) and the production health gate fired `[ALERT][free-model-dead] kind=gone` the same day. Upstream hid the model and re-pointed its own dependents — `qwen3-coder-480b` and `devstral-2-123b`, which both used seed-oss as their fallback — at `gpt-oss-120b`.
+- ClawRouter was still carrying it in three places that matter at request time:
+  - the **`FREE_MODELS` auto-pick cascade** (`proxy.ts`) — 9 entries → **8**,
+  - the **picker** (`src/top-models.json`) — 7 free → **6**, now exactly blockrun's visible free set,
+  - **three router fallback chains** (`router/config.ts`).
+- This is not cosmetic. A dead model that the gateway server-redirects **silently defeats `/exclude`**: a caller excludes it, the router hands the request to it anyway, and the gateway answers from the redirect target. Same failure mode as `mistral-large-3-675b` in v0.12.239 — same fix.
+- The `free` profile's SIMPLE chain drops the rung outright (`gpt-oss-120b`/`20b` already head it). The premium and agentic "NVIDIA free ultimate backstop" rungs are **retargeted** to `free/gpt-oss-120b` rather than dropped, since nothing else free sat below them.
+
+### Changed — generic coding aliases follow the gateway, pins stay routable
+
+Six shorthands promised "a live free coder" and pointed at a dead one. They now resolve to `free/gpt-oss-120b`, matching blockrun's own retarget: `qwen-coder`, `qwen-coder-free`, `coder-free`, `glm-free`, `devstral`, `devstral-2`.
+
+Unchanged and still routable, because they name the model itself rather than a capability: `seed-oss`, `seed-oss-36b`, `nvidia/seed-oss-36b`, and the catalog entry. The gateway redirects them, exactly as it does for the other retired free ids.
+
+---
+
+## v0.12.240 — August 4, 2026
+
+Security housekeeping. Clears **13 of the 15 open Dependabot alerts** — including 3 of the 4 highs — by removing the thing that was silently swallowing our `overrides` block.
+
+### Fixed — openclaw's `npm-shrinkwrap.json` was voiding every override we wrote
+
+- `openclaw` ≤ 2026.7.1 publishes with `hasShrinkwrap: true`. A shipped `npm-shrinkwrap.json` pins that package's **entire subtree** verbatim, and npm resolves it ahead of the root project's `overrides`. The failure is silent and actively misleading: `npm ls` prints `fast-uri@3.1.2 overridden` next to a version the override forbids.
+- So v0.12.239's `fast-uri`/`hono`/`brace-expansion` overrides — and the pre-existing ones — **never took effect** on anything under `node_modules/openclaw/`. Deleting `package-lock.json` and reinstalling from scratch did not help either; only the shrinkwrap going away does.
+- Bumped the `openclaw` dev dependency to **`^2026.7.2-beta.7`**, the first release that ships without the shrinkwrap. With it gone the overrides land, and the openclaw subtree audits clean:
+
+  | package             | before  | after  |
+  | ------------------- | ------- | ------ |
+  | `undici`            | 8.5.0   | 8.10.0 |
+  | `fast-uri`          | 3.1.2   | 3.1.5  |
+  | `hono`              | 4.12.25 | 4.13.0 |
+  | `@hono/node-server` | 1.19.14 | 2.1.0  |
+  | `ip-address`        | 10.2.0  | 10.4.0 |
+  | `brace-expansion`   | 5.0.7   | 5.0.9  |
+
+- Overrides for `@hono/node-server` and `ip-address` are new; `ws`, `postcss`, `tar`, `brace-expansion`, and `fast-uri` floors were raised. All still inside the **single** `overrides` key (see v0.12.238's gotcha).
+- The `openclaw` scanner integration test still runs against the real scanner chunk on the new version — it throws rather than skipping when the chunk cannot be loaded, so a silent pass is not possible.
+
+### Changed — contributor Node floor is now 22.22.3
+
+- openclaw 2026.7.2's preinstall gate rejects Node below `22.22.3`, so `npm install` in this repo now requires it. CI's `node-version: "22"` already resolves above the floor.
+- **Published users are unaffected**: `openclaw` is a dev dependency and an optional peer, and is never bundled into `dist/`. The package's own `engines.node` stays `>=22`.
+
+### Changed — bundled `undici` floor raised to ^8.10.0
+
+- tsup inlines runtime deps, so this one does ship. The previously bundled 8.9.0 was already past the advisory range (`< 8.9.0`); the bump is the current patch line, not a vulnerability fix. `dist/` grows the corresponding upstream changes (TLS `servername` handling, idle-socket timeout).
+
+### Not fixed — two alerts with no upstream patch
+
+- **`bigint-buffer` (high, GHSA-3gc7-fjrx-p6mg).** No fixed release exists: 1.1.5 is the last publish (2019), and `@trufflesuite/bigint-buffer@1.1.10`'s `src/bigint-buffer.c` is **byte-identical** to it — the fork is not a patch, so overriding onto it would launder the alert without fixing anything. It reaches the lockfile as an optional dependency of `@blockrun/llm` (`→ @solana/spl-token → @solana/buffer-layout-utils`), pulled in only by `createSolanaPaymentPayload`, which ClawRouter never imports — we use the EVM `createPaymentPayload`. Verified absent from the shipped bundle: `dist/` contains zero references to `spl-token`, `buffer-layout-utils`, or `toBigIntLE`. The real fix belongs upstream in `@blockrun/llm`, whose Solana extras are already lazy `await import()`s and could be optional peers instead of optional dependencies.
+- **`elliptic` (low, GHSA-848j-6mx2-7j84).** 6.6.1 is the latest release and is still in the vulnerable range. It arrives via ethers v5 under `@polymarket/*`.
+
+---
+
+## v0.12.239 — August 2, 2026
+
+Catches up with blockrun's **2026-07-28 free-model re-probe** (blockrun #309) and the **2026-07-29 fee revert** (blockrun #319). Verified live against the gateway before syncing: `nvidia/deepseek-v4-flash` answers and stays $0; the brand artifact now publishes 65 chat models / 7 free.
+
+### Changed — free/mistral-large-3-675b is EOL at NVIDIA (HTTP 410)
+
+- blockrun's 07-28 re-probe got **410 Gone on both passes** for `mistral-large-3-675b` (plus `qwen3-next-80b` and `qwen3.5-397b`, which ClawRouter had already dropped on 07-17). Upstream hides it and server-redirects calls to `gpt-oss-120b`.
+- Removed from the `FREE_MODELS` auto-pick cascade, the picker (`top-models.json`), and the eco SIMPLE fallback chain — a server-redirected dead model in the cascade silently defeats `/exclude`. The catalog entry and explicit pins (`mistral-large`, `mistral-large-3-675b`) stay routable; the gateway redirects them.
+- `mistral-free` re-aimed at `free/mistral-nemotron`, the last live free Mistral (blockrun demoted its own `/free-mistral` primary the same way).
+- `free/deepseek-v4-flash` **stays**: the same probe measured it slow on real prompts (~10 tok/s, 74.6s) but completing — and it is the only 1M-context free model. The 07-17 "3.2s recovery" was a short-ping artifact.
+- Free count is now **7** across README, SKILL.md, and brand-number markers (chat-visible total: 65).
+
+### Changed — per-transaction fee mirrored back to $0.001
+
+- blockrun reverted the flat settlement fee from $0.002 to **$0.001/tx** on 2026-07-29 (#319). `estimateAmount()` and the README pricing note follow. Payments were always server-quoted via 402 — the old value only over-reserved balance pre-checks and overstated usage logs by $0.001/call.
+
+### Security — dependency refresh
+
+- `openclaw` dev dependency bumped to 2026.7.1; overrides added for `brace-expansion`, `fast-uri`, `tar`, `hono`, and `jayson > uuid` (all merged into the single existing `overrides` block — see v0.12.238's gotcha), and `package-lock.json` regenerated. tsup bundles runtime deps into `dist/`, so the override floors ship in the artifact.
+
+---
+
+## v0.12.238 — August 2, 2026
+
+### Security — vulnerable axios 0.27.2 was being bundled into every install
+
+- `@polymarket/builder-relayer-client@0.0.10` pins `axios@^0.27.2` (2022-era, 20+ open advisories including high-severity SSRF/CSRF classes). Because tsup bundles all dependencies (`noExternal`), that copy shipped inside `dist/` to every user — npm overrides in a consumer's project can't reach it. Added a root `axios: "$axios"` override so the whole tree dedupes to the current 1.x line; the relayer client's axios usage (`create`/`request`/`isAxiosError`) is 1.x-compatible, and the newer Polymarket SDKs in the same tree were already on 1.x. Verified the 0.27.2 code is gone from the built bundle.
+- **Gotcha for next time:** `package.json` already had an `overrides` block further down (basic-ftp/ws/postcss/esbuild). Adding a second `overrides` key parses as valid JSON but npm silently uses only the last one — merge into the existing block.
+- Remaining known-unfixable transitive: `bigint-buffer` (buffer overflow in `toBigIntLE()`, no patched release exists) via `@blockrun/llm → @solana/spl-token`. It processes our own wallet-balance buffers, not attacker-controlled input; tracked until the Solana ecosystem moves off it.
+
+---
+
+## v0.12.237 — August 2, 2026
+
+### Fixed — huge default `max_tokens` no longer forces free-model fallback
+
+- OpenClaw can send a model's default output ceiling as `max_tokens` (128k on Opus-class models). The low-balance preflight treated that as guaranteed spend, so a paid call to `anthropic/claude-opus-5` could silently fall back to a free model even with $5+ in the wallet. The preflight now caps its assumed output at 4096 tokens via `estimateBalancePreflightAmount()`; the request payload is untouched and x402 still enforces the real server quote.
+- `estimateAmount()` stays exact where worst-case matters: the strict `maxCostPerRun` cap and cached-balance deduction. The free-fallback path now also clears the stale paid estimate, so a request that fell back to free no longer deducts a paid-model estimate from the cached balance.
+- Thanks to @0xCheetah1 for the fix and regression suite (#217).
+
+---
+
+## v0.12.236 — August 2, 2026
+
+### Fixed — `vision` missing on MiniMax M3
+
+- `minimax/minimax-m3` was registered without `vision`, so `filterByVision()` dropped it from the candidate pool whenever a request carried an `image_url` content part. blockrun's catalog lists M3 as chat+reasoning+coding with no vision category, but that is the same upstream under-claim class as `claude-haiku-4.5`/`claude-sonnet-4.6` (see v0.12.235): a live gateway probe on 2026-08-02 sent a two-color image to M3 and it described both colors and their positions correctly. `minimax-m2.7` is text-only upstream and stays without the flag; a regression test pins both. (#226)
+
+### Notes
+
+- Rejected in review, not merged: a proposed switch of the music default to `minimax/music-3.0` (#227). blockrun's gateway registers only `minimax/music-2.5+` and rejects unknown audio model ids with `400`, so the new default would have failed every music request. The mock-upstream e2e suite cannot catch invalid gateway ids — it accepts any model string.
+
+---
+
+## v0.12.235 — July 25, 2026
+
+Fixes capability-flag drift found by auditing all 88 shared entries against blockrun's `categories` array. What began as a single missing `vision` on `gpt-5.4-pro` turned out to be 16 mismatches; 9 are corrected here, 7 are deliberate and now pinned by tests.
+
+### Fixed — `vision` missing on the max-compute Pro tiers
+
+- `openai/gpt-5.2-pro` and `openai/gpt-5.4-pro` were registered without `vision`, though blockrun lists it on both. `vision` gates `filterByVision()`, so image requests were dropping both models from the candidate pool for no reason — a silent capability under-claim, not a routing preference.
+
+### Fixed — `reasoning` missing on seven thinking-capable models
+
+- `google/gemini-3-flash-preview`, `free/nemotron-nano-9b-v2`, `free/nemotron-nano-12b-v2-vl`, `zai/glm-5`, `zai/glm-5.1`, `zai/glm-5.2`, `zai/glm-5-turbo`.
+- The flag enrolls an id in `REASONING_MODEL_IDS` (`proxy.ts`), raising its per-model timeout from 60s to 180s. These models genuinely think before first token, so the 60s ceiling was cutting them off early on cold start. None of the seven is a tier primary, so the longer stall is confined to fallback paths that only run after a primary already failed.
+
+### Kept — `vision` on two Claude models blockrun under-claims
+
+- blockrun lists `claude-haiku-4.5` as chat+coding and `claude-sonnet-4.6` as chat+coding+reasoning; neither carries `vision`. That is an **upstream catalog bug, not a ClawRouter over-claim** — a live gateway probe sent an image to `claude-haiku-4.5` and it read the image correctly.
+- Dropping the flag to "match" the source of truth would have broken image routing to the premium REASONING primary and both agentic primaries. The source-of-truth rule governs pricing, ids and aliases; it is not a mandate to copy an upstream data error into a working-feature regression. Worth fixing in blockrun's catalog.
+
+### Notes
+
+- Also confirmed the deployed `/api/v1/models` response lags blockrun's repo on `categories` — audit against the repo, not the live endpoint.
+- Three remaining `reasoning` gaps (`openai/gpt-5.3-codex`, `google/gemini-3.1-flash-lite`, `free/gpt-oss-120b`) are **intentionally left alone**: all three are tier primaries, so the flag would triple the failover stall on default routing paths. Changing them is a latency decision, not a data fix.
+- `xai/grok-4.20-*` are hidden upstream and left untouched.
+- A new `capability flags vs blockrun's catalog` suite pins the resolved set so this cannot drift silently again.
+
+---
+
+## v0.12.234 — July 25, 2026
+
+Closes two catalog gaps found by diffing the live gateway against `BLOCKRUN_MODELS` during the Opus 5 sync — both models were already live upstream and billable, but absent from the registry, so they carried no local pricing and never appeared in the picker.
+
+### Added — GPT-5.5 Pro
+
+- **`openai/gpt-5.5-pro`**: max-compute tier of the 5.5 family. $30/$180 per 1M, **1.05M context**, 128K max output, reasoning + vision. Mirrors the `gpt-5.4-pro` shape and joins it in the picker.
+- Pin: **`gpt-5.5-pro`**. Deliberately **not** flagged `agentic` (same as `gpt-5.4-pro`) — max-compute latency makes it a poor multi-step autonomous pick, and the flag would pull it into agentic tier selection.
+- Upstream also applies OpenAI's long-context tier (2x input / 1.5x output above 272K prompt tokens), which this registry cannot express. As with grok, that skews `logUsage` only — the charge is server-dictated via 402.
+
+### Added — ChatGPT Instant (`chat-latest`)
+
+- **`openai/chat-latest`**: ChatGPT's default model, tuned for speed and concision. $5/$30 per 1M, 128K context, chat + vision. Pins: **`chat-latest`**, **`chatgpt`**.
+- The id is intentionally version-less. Upstream exposes ChatGPT's default _only_ as the rolling `chat-latest` alias, so pinning it means "whatever ChatGPT's default is today", not a fixed snapshot — the display name tracks the current one and needs refreshing whenever OpenAI rolls it.
+- **Not** added to the picker: a rolling alias is a pin-on-purpose model, not a curated default. Same treatment as `sonnet-4.5` and `opus-4.6` — resolvable, just not featured.
+- Registered with neither `reasoning` nor `agentic`, matching its upstream categories. Claiming reasoning would mis-route it into the REASONING tier and silently raise its per-model timeout from 60s to 180s.
+
+`toolCalling: true` is **live-verified on both** — gateway probes returned structured `tool_calls` arrays (`get_weather` + valid JSON args, `finish_reason: "tool_calls"`), no textual leak.
+
+Routing tiers are untouched: neither model is benchmarked, and a $30/$180 model does not belong in a fallback chain reached by an automatic tier decision.
+
+---
+
+## v0.12.233 — July 24, 2026
+
+Syncs **Claude Opus 5**, which Anthropic shipped and blockrun added on launch day (blockrun `src/lib/models.ts`, [#283](https://github.com/blockrunai/blockrun/pull/283)).
+
+### Added — Claude Opus 5 (Anthropic flagship)
+
+- **`anthropic/claude-opus-5`** registered in `BLOCKRUN_MODELS`: **$5/$25** per 1M, **1M context**, 128K max output, reasoning + vision + agentic tool use. Anthropic bills the 1M window at standard rates, so there are no long-context tier fields to model. Verified against both source-of-truth planes — the live gateway (`GET /api/v1/models`) and blockrun's registry, which lists it in the featured array with `fallbackModel: anthropic/claude-opus-4.8`.
+- Added to `top-models.json` at rank 2 (picker + default-model allowlist), the README premium pricing table, and the SKILL catalog line.
+- Inserted at the head of the in-family Opus fallback chain in **four** routing tiers — premium COMPLEX + REASONING, agentic COMPLEX + REASONING. Cost-neutral, so no tier primary moved: premium COMPLEX stays on `claude-fable-5`, and the `auto`/`eco`/`free` profiles are untouched.
+- `clawrouter doctor opus` now runs on Opus 5 (`DOCTOR_MODELS` in `src/doctor.ts`), same `~$0.01` estimate.
+
+### Changed — bare `opus` alias promoted to Opus 5
+
+- **`opus`, `anthropic/opus`, and `blockrun/opus` now resolve to `anthropic/claude-opus-5`** (previously 4.8). New explicit pins `opus-5` / `opus-5.0` / `opus-5-0` / `anthropic/claude-opus-5-0`.
+- The generic-alias rule is "only move it with the cost tradeoff argued explicitly" — here the tradeoff is **zero**. Opus 5 is $5/$25 with a 1M/128K envelope, identical to 4.8 on every axis that can bill or truncate a caller, so no wallet with a per-call cap changes behavior. blockrun made the same call upstream, repointing its `clawrouter-premium` redirect from 4.8 to Opus 5 on launch day; leaving `opus` on 4.8 would have made the proxy disagree with the gateway it fronts. Contrast `kimi`, deliberately left on K2.7 in v0.12.229 because K3 is ~5x the price.
+- **Every 4.x pin stays routable** — `opus-4.8`, `opus-4.7`, `opus-4.6`, `opus-4.5` and their `anthropic/claude-opus-4-N` forms are unchanged, as are the generation-generic `opus-4` / `anthropic/claude-opus-4` (they name the 4-series, not "newest"). Pinned by `src/models.test.ts`.
+- `selector.ts` savings baseline stays on `claude-opus-4.7` — pricing-identical, so no change to the savings math.
+
+### Fixed — stale premium COMPLEX primary in the docs
+
+- `README.md` and `docs/routing-profiles.md` both still listed the premium COMPLEX primary as `claude-opus-4.8`; it has been `claude-fable-5` ($10/$50) since v0.12.221. Corrected in both.
+
+---
+
+## v0.12.232 — July 20, 2026
+
+Fixes a cost-control hole: requests using OpenAI's current `max_completion_tokens` field were priced as if they had asked for nothing.
+
+### Fixed — `max_completion_tokens` was never read
+
+- OpenAI deprecated `max_tokens` in favour of `max_completion_tokens`, but ClawRouter only ever read the legacy field. Every request from a client on the modern field was sized at the 4096 default no matter how much output it actually requested — the string `max_completion_tokens` did not appear anywhere in `src/`.
+- That number is not cosmetic. It feeds the routing decision, `estimateAmount` (balance pre-check), **the strict-mode `maxCostPerRun` cap**, `chargedOutputTokens` in `logUsage`, and the pre-auth reuse check. A request asking for 65536 output tokens was priced at 1/16th of its real cost and **walked straight through a cost cap the user had set** — reproduced in `src/proxy.max-tokens-cap.test.ts`, which fails with HTTP 200 before the fix and 429 after.
+- The same gap sat in `src/payment-preauth.ts`, where it sized the request at **0** tokens: a payment authorization cached for a tiny request could be reused to pay for a much larger one.
+- Both now share `resolveMaxTokens()` (new `src/max-tokens.ts`, kept separate to avoid a `proxy` ↔ `payment-preauth` import cycle). It reads either field, ignores values that cannot be a token budget (`NaN`, `Infinity`, negatives, non-numbers — any of which would silently disable the cap comparison), and when a client sends both takes the **larger**: over-estimating only makes the pre-check stricter, under-estimating defeats it.
+- Affects all 55+ models; the exposure scaled with output price, so `moonshot/kimi-k3` ($15/M out) was the worst case.
+
+---
+
+## v0.12.231 — July 20, 2026
+
+Syncs **Qwen3.7 Max**, which blockrun added and endpoint-probed on 2026-07-20 (blockrun `src/lib/models.ts`). Thanks **[@KillerQueen-Z](https://github.com/KillerQueen-Z)** ([#215](https://github.com/BlockRunAI/ClawRouter/pull/215)).
+
+### Added — Qwen3.7 Max (Alibaba flagship)
+
+- **`qwen/qwen3.7-max`** registered in `BLOCKRUN_MODELS`: Alibaba's Max tier resold through blockrun's OpenRouter credit pool, **1M context**, 65K max output, reasoning + agentic tool use. Priced at COGS $1.475/$4.425 per 1M (users pay ~$1.55/$4.65 after blockrun's 5% margin). Added to `top-models.json` (picker + allowlist), the README mid-range table, and the SKILL catalog line.
+- Explicit pins **`qwen3.7-max`**, **`qwen-3.7-max`**, and **`qwen3-7-max`** — both punctuation conventions, matching the `sonnet-4.6` / `sonnet-4-6` pattern.
+- `reasoning: true` also enrolls the id in `REASONING_MODEL_IDS`, raising its per-model timeout from 60s to 180s. Noted inline so the longer stall on a hung upstream isn't a surprise.
+- **`toolCalling: true` is live-verified, not assumed.** An end-to-end request through the gateway returned a structured `tool_calls` array (`get_weather` + valid JSON arguments, `finish_reason: "tool_calls"`) — no textual leak of the kind Kimi K3 ([#213](https://github.com/BlockRunAI/ClawRouter/issues/213)), Gemini ([#189](https://github.com/BlockRunAI/ClawRouter/issues/189)) and GPT ([#193](https://github.com/BlockRunAI/ClawRouter/issues/193)) produce. Streaming, all three pins, and the unbound bare `qwen` were verified against the live gateway in the same pass.
+
+### Unchanged — by design
+
+- **Bare `qwen` stays unbound.** Every other `qwen*` shorthand resolves to a FREE model (`qwen-coder`, `qwen-thinking`, `qwen3-next`, `qwen3.5-122b`), so binding the shortest name to a $1.475/$4.425 flagship would silently bill callers who typed it expecting the free tier. Same rule that keeps generic `kimi` on K2.7 — address the flagship explicitly. (`grok` was promoted to 4.5, but only with the cost tradeoff argued on the record; there's no such case for qwen yet.) A regression test pins this.
+- **Routing tiers untouched.** No benchmarks yet to justify promoting a $4.425/M-out model into the cheap coding fallbacks.
+
+---
+
+## v0.12.230 — July 18, 2026
+
+Fixes **[#213](https://github.com/BlockRunAI/ClawRouter/issues/213)** — Kimi K3 tool calls leaking into OpenClaw as plain assistant text.
+
+### Fixed — tool-aware recovery of nameless argument blobs (Kimi K3)
+
+- ClawRouter already synthesizes structured `tool_calls` from four textual leak shapes (OpenClaw XML, Anthropic `<invoke>`, Gemini transcript, GPT named-JSON). Each needs the tool **name** inside the text. Kimi K3 instead emits the tool's **arguments** as a bare JSON object with no `name`/`type` field — the name is only in the preceding prose (`Let's do web_search.\n{...}`) or absent entirely (`{"path":...,"action":"read"}`, `{"cmd":[...],"timeout":...}`) — so none of them fired and the JSON leaked to the chat channel.
+- `extractTextualToolCalls(content, { tools })` now takes the request's `tools` schema and, as a final pass, resolves a nameless blob to a declared tool by: (a) a tool name mentioned in the preceding prose, or (b) a **unique** parameter-signature match (every blob key is a declared param — with `cmd`↔`command` aliasing for the terminal tool — and all required params present). `proxy.ts` passes the request tools at both the streaming and non-streaming recovery sites.
+- **Conservative by construction** — the new pass never fires unless the request actually declared tools, and never on an ambiguous/zero signature match, so a legitimate JSON answer is never hijacked into a tool call. Backward-compatible: callers that pass no tools behave exactly as before.
+
+---
+
+## v0.12.229 — July 17, 2026
+
+Syncs **Kimi K3**, which blockrun added and live-probed on 2026-07-17 (blockrun `src/lib/models.ts`).
+
+### Added — Kimi K3 (Moonshot flagship)
+
+- **`moonshot/kimi-k3`** registered in `BLOCKRUN_MODELS`: 2.8T-param open MoE, **1M context**, image + text input, returns `reasoning_content`. Priced at COGS $3.00/$15.00 per 1M (users pay ~$3.15/$15.75 after blockrun's 5% margin). Added to `top-models.json` (picker + allowlist), replacing the now-hidden `moonshot/kimi-k2.7`, and to the README model table + SKILL catalog line.
+- New explicit pin **`kimi-k3` → `moonshot/kimi-k3`**.
+
+### Unchanged — by design
+
+- **Bare `kimi` / `moonshot` / `kimi-k2` aliases stay on K2.7** ($0.95/$4.00). K3 is ~5x the price, so repointing the generic alias would silently ~5x every generic-`kimi` quote and break per-call-cap wallets — mirrors blockrun's own alias decision (and the grok-4.5 precedent). Address the flagship explicitly.
+- **Routing tiers still primary on K2.7.** K3 is not wired into any tier primary or fallback: at $3/$15 a failover in the cheap Kimi coding tiers would spike cost, and promotion needs benchmarks we don't have yet.
+- K2.7 registry entry + pins remain routable (blockrun hid it, didn't retire it).
+
+---
+
+## v0.12.228 — July 17, 2026
+
+Catches up with blockrun's **2026-07-17 live free-model re-probe** (blockrun PR #257, landed hours before v0.12.227 was cut against the older 07-11 map) and the **flat $0.002/tx settlement fee** introduced upstream on 2026-07-14.
+
+### Changed — free tier follows the 07-17 re-probe
+
+- **`free/deepseek-v4-flash` recovered** (3.2s on both probe passes) — un-hidden upstream and back in the advertised free 8. Added to `top-models.json` (picker + allowlist), the eco SIMPLE fallback chain, the `FREE_MODELS` auto-pick cascade, and the README/SKILL free lists. At 1M context it's the largest-context free model.
+- **`free/qwen3-next-80b-a3b-instruct` died** (">60s / DEGRADED", both passes) — dropped from the picker and docs. The registry entry and explicit pins (`qwen3-next`, `qwen3-next-80b`) stay routable; the gateway redirects them to `gpt-oss-120b`.
+- **`FREE_MODELS` auto-pick cascade pruned**: `free/qwen3.5-122b-a10b`, `free/qwen3-next-80b-a3b-instruct`, and `free/llama-4-maverick` removed — all three are hidden + server-redirected to `gpt-oss-120b`, so keeping them in the cascade would silently serve gpt-oss to users who had `/exclude`d it. Cascade is now the two gpt-oss defaults + the live 8.
+
+### Changed — aliases mirror blockrun's current redirect map
+
+- Dead-model redirect targets moved off dead models: everything that pointed at `free/llama-4-maverick` (itself dead now) or diverged from the server map is re-aimed — `nemotron-ultra`/`-253b`/`-super`/`-49b`/`-120b`, `llama-free`, `devstral-2-123b` → `free/gpt-oss-120b` (the server's universal live target); `mistral-free` → `free/mistral-large-3-675b`; `mistral-small` → `free/mistral-nemotron`; bare `nemotron` → `free/nemotron-3-nano-omni-30b-a3b-reasoning` (strongest live Nemotron); `qwen-thinking` → `free/gpt-oss-120b` (no live free Qwen remains).
+- `nvidia/mistral-small-4-119b`'s local redirect is **removed** — it recovered in the re-probe and blockrun dropped its server redirect, so pinned callers reach the real model again. Same for the two hidden-but-routable nemotron supers: pins now pass through instead of being rewritten to a dead model.
+- `nvidia/glm-4.7` now pins to `free/glm-4.7` (gateway redirects) instead of being locally rewritten to seed-oss-36b.
+
+### Changed — pricing mirrors the upstream $0.002/tx settlement fee
+
+- blockrun now adds a flat **$0.002 per-transaction fee on every paid product** (covers gas; included in the 402 quote). `estimateAmount()` mirrors it so balance pre-checks and usage logs track the real charge; free models never pay it. Payments themselves were always server-quoted — this only fixes the local estimate.
+- README pricing intro updated: headline switches from "starting at $0.0002/request" (no longer true with the fee) to the free tier, and the fee is documented next to the per-request cost note.
+
+---
+
+## v0.12.227 — July 17, 2026
+
+**The picker and every user-facing surface now match the advertised blockrun.ai catalog** (verified against the live `/v1/models` on 2026-07-17, mirroring the same alignment shipped in hermes-plugin-clawrouter 0.3.10).
+
+### Changed — top-models picker aligned with the advertised catalog
+
+- `src/top-models.json` goes 47 → 44 entries. Removed the 7 ids no longer advertised by the gateway: `xai/grok-4-0709`, `xai/grok-4-1-fast-reasoning`, `xai/grok-3`, `free/gpt-oss-120b`, `free/gpt-oss-20b`, `free/qwen3.5-122b-a10b`, `free/llama-4-maverick`. Added the 4 newly advertised free models: `free/mistral-nemotron`, `free/step-3.7-flash`, `free/nemotron-nano-9b-v2`, `free/nemotron-nano-12b-v2-vl` — the free block now equals the live 8-model NVIDIA tier exactly.
+- Router internals are untouched on purpose: the removed ids stay hidden-but-routable at the gateway (verified against blockrun source — catalog `available:true, hidden:true`, or MODEL_REDIRECTS to a successor), so existing fallback chains and pinned users keep working. This only changes what pickers advertise. The allowlist sync in `index.ts`/`update.sh` prunes the stale `blockrun/*` keys from users' configs on next start.
+- `top-models.test.ts` sentinels re-pinned (`grok-4.5`, `claude-fable-5`, `free/step-3.7-flash` in; retired ids asserted out).
+
+### Fixed — image aliases pointed at models the gateway can no longer serve
+
+- `dalle`/`dall-e`/`dall-e-3` aliases (models.ts + `/cr-imagegen`) targeted `openai/dall-e-3`, which the gateway 400s ("Delisted 2026-05-25: OpenAI removed dall-e-3 from the API"). They now route to the successor `openai/gpt-image-2`. `flux`/`flux-pro` targeted `black-forest/flux-1.1-pro`, which has no gateway entry at all — removed.
+- New aliases for the current image catalog: `gpt-image-2`, `seedream` (→ `bytedance/seedream-5-pro`), and `/cr-imagegen` parity aliases for `grok-imagine`/`grok-imagine-pro`/`cogview`. IMAGE_PRICING drops the two dead entries and adds `bytedance/seedream-5-pro` ($0.045 base / $0.09 at 2K-class, matching blockrun's IMAGE_MODELS). The images usage-log fallback model is now `google/nano-banana` (the real `/cr-imagegen` default) instead of dead dall-e-3.
+
+### Changed — README + skills refreshed to the current catalog
+
+- README: free-tier references switch from retired `nvidia/gpt-oss-120b` to `free/mistral-large-3-675b` (the new default free model); the free pricing block lists the live 8; grok-4.5 gets a pricing row ($2.50/$9.00, 500K); rows for grok-4-0709/grok-4-1-fast-reasoning/grok-3/grok-3-mini removed; kimi-k2.6 → kimi-k2.7; routing-tier examples use advertised models only; image table now shows gpt-image-2 + seedream; `~38` → `~44` model-count mentions.
+- `skills/clawrouter/SKILL.md`: the "7 free" vs "8 free" contradiction is fixed (it's 8), Available Models adds claude-fable-5 + grok-4.5 and drops retired ids, image tool row updated.
+- `skills/imagegen/SKILL.md`: dalle/flux rows replaced with gpt-image-2 + seedream (with the legacy-alias note), triggers and size guidance updated.
+
+---
+
+## v0.12.226 — July 14, 2026
+
+Salvages the two pieces of #206 that were still worth having, with thanks to @0xCheetah1. The rest of that PR either shipped in v0.12.221–223 or was superseded by v0.12.225; it's closed with a full accounting.
+
+### Fixed — `clawrouter setup` couldn't find OpenClaw under a stripped PATH
+
+- Detection was `command -v openclaw` and nothing else. npm runs lifecycle scripts with a stripped PATH, so a perfectly working global install is invisible there and setup would exit telling the user to install what they already have. Verified: under `env -i PATH=/usr/bin:/bin`, `command -v openclaw` finds nothing while the install is right there.
+- Now falls back through `npm_config_prefix`, `npm root -g`, `~/.npm-global/bin`, `~/.local/bin`, and `/usr/local/bin`.
+
+### Added — bare Gemini Pro shorthands
+
+- `gemini-pro`, `gemini-3-pro`, and `gemini-3.1-pro` resolve to `google/gemini-3.1-pro`. `gemini-3-pro` was never a real id — the 3-series Pro shipped as `-preview`, then 3.1 — but callers reach for it anyway and got a 400.
+- These are bare aliases, so they're advertised as their own `/v1/models` rows while the canonical `google/gemini-3.1-pro` catalog entry (with its real pricing) stays unshadowed. Pinned by a test, since a slash-prefixed key would have shadowed it instead. `/v1/models` goes 205 → 208; no aliases lost.
+
+---
+
+## v0.12.225 — July 14, 2026
+
+**The circular dependency is gone at the source**, plus `grok` now tracks the 4.5 flagship.
+
+### Fixed — `@blockrun/llm` was pinned to the version that caused the v0.12.220 disaster
+
+- We depended on `@blockrun/llm: ^2.11.0`, which resolves to **2.13.0 — and 2.13.0 lists `@blockrun/clawrouter` as a dependency.** That back-dependency is the root of the whole v0.12.220 collapse: it's what let `noExternal` inline a stale published copy of ourselves, bloat dist to 10.2MB, and collide the tsup banner into a load-time `SyntaxError`.
+- **`@blockrun/llm` 3.x demotes it to a peer** — `3.6.1`'s `dependencies` are just `bs58` and `viem`; `@blockrun/clawrouter` moved to `peerDependencies`. It is _not_ gone, but npm will not install a package into itself, so our own `node_modules` no longer receives a stale published copy at all — `npm ls @blockrun/clawrouter` reports `(empty)` and `node_modules/@blockrun/` contains only `llm`. That removes the hazard at its source for our build, rather than aliasing around it. Verified `BlockrunClient` and `createPaymentPayload` (our only imports, in `src/polymarket/fund.ts`) are unchanged across the 2→3 major.
+- **Install size is unchanged (~247MB)** and this release does not claim otherwise. `@blockrun/llm` declares `@solana/spl-token`, `@solana/web3.js`, and `@anthropic-ai/sdk` as `optionalDependencies`, which npm installs by default; `spl-token`'s `@solana/codecs@2.0.0-rc.1` chain is what drags in `typescript` (23MB). `--omit=optional` takes the tree to 202MB and the router still works, but the honest fix is upstream.
+- The tsup alias and the smoke check's stale-copy assertion **stay** — they're now belt-and-braces that re-arm automatically if anything ever reintroduces the cycle.
+
+### Changed — `grok` now resolves to Grok 4.5 (deliberate cost increase)
+
+- `grok` moves from `xai/grok-4.3` to `xai/grok-4.5`, xAI's current flagship. **This costs more**: $2.50/$9.00 vs $1.50/$4.00, and upstream re-prices the whole request at $5/$18 once prompt tokens reach 200K. What it buys is a direct-xAI SKU — 4.3 is OpenRouter-only and silently drops Live Search while still charging for it.
+- Pin `grok-4.3` to opt out. Explicit `grok-4.5` / `grok-4-5` pins are unchanged. Now covered by a test so the tradeoff can't be flipped silently.
+
+### Also in this release
+
+- `scripts/update.sh` / `scripts/reinstall.sh` no longer wipe other plugins from `plugins.allow` (#207, thanks @0xCheetah1). The old cleanup kept a hardcoded list of bundled plugin IDs and **silently deleted every bare plugin ID not on it** — local/custom plugins, and any bundled plugin added to OpenClaw after that list was written. Now it removes only ClawRouter's own entries.
+
+---
+
+## v0.12.224 — July 14, 2026
+
+**Two thirds of what we published was sourcemaps.** No behaviour change.
+
+### Changed — stop shipping sourcemaps to npm
+
+- The tarball carried `dist/index.js.map` and `dist/cli.js.map` at ~17MB each: **34MB of a 50MB install, 68% of the package**, downloaded by everyone who has ever run `npx @blockrun/clawrouter` or installed anything that depends on us. Excluded via `"!dist/**/*.map"` in package.json `files`. **50.0MB → 16.6MB unpacked** (3.4MB packed).
+- `sourcemap: true` stays in `tsup.config.ts` — maps are still generated for local debugging and CI, they just no longer ship. The bundles keep their `//# sourceMappingURL=` comment; a missing map is silently ignored at runtime. Verified the published tarball runs both normally and under `node --enable-source-maps`.
+- Context: this only became visible while auditing why `@blockrun/mcp` was paying ~50MB (≈15% of its install tree) for a router it never called. See `@blockrun/llm@3.6.0`, which stops installing us for consumers that don't route.
+
+---
+
+## v0.12.223 — July 14, 2026
+
+**Hotfix again: v0.12.222 could not be installed as an OpenClaw plugin.** Plus a repair for the model list that kept showing retired models.
+
+### Fixed — v0.12.222 was uninstallable as a plugin (P0, self-inflicted)
+
+- `openclaw plugins install @blockrun/clawrouter` failed outright on v0.12.222:
+  `Plugin "clawrouter" installation blocked: dangerous code patterns detected: Shell command execution detected (child_process) (scripts/smoke-dist.mjs:65)`.
+  The dist smoke check added in v0.12.221 is a **build-time** gate, but `scripts` is in package.json `files`, so it shipped — and OpenClaw scans a plugin's loose script files and blocks the whole install over a `child_process` import. Excluded via `"!scripts/smoke-dist.mjs"`. (`dist/` is exempt from that scan; the proxy legitimately spawns processes.)
+- The smoke check now asserts on the **real `npm pack` file list** that no shipped `scripts/*.mjs` imports `child_process`, so this cannot recur. Verified it fails the build when the exclusion is removed.
+
+### Fixed — the picker kept listing retired models
+
+- OpenClaw keeps a **third** model-list plane at `~/.openclaw/agents/<agent>/agent/models.json`, separate from the two in `openclaw.json` (`models.providers.blockrun.models` = picker, `agents.defaults.models` = allowlist). Nothing ever synced it, so it rotted independently and kept serving long-dead models.
+- Measured on a real machine: after `clawrouter setup` had already repaired `openclaw.json` to the correct 47, this cache still held **155 entries — 127 retired** (`gpt-5.2`, `gpt-4.1`, `o1`, `gpt-5-mini` …), duplicate `free` and `moonshot/kimi-k2.5` rows, and **none** of the current flagships. That is the stale/duplicate rows people were seeing.
+- `setup` (and gateway start) now repairs it: 155 → 47, correct order, dupes gone. It only touches an existing `blockrun` provider, never creates one, and preserves other providers plus `baseUrl`/`api`/`apiKey`. Ordering is compared positionally, since order is what the picker renders.
+- `setup`'s closing hint said "you should see ~38 BlockRun models" — hardcoded and wrong since v0.12.184. Now derived from the actual list.
+
+### Known issue — OpenClaw rejects the repair through its own writer
+
+- `openclaw plugins install` still ends in `Config write rejected: openclaw.json (size-drop:76642->25200)`. OpenClaw guards against large config shrinks, and pruning 155 stale models → 47 _is_ a large shrink, so it rejects the write and rolls the install back — restoring the stale list. `clawrouter setup` is unaffected (it writes directly and is the supported repair path), and the plugin itself registers fine (provider, 26 tools, all commands).
+- This is OpenClaw-side, so ClawRouter does not work around it: reaching into OpenClaw's internals to force it is what we deliberately are not doing. **Run `clawrouter setup` to repair the list.**
+
+---
+
+## v0.12.222 — July 14, 2026
+
+**Hotfix: v0.12.220 was unusable and v0.12.221 was only half-fixed — upgrade to this one.** Plus Claude Fable 5 and Grok 4.5.
+
+> v0.12.221 (published earlier the same day, superseded within the hour) renamed the banner identifier and added the models, which un-bricked the CLI. But it treated the symptom: it still inlined a stale copy of ClawRouter into its own bundle (10.2MB). v0.12.222 fixes the actual cause. If you are on v0.12.221 it works — but upgrade anyway.
+
+### Fixed — v0.12.220 shipped a dead CLI (P0)
+
+- Every entrypoint in v0.12.220 threw `SyntaxError: Identifier '__cjs_createRequire' has already been declared` at load time. `clawrouter` would not start, `import "@blockrun/clawrouter"` would not load, and `@blockrun/mcp` — which reaches us transitively through `@blockrun/llm` — could not boot either (thanks @0xCheetah1, spotted in #206; independently reported against `@blockrun/mcp`).
+- **Root cause — we bundled a stale copy of ourselves.** We and `@blockrun/llm` depend on each other, and `noExternal: [/.*/]` inlines it. v0.12.220's Polymarket port added `src/polymarket/fund.ts`, our first-ever `import` of `@blockrun/llm` — so its `import { route, ... } from "@blockrun/clawrouter"` resolved through `node_modules` to the **last published build of this package**, and esbuild inlined that entire stale bundle beside the one it was building. The old copy carried its own `__cjs_createRequire`, and esbuild cannot rename around a banner it never sees (banners are raw text injected _after_ bundling) — hence the collision. Fixed by aliasing that back-import to our own source so it dedupes into the graph: **dist drops 9.8MB → 7.4MB**, one ClawRouter again instead of two shadowing each other with separate module state. Left unfixed, each release would have inlined the previous one — ~20MB next publish.
+- Also renamed the banner identifier to `__blockrun_createRequire`, so no bundled dependency can ever collide with it again.
+- **Why CI published it anyway**: the release pipeline runs `build && typecheck && test`, and none of those ever load `dist/`. Added `scripts/smoke-dist.mjs`, wired as `postbuild`: it imports `dist/index.js`, runs `dist/cli.js --version`, and asserts no stale ClawRouter is inlined (a loadable bundle would otherwise hide that). It fails the build (exit 1), so this class of defect can no longer reach npm.
+
+### Added — Claude Fable 5 (relisted upstream)
+
+- `anthropic/claude-fable-5` is back: Anthropic restored the offer on 2026-07-06 after the 2026-06-13 delisting, and BlockRun relisted it. Mythos-class tier above Opus — $10/$50, 1M context, 128K output, always-on thinking.
+- `fable` / `fable-5` / `fable-5.0` / `anthropic/fable` now resolve to the real model again instead of redirecting to `opus-4.8`.
+- Restored as the **premium** COMPLEX primary, reverting the forced 2026-06-13 downgrade (`opus-4.8` moves back to first fallback). The `auto` profile is untouched — its COMPLEX primary stays `google/gemini-3.1-pro`, so default routing costs nothing extra.
+
+### Added — Grok 4.5
+
+- `xai/grok-4.5`, xAI's flagship (added upstream 2026-07-13). $2.50/$9.00 base, 500K context, vision, Live Search capable. Picker-visible; added to the premium COMPLEX fallback chain as a 503-resistant flagship.
+- Reachable via explicit `grok-4.5` / `grok-4-5` pins. The generic `grok` shorthand **stays on `grok-4.3`** — 4.5 costs ~1.7x more and re-prices the entire request at 2x above 200K prompt tokens, so promotion waits on benchmarks.
+- Local pricing records the base rate only; the registry has no field for the long-context tier. This skews `logUsage` telemetry on >200K calls, never the charge — payments are server-dictated via 402.
+
+### Verified
+
+- Both models exercised end-to-end through the built proxy with real x402 payments settled on Base, including alias resolution (`fable` → `anthropic/claude-fable-5`, `grok-4.5` → `xai/grok-4.5`).
+- `/v1/models` advertises 205 entries (was 201): +2 catalog, +2 aliases, with all 118 friendly aliases intact.
+
+---
+
 ## v0.12.220 — July 10, 2026
 
 Direct Polymarket **betting** — ported from blockrun-mcp v0.30.0's `blockrun_polymarket` tool. ClawRouter could already read prediction-market odds (`blockrun_predexon_*`); now it can place, manage, and redeem **real-money** bets on Polymarket (CLOB V2, Polygon), signed locally by the same wallet that pays for LLM calls.

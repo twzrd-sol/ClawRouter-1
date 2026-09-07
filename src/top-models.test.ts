@@ -8,7 +8,31 @@ describe("TOP_MODELS", () => {
     expect(TOP_MODELS).toEqual(topModelsJson);
     expect(new Set(TOP_MODELS).size).toBe(TOP_MODELS.length);
     expect(TOP_MODELS).toContain("openai/gpt-5.5");
-    expect(TOP_MODELS).toContain("xai/grok-4-0709");
+    expect(TOP_MODELS).toContain("xai/grok-4.5");
+    expect(TOP_MODELS).toContain("anthropic/claude-fable-5");
     expect(TOP_MODELS).toContain("deepseek/deepseek-reasoner");
+    expect(TOP_MODELS).toContain("free/nemotron-3.5-lightning");
+    // Retired from the advertised catalog 2026-07 — must not reappear.
+    expect(TOP_MODELS).not.toContain("xai/grok-4-0709");
+    expect(TOP_MODELS).not.toContain("xai/grok-3");
+    expect(TOP_MODELS).not.toContain("free/gpt-oss-120b");
+    // Died in the 2026-07-17 re-probe (hidden + redirected upstream).
+    expect(TOP_MODELS).not.toContain("free/qwen3-next-80b-a3b-instruct");
+    // HTTP 410 Gone at NVIDIA in blockrun's 2026-07-28 re-probe (baa967b) —
+    // hidden + redirected to gpt-oss-120b upstream; must not reappear.
+    expect(TOP_MODELS).not.toContain("free/mistral-large-3-675b");
+    // HTTP 410 Gone at NVIDIA 2026-08-12 (blockrun #367) — the last free
+    // DeepSeek; hidden + redirected to gpt-oss-120b upstream; must not reappear.
+    expect(TOP_MODELS).not.toContain("free/deepseek-v4-flash");
+    // 2026-08-30 (blockrun #448): NVIDIA retired FOUR of the five visible free
+    // models in one sweep. The first three published 410 Gone; mistral-nemotron
+    // went the quiet way — still listed, >150s and zero bytes. All four are
+    // hidden and server-redirected upstream, which is precisely why a stale
+    // picker entry looks healthy: the caller gets an answer, from another model,
+    // and /exclude on the id they can see does nothing.
+    expect(TOP_MODELS).not.toContain("free/step-3.7-flash");
+    expect(TOP_MODELS).not.toContain("free/nemotron-nano-9b-v2");
+    expect(TOP_MODELS).not.toContain("free/nemotron-nano-12b-v2-vl");
+    expect(TOP_MODELS).not.toContain("free/mistral-nemotron");
   });
 });

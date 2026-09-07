@@ -50,5 +50,67 @@ jobs:
       - name: Build
         run: npm run build
 
+      # The unit suite (713 tests) was never wired in here — only the lifecycle
+      # integration test ran, so a failing unit test could merge unnoticed.
+      - name: Unit tests
+        run: npm test
+
+      # Fails when a number in the docs disagrees with brand-numbers.json.
+      # Offline by design: it reads the committed snapshot and never fetches, so
+      # a blockrun.ai deploy in progress cannot fail this repo's CI.
+      - name: Brand numbers
+        run: node scripts/sync-brand-numbers.mjs --check
+
       - name: Integration tests (lifecycle)
         run: npx vitest run --config vitest.integration.config.ts test/integration/lifecycle.test.ts
+
+  # apps/desktop is a separate npm project — the root `npm ci` and `npm test`
+  # above never touch it. Without this job its 47 tests, its typecheck and both
+  # its builds are unrun on every PR, which is how the Desktop app landed in
+  # #313 with no coverage at all: #291 added this job, and the branch that
+  # superseded it did not carry it over.
+  #
+  # Deliberately NOT running `verify:runtime` here. That guard compares the
+  # runtime lockfile to CLAWROUTER_PACKAGE_VERSION, and it is expected to fail
+  # between a release commit and the follow-up relock — npm cannot serve the
+  # version the release commit is publishing. It belongs in `dist`/`dist:release`
+  # (see apps/desktop/scripts/verify-runtime-pin.mjs), where packaging happens
+  # after both. Running it on every push would make each release red.
+  desktop:
+    name: Desktop
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/desktop/package-lock.json
+
+      # The Desktop typecheck reaches into the repo root: manager.ts imports
+      # `../../../../src/solana-key.js` (the Solana derivation shared with the
+      # proxy). TypeScript resolves that file's own imports from ITS directory,
+      # so @noble/hashes and @scure/bip39 must be present in the ROOT
+      # node_modules — declaring them in apps/desktop/package.json does not
+      # satisfy it. Locally this passes only because the root install happens to
+      # be there; in a clean checkout it fails.
+      - name: Install root dependencies
+        run: npm ci
+        working-directory: .
+
+      - run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build

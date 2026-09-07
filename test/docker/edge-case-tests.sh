@@ -115,7 +115,7 @@ test_openclaw_plugin_install() {
     }
 
     # Verify extension installed
-    if [ -f "$HOME/.openclaw/extensions/clawrouter/dist/index.js" ]; then
+    if [ -f "$HOME/.openclaw/extensions/blockrun-clawrouter/dist/index.js" ]; then
         log_pass "OpenClaw extension installed correctly"
     else
         log_fail "Extension dist/index.js missing"
@@ -135,7 +135,7 @@ test_model_alias_resolution() {
         "sonnet:anthropic/claude-sonnet-4.6"
         "deepseek:deepseek/deepseek-chat"
         "gemini:google/gemini-2.5-flash"
-        "free:gpt-oss-120b"
+        "free:free/nemotron-3.5-lightning"
     )
 
     for alias_pair in "${aliases[@]}"; do

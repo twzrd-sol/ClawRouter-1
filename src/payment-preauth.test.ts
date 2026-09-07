@@ -65,17 +65,29 @@ function challenge402(): Response {
  *  exercise the safety-net path. Records whether each call carried payment. */
 function fakeGateway() {
   const calls: Array<{ paid: boolean }> = [];
-  const ctl = { rejectNextPaid: false }; // flip AFTER seeding to reject a pre-auth
+  // `rejectNextPaid` returns a 402 (an underpayment the gateway declined).
+  // `throwNextPaidSend` instead makes the SEND ITSELF reject, after the request
+  // carrying the signed payment has already reached the gateway — a reset or a
+  // socket hang-up on a call the gateway may well have settled.
+  const ctl = { rejectNextPaid: false, throwNextPaidSend: false };
   const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input, init);
     const paid = req.headers.has("payment-signature");
     calls.push({ paid });
     if (paid) {
+      if (ctl.throwNextPaidSend) {
+        ctl.throwNextPaidSend = false;
+        // The gateway HAS the payment; only the response is lost.
+        throw new TypeError("fetch failed: socket hang up");
+      }
       if (ctl.rejectNextPaid) {
         ctl.rejectNextPaid = false;
         return challenge402(); // underpayment rejected
       }
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "payment-response": "settled" },
+      });
     }
     return challenge402();
   });
@@ -88,6 +100,57 @@ function body(maxTokens = 10) {
 }
 
 describe("payment pre-auth — per-request pricing safety", () => {
+  it("notifies once after the normal 402 then accepted paid retry", async () => {
+    const gw = fakeGateway();
+    const onPayment = vi.fn();
+    const pay = createPayFetchWithPreAuth(gw.fn, testClient(), undefined, {
+      estimateAmount: () => "1000",
+      onPayment,
+    });
+
+    await pay(URL, { method: "POST", body: body() });
+
+    expect(onPayment).toHaveBeenCalledOnce();
+    expect(onPayment).toHaveBeenCalledWith({
+      model: "test/model",
+      amount: "1000",
+      network: "eip155:8453",
+    });
+  });
+
+  it("notifies once for an accepted cached pre-auth and never for a rejected one", async () => {
+    const gw = fakeGateway();
+    const onPayment = vi.fn();
+    const pay = createPayFetchWithPreAuth(gw.fn, testClient(), undefined, {
+      estimateAmount: () => "1000",
+      onPayment,
+    });
+
+    await pay(URL, { method: "POST", body: body() });
+    onPayment.mockClear();
+    await pay(URL, { method: "POST", body: body() });
+    expect(onPayment).toHaveBeenCalledOnce();
+
+    onPayment.mockClear();
+    gw.ctl.rejectNextPaid = true;
+    await pay(URL, { method: "POST", body: body() });
+    expect(onPayment).toHaveBeenCalledOnce();
+  });
+
+  it("does not let an observer failure turn a settled response into a retry", async () => {
+    const gw = fakeGateway();
+    const pay = createPayFetchWithPreAuth(gw.fn, testClient(), undefined, {
+      estimateAmount: () => "1000",
+      onPayment: () => {
+        throw new Error("observer failed");
+      },
+    });
+
+    const res = await pay(URL, { method: "POST", body: body() });
+    expect(res.status).toBe(200);
+    expect(gw.calls.map((call) => call.paid)).toEqual([false, true]);
+  });
+
   it("reuses pre-auth when the estimate proves the cache still covers it (no extra 402)", async () => {
     const est = vi.fn(() => "1000"); // every request estimated equal
     const gw = fakeGateway();
@@ -135,6 +198,76 @@ describe("payment pre-auth — per-request pricing safety", () => {
     expect(seq[0]).toBe(true); // pre-auth attempt (got rejected)
     expect(seq).toContain(false); // a CLEAN refetch followed (rejection not reused)
     expect(seq[seq.length - 1]).toBe(true); // then paid correctly
+  });
+
+  it("sizes the request by max_completion_tokens too, so a grown request can't reuse a small pre-auth", async () => {
+    // OpenAI deprecated `max_tokens` for `max_completion_tokens`. Reading only
+    // the legacy field made a 9000-token request look like a 0-token one, so a
+    // pre-auth cached for a tiny request was reused to pay for a large one.
+    const est = vi.fn((_m: string, _len: number, maxTokens: number) =>
+      String(maxTokens * 10 + 100),
+    );
+    const gw = fakeGateway();
+    const pay = createPayFetchWithPreAuth(gw.fn, testClient(), undefined, { estimateAmount: est });
+
+    await pay(URL, { method: "POST", body: body(10) }); // seed cover = 10*10+100 = 200
+    const seeded = gw.calls.length;
+
+    const grown = JSON.stringify({
+      model: "test/model",
+      max_completion_tokens: 9000, // needs 90100 ≫ the cached 200
+      messages: [],
+    });
+    const res = await pay(URL, { method: "POST", body: grown });
+
+    expect(res.status).toBe(200);
+    // The estimator must have SEEN the real budget, not 0.
+    expect(est).toHaveBeenCalledWith(expect.anything(), expect.anything(), 9000);
+    // Too big for the cached authorization → clean unpaid request, then paid retry.
+    expect(gw.calls.slice(seeded).map((c) => c.paid)).toEqual([false, true]);
+  });
+
+  it("never signs a second payment when the pre-auth SEND fails (issue #317)", async () => {
+    // The pre-auth request carries a signed payment. If the send rejects, the
+    // client cannot tell "never arrived" from "arrived, settled, response lost".
+    // Falling through to the clean-402 path signs a SECOND, distinct payment
+    // with a fresh nonce — every replay and dedup guard correctly passes it,
+    // so one user request becomes two USDC charges. Fail closed instead.
+    const est = vi.fn(() => "1000");
+    const gw = fakeGateway();
+    const pay = createPayFetchWithPreAuth(gw.fn, testClient(), undefined, { estimateAmount: est });
+
+    await pay(URL, { method: "POST", body: body() }); // seed the cache
+    gw.calls.length = 0;
+    gw.ctl.throwNextPaidSend = true;
+
+    await expect(pay(URL, { method: "POST", body: body() })).rejects.toThrow(/socket hang up/);
+
+    // Exactly one payment left this process for this request.
+    expect(gw.calls.filter((c) => c.paid).length).toBe(1);
+  });
+
+  it("still falls through when pre-auth fails BEFORE anything is sent", async () => {
+    // Signing failures are unambiguous — no payment went out, so falling
+    // through to the normal 402 flow cannot double-charge. Keep that path.
+    const est = vi.fn(() => "1000");
+    const gw = fakeGateway();
+    const client = testClient();
+    const pay = createPayFetchWithPreAuth(gw.fn, client, undefined, { estimateAmount: est });
+
+    await pay(URL, { method: "POST", body: body() }); // seed the cache
+    gw.calls.length = 0;
+
+    const spy = vi
+      .spyOn(client, "createPaymentPayload")
+      .mockRejectedValueOnce(new Error("signing blew up"));
+
+    const res = await pay(URL, { method: "POST", body: body() });
+    expect(res.status).toBe(200);
+    // Nothing was ever sent with a payment attached before the failure, so the
+    // clean unpaid request + paid retry is correct and charges exactly once.
+    expect(gw.calls.map((c) => c.paid)).toEqual([false, true]);
+    spy.mockRestore();
   });
 
   it("disables pre-auth entirely when no estimator is provided (never underpays)", async () => {

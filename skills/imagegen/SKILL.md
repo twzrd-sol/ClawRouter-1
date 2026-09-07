@@ -7,8 +7,7 @@ triggers:
   - "clawrouter image"
   - "generate image via blockrun"
   - "blockrun ai art"
-  - "blockrun dall-e"
-  - "blockrun flux"
+  - "blockrun seedream"
   - "blockrun nano banana"
   - "blockrun cogview"
   - "blockrun grok imagine"
@@ -56,34 +55,36 @@ Display inline: `![generated image](http://localhost:8402/images/abc123.png)`
 
 ### Model Selection
 
-| Alias              | Full ID                      | Price        | Sizes                           | Best for                                                         |
-| ------------------ | ---------------------------- | ------------ | ------------------------------- | ---------------------------------------------------------------- |
-| `nano-banana`      | `google/nano-banana`         | $0.05        | 1024×1024, 1216×832, 1024×1792  | Default — fast, cheap, good quality                              |
-| `banana-pro`       | `google/nano-banana-pro`     | $0.10–$0.15  | up to 4096×4096                 | High-res, large format                                           |
-| `dalle`            | `openai/dall-e-3`            | $0.04–$0.08  | 1024×1024, 1792×1024, 1024×1792 | Photorealistic, complex scenes                                   |
-| `gpt-image`        | `openai/gpt-image-1`         | $0.02–$0.04  | 1024×1024, 1536×1024, 1024×1536 | Budget option; supports editing                                  |
-| —                  | `openai/gpt-image-2`         | $0.06–$0.12  | 1024×1024, 1536×1024, 1024×1536 | Reasoning-driven, text rendering (slow — proxy polls up to 5min) |
-| `flux`             | `black-forest/flux-1.1-pro`  | $0.04        | 1024×1024, 1216×832, 832×1216   | Artistic styles, fewer restrictions                              |
-| `grok-imagine`     | `xai/grok-imagine-image`     | $0.02        | 1024×1024                       | xAI Grok image style                                             |
-| `grok-imagine-pro` | `xai/grok-imagine-image-pro` | $0.07        | 1024×1024                       | Grok high-quality                                                |
-| `cogview`          | `zai/cogview-4`              | $0.015–$0.02 | 512×512 to 1440×1440            | Cheapest — Zhipu CogView                                         |
+| Alias              | Full ID                      | Price        | Sizes                           | Best for                                                                                                           |
+| ------------------ | ---------------------------- | ------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `nano-banana`      | `google/nano-banana`         | $0.05        | 1024×1024                       | Default — fast, cheap, good quality                                                                                |
+| `banana-2`         | `google/nano-banana-2`       | $0.09        | 1024×1024                       | Gemini 3.1 Flash imagegen — sharper than nano-banana at 1K                                                         |
+| `banana-pro`       | `google/nano-banana-pro`     | $0.10–$0.15  | 1024×1024, 2048×2048, 4096×4096 | High-res, large format                                                                                             |
+| `gpt-image`        | `openai/gpt-image-1`         | $0.02–$0.04  | 1024×1024, 1536×1024, 1024×1536 | Budget option; supports editing                                                                                    |
+| `gpt-image-2`      | `openai/gpt-image-2`         | $0.06–$0.12  | 1024×1024, 1536×1024, 1024×1536 | Photorealistic, reasoning-driven, text rendering (slow — proxy polls up to 5min); legacy `dalle` alias routes here |
+| `seedream`         | `bytedance/seedream-5-pro`   | $0.045–$0.09 | up to 2848×1600 / 2304×1728     | Flagship quality, reference-image support                                                                          |
+| `grok-imagine`     | `xai/grok-imagine-image`     | $0.02        | 1024×1024                       | xAI Grok image style                                                                                               |
+| `grok-imagine-pro` | `xai/grok-imagine-image-pro` | $0.07        | 1024×1024                       | Grok high-quality                                                                                                  |
+| `cogview`          | `zai/cogview-4`              | $0.015–$0.02 | 512×512 to 1440×1440            | Cheapest — Zhipu CogView                                                                                           |
 
 **Choosing a model:**
 
 - Default → `nano-banana`
 - "high res" / "large" → `banana-pro`
-- "photorealistic" / "dall-e" → `dalle`
+- "photorealistic" / complex scenes → `gpt-image-2`
+- "flagship quality" / reference image → `seedream`
 - "budget" / "cheap" → `cogview`
 - "editable" / "inpainting" → `gpt-image` (only edit-capable model)
-- "artistic" / flexible content → `flux`
+- "artistic" / flexible content → `grok-imagine`
 - "grok style" → `grok-imagine` or `grok-imagine-pro`
 
 **Choosing a size:**
 
-- Default: `1024x1024`
-- Portrait: `1024x1792`
-- Landscape: `1792x1024` (dall-e-3) or `1216x832` (nano-banana / flux)
-- High-res: `2048x2048` or `4096x4096` with `banana-pro` only
+- Default: `1024x1024` (the only size every model accepts)
+- Portrait: `1024x1536` (gpt-image / gpt-image-2) or `1728x2304` (seedream)
+- Landscape: `1536x1024` (gpt-image / gpt-image-2), `1344x768` (cogview), or `2048x1024` / `1280x720` (seedream)
+- High-res: `2048x2048` / `4096x4096` with `banana-pro`; `2848x1600` with `seedream`
+- The gateway validates size per model BEFORE payment and rejects unknown ones — do not invent sizes outside each model's list above
 
 ---
 
@@ -124,7 +125,7 @@ Response is identical to generation:
 → POST to `/v1/images/generations`, model `nano-banana`, prompt as given.
 
 **User:** Generate a high-res portrait of a samurai
-→ POST to `/v1/images/generations`, model `banana-pro`, size `1024x1792`.
+→ POST to `/v1/images/generations`, model `seedream`, size `1728x2304`.
 
 **User:** Edit this photo to add a sunset background: https://example.com/portrait.jpg
 → POST to `/v1/images/image2image`, model `gpt-image`, image = the URL, prompt = "add a warm sunset background".
@@ -136,8 +137,8 @@ Response is identical to generation:
 
 ## Notes
 
-- Payment is automatic via x402 — deducted from the user's BlockRun wallet
-- If the call fails with a payment error, tell the user to fund their wallet at [blockrun.ai](https://blockrun.ai)
+- Payment is automatic, and which rail it uses depends on how ClawRouter was started: an x402 USDC micropayment from the user's wallet, or a draw on account credit if a BlockRun API key is configured. Either way the agent does nothing.
+- If the call fails with a payment error, check `GET http://localhost:8402/health` and read `authMode` before telling the user how to fix it: `wallet` → fund the wallet at [blockrun.ai](https://blockrun.ai); `api-key` → top up account credit at [user.blockrun.ai/dashboard/credits](https://user.blockrun.ai/dashboard/credits). Naming the wrong one sends the user to a page that cannot fix their error.
 - Google models may return base64 internally — ClawRouter uploads automatically and returns a hosted URL
-- DALL-E 3 enforces OpenAI content policy; use `flux` or `nano-banana` for more flexibility
-- Image editing is only available with `gpt-image-1`; generation supports all 5 models
+- OpenAI image models enforce OpenAI content policy; use `nano-banana` or `grok-imagine` for more flexibility
+- Image editing is only available with `gpt-image-1`; generation supports all listed models

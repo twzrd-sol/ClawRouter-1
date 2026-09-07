@@ -24,6 +24,9 @@
 import type { x402Client } from "@x402/fetch";
 import { x402HTTPClient } from "@x402/fetch";
 
+import { resolveMaxTokens } from "./max-tokens.js";
+import { SpendPolicyError } from "./spend-control.js";
+
 type PaymentRequired = Parameters<InstanceType<typeof x402Client>["createPaymentPayload"]>[0];
 
 interface CachedEntry {
@@ -44,11 +47,17 @@ const DEFAULT_TTL_MS = 3_600_000; // 1 hour
 
 type FetchFn = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+export type PaymentNotification = { model: string; amount: string; network: string };
+
 export function createPayFetchWithPreAuth(
   baseFetch: FetchFn,
   client: x402Client,
   ttlMs = DEFAULT_TTL_MS,
-  options?: { skipPreAuth?: boolean; estimateAmount?: EstimateFn },
+  options?: {
+    skipPreAuth?: boolean;
+    estimateAmount?: EstimateFn;
+    onPayment?: (info: PaymentNotification) => void;
+  },
 ): FetchFn {
   const httpClient = new x402HTTPClient(client);
   const cache = new Map<string, CachedEntry>();
@@ -74,15 +83,42 @@ export function createPayFetchWithPreAuth(
               : "";
         if (bodyStr) {
           bodyLength = bodyStr.length;
-          const parsed = JSON.parse(bodyStr) as { model?: string; max_tokens?: number };
-          requestModel = parsed.model ?? "";
-          maxTokens = Number(parsed.max_tokens) || 0;
+          const parsed = JSON.parse(bodyStr) as Record<string, unknown>;
+          requestModel = (parsed.model as string) ?? "";
+          // Accept OpenAI's current `max_completion_tokens` as well as the
+          // legacy `max_tokens` — reading only the latter sized a large request
+          // as 0 tokens, letting it reuse a pre-auth bought for a tiny one.
+          // Fallback stays 0 here (not the proxy's 4096): with no declared
+          // budget this layer prices on body length alone, as it always has.
+          maxTokens = resolveMaxTokens(parsed, 0);
         }
       } catch {
         /* not JSON, use empty model */
       }
     }
     const cacheKey = `${urlPath}:${requestModel}`;
+
+    const notifyAcceptedPayment = (
+      response: Response,
+      payload: { accepted: { amount: string; network: string } },
+    ): void => {
+      const settled =
+        response.headers.has("payment-response") || response.headers.has("x-payment-response");
+      if (!settled || !options?.onPayment) return;
+      try {
+        options.onPayment({
+          model: requestModel,
+          amount: payload.accepted.amount,
+          network: payload.accepted.network,
+        });
+      } catch (error) {
+        // The observer runs after settlement. Its failure must not turn a paid
+        // response into a retryable request and risk a second charge.
+        console.error(
+          `[ClawRouter] onPayment callback failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
 
     // Up-front estimate of what THIS request will cost (USDC micro-units), used
     // both to gate pre-auth reuse and to record what a new cache entry covers.
@@ -105,6 +141,15 @@ export function createPayFetchWithPreAuth(
       needMicros !== undefined &&
       needMicros <= cached.coverMicros;
     if (preAuthCovers) {
+      // Whether a request carrying a SIGNED payment has left this process. Once
+      // it has, a failure is ambiguous: "never arrived" and "arrived, settled,
+      // response lost" look identical from here, and the fall-through path
+      // below signs a second, distinct payment. That second authorization has a
+      // fresh nonce, so replay protection passes it, and it happens inside one
+      // payFetch call, so the proxy's response dedup never sees it — one user
+      // request, two USDC charges (#317). Resolve the ambiguity the safe way:
+      // fail the request rather than risk paying twice.
+      let paymentInFlight = false;
       try {
         const payload = await client.createPaymentPayload(cached.paymentRequired);
         const headers = httpClient.encodePaymentSignatureHeader(payload);
@@ -112,17 +157,35 @@ export function createPayFetchWithPreAuth(
         for (const [key, value] of Object.entries(headers)) {
           preAuthRequest.headers.set(key, value);
         }
+        paymentInFlight = true;
         const response = await baseFetch(preAuthRequest);
         if (response.status !== 402) {
+          notifyAcceptedPayment(response, payload);
           return response; // Pre-auth worked — saved ~200ms
         }
         // Rejected despite our estimate (server priced it higher than we did).
-        // The rejection 402 is NOT a reusable challenge, so drop it and fall
-        // through to a clean, un-paid request that yields a fresh challenge.
+        // A 402 is an ANSWER: the gateway declined the payment, so nothing was
+        // settled and re-signing is safe. The rejection 402 is NOT a reusable
+        // challenge, so drop it and fall through to a clean, un-paid request
+        // that yields a fresh challenge.
+        paymentInFlight = false;
         cache.delete(cacheKey);
-      } catch {
-        // Pre-auth signing failed — invalidate and fall through.
+      } catch (err) {
         cache.delete(cacheKey);
+        // A spend-policy refusal is deterministic: falling through would sign
+        // the same blocked payment again on the fresh-challenge path, costing
+        // an extra unpaid upstream round trip to reach the identical denial.
+        if (err instanceof SpendPolicyError) {
+          throw err;
+        }
+        // The send failed with a payment attached — see above. Surface the
+        // transport error instead of quietly authorizing a second one. An
+        // abort lands here too and must stay an abort, not a silent retry.
+        if (paymentInFlight) {
+          throw err;
+        }
+        // Pre-auth signing failed before anything was sent — unambiguous, so
+        // invalidate and fall through to the normal 402 flow.
       }
     }
 
@@ -166,6 +229,8 @@ export function createPayFetchWithPreAuth(
     for (const [key, value] of Object.entries(paymentHeaders)) {
       clonedRequest.headers.set(key, value);
     }
-    return baseFetch(clonedRequest);
+    const paidResponse = await baseFetch(clonedRequest);
+    notifyAcceptedPayment(paidResponse, payload);
+    return paidResponse;
   };
 }

@@ -10,19 +10,145 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #  restores it if the update process somehow wiped it.
 # ─────────────────────────────────────────────────────────────
 
-PLUGIN_DIR="$HOME/.openclaw/extensions/clawrouter"
+PLUGIN_DIR="$HOME/.openclaw/extensions/blockrun-clawrouter"
+LEGACY_PLUGIN_DIR="$HOME/.openclaw/extensions/clawrouter"
 CONFIG_PATH="$HOME/.openclaw/openclaw.json"
 WALLET_FILE="$HOME/.openclaw/blockrun/wallet.key"
 WALLET_BACKUP=""
+WALLET_EXISTED=0
 PLUGIN_BACKUP=""
+LEGACY_PLUGIN_BACKUP=""
+LEGACY_BLOCKRUN_INSTALL=0
 CONFIG_BACKUP=""
+CONFIG_EXISTED=0
+CREDS_DIR="$HOME/.openclaw/credentials"
+CREDS_BACKUP=""
+CREDS_EXISTED=0
+ACTIVE_PACKAGE_DIR=""
+INSTALL_SPEC="${BLOCKRUN_CLAWROUTER_INSTALL_SPEC:-@blockrun/clawrouter}"
+
+[ -f "$WALLET_FILE" ] && WALLET_EXISTED=1
+[ -f "$CONFIG_PATH" ] && CONFIG_EXISTED=1
+[ -d "$CREDS_DIR" ] && CREDS_EXISTED=1
+
+is_blockrun_plugin_dir() {
+  local candidate_dir="$1"
+  [ -d "$candidate_dir" ] || return 1
+  node -e '
+const fs = require("fs");
+const path = require("path");
+const dir = process.argv[1];
+for (const candidate of [path.join(dir, "package.json"), path.join(dir, "package", "package.json")]) {
+  try {
+    if (JSON.parse(fs.readFileSync(candidate, "utf8")).name === "@blockrun/clawrouter") process.exit(0);
+  } catch {}
+}
+process.exit(1);
+' "$candidate_dir"
+}
+
+NPM_PREFIX="$(npm config get prefix 2>/dev/null || echo "")"
+if [ -n "$NPM_PREFIX" ] && [ -d "$NPM_PREFIX/bin" ]; then
+  PATH="$NPM_PREFIX/bin:$PATH"
+  export PATH
+fi
+
+find_clawrouter_package_dir() {
+  node <<'NODE'
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const home = os.homedir();
+const candidates = [
+  { packagePath: path.join(home, '.openclaw', 'extensions', 'blockrun-clawrouter', 'package.json'), priority: 0 },
+  { packagePath: path.join(home, '.openclaw', 'extensions', 'clawrouter', 'package.json'), priority: 3 },
+  { packagePath: path.join(home, '.openclaw', 'npm', 'node_modules', '@blockrun', 'clawrouter', 'package.json'), priority: 2 },
+];
+
+const projectsDir = path.join(home, '.openclaw', 'npm', 'projects');
+try {
+  for (const name of fs.readdirSync(projectsDir)) {
+    candidates.push({
+      packagePath: path.join(projectsDir, name, 'node_modules', '@blockrun', 'clawrouter', 'package.json'),
+      priority: 1,
+    });
+  }
+} catch {}
+
+function versionParts(version) {
+  return String(version || '').split(/[.-]/).slice(0, 3).map((part) => Number.parseInt(part, 10) || 0);
+}
+
+function compareVersions(a, b) {
+  const left = versionParts(a);
+  const right = versionParts(b);
+  for (let i = 0; i < 3; i++) {
+    if (left[i] !== right[i]) return left[i] - right[i];
+  }
+  return 0;
+}
+
+let best = null;
+for (const candidate of candidates) {
+  try {
+    const stat = fs.statSync(candidate.packagePath);
+    const pkg = JSON.parse(fs.readFileSync(candidate.packagePath, 'utf8'));
+    if (pkg?.name !== '@blockrun/clawrouter') continue;
+    const versionOrder = best ? compareVersions(pkg.version, best.pkg.version) : 1;
+    if (
+      !best ||
+      versionOrder > 0 ||
+      (versionOrder === 0 &&
+        (candidate.priority < best.priority ||
+          (candidate.priority === best.priority && stat.mtimeMs > best.mtimeMs)))
+    ) {
+      best = { ...candidate, pkg, mtimeMs: stat.mtimeMs };
+    }
+  } catch {}
+}
+
+if (best) console.log(path.dirname(best.packagePath));
+NODE
+}
+
+sync_cli_shim() {
+  local package_dir="$1"
+  if [ -z "$package_dir" ] || [ ! -f "$package_dir/dist/cli.js" ]; then
+    echo "  ⚠ Could not update CLI shim: ClawRouter CLI not found"
+    return 1
+  fi
+
+  local prefix
+  prefix=$(npm config get prefix 2>/dev/null || echo "")
+  if [ -z "$prefix" ]; then
+    echo "  ⚠ Could not update CLI shim: npm prefix unavailable"
+    return 1
+  fi
+
+  local bin_dir="$prefix/bin"
+  mkdir -p "$bin_dir"
+  rm -f "$bin_dir/clawrouter"
+  cat >"$bin_dir/clawrouter" <<EOF
+#!/bin/sh
+exec node "$package_dir/dist/cli.js" "\$@"
+EOF
+  chmod +x "$bin_dir/clawrouter"
+  echo "  ✓ CLI shim updated: $bin_dir/clawrouter → $package_dir/dist/cli.js"
+}
 
 cleanup_backups() {
   if [ -n "$PLUGIN_BACKUP" ] && [ -d "$PLUGIN_BACKUP" ]; then
     rm -rf "$PLUGIN_BACKUP"
   fi
+  if [ -n "$LEGACY_PLUGIN_BACKUP" ] && [ -d "$LEGACY_PLUGIN_BACKUP" ]; then
+    rm -rf "$LEGACY_PLUGIN_BACKUP"
+  fi
   if [ -n "$CONFIG_BACKUP" ] && [ -f "$CONFIG_BACKUP" ]; then
     rm -f "$CONFIG_BACKUP"
+  fi
+  if [ -n "$CREDS_BACKUP" ] && [ -d "$CREDS_BACKUP" ]; then
+    rm -rf "$(dirname "$CREDS_BACKUP")"
   fi
 }
 
@@ -42,9 +168,34 @@ restore_previous_install() {
       echo "  ✓ Restored previous plugin files"
     fi
 
+    if [ -n "$LEGACY_PLUGIN_BACKUP" ] && [ -d "$LEGACY_PLUGIN_BACKUP" ]; then
+      mv "$LEGACY_PLUGIN_BACKUP" "$LEGACY_PLUGIN_DIR"
+      echo "  ✓ Restored previous legacy BlockRun plugin files"
+    fi
+
     if [ -n "$CONFIG_BACKUP" ] && [ -f "$CONFIG_BACKUP" ]; then
       cp "$CONFIG_BACKUP" "$CONFIG_PATH"
       echo "  ✓ Restored previous OpenClaw config"
+    elif [ "$CONFIG_EXISTED" = "0" ]; then
+      rm -f "$CONFIG_PATH"
+    fi
+
+    if [ "$WALLET_EXISTED" = "1" ] && [ -n "$WALLET_BACKUP" ] && [ -f "$WALLET_BACKUP" ]; then
+      mkdir -p "$(dirname "$WALLET_FILE")"
+      cp "$WALLET_BACKUP" "$WALLET_FILE"
+      chmod 600 "$WALLET_FILE"
+      echo "  ✓ Restored previous wallet"
+    elif [ "$WALLET_EXISTED" = "0" ]; then
+      rm -f "$WALLET_FILE"
+    fi
+
+    if [ "$CREDS_EXISTED" = "1" ] && [ -n "$CREDS_BACKUP" ] && [ -d "$CREDS_BACKUP" ]; then
+      rm -rf "$CREDS_DIR"
+      mkdir -p "$CREDS_DIR"
+      cp -a "$CREDS_BACKUP/." "$CREDS_DIR/"
+      echo "  ✓ Restored OpenClaw credentials"
+    elif [ "$CREDS_EXISTED" = "0" ]; then
+      rm -rf "$CREDS_DIR"
     fi
   fi
 
@@ -93,10 +244,12 @@ echo ""
 
 # Pre-flight: fail fast if config is corrupt
 validate_config
+ACTIVE_PACKAGE_DIR=$(find_clawrouter_package_dir)
 
 echo "→ Checking wallet..."
 
 if [ -f "$WALLET_FILE" ]; then
+  WALLET_EXISTED=1
   # Validate the key looks correct before backing up
   WALLET_KEY=$(cat "$WALLET_FILE" | tr -d '[:space:]')
   KEY_LEN=${#WALLET_KEY}
@@ -105,7 +258,7 @@ if [ -f "$WALLET_FILE" ]; then
     # Derive wallet address via node (viem is available post-install)
     WALLET_ADDRESS=$(node -e "
       try {
-        const { privateKeyToAccount } = require('$HOME/.openclaw/extensions/clawrouter/node_modules/viem/accounts/index.js');
+        const { privateKeyToAccount } = require(require.resolve('viem/accounts', { paths: ['$ACTIVE_PACKAGE_DIR'] }));
         const acct = privateKeyToAccount('$WALLET_KEY');
         console.log(acct.address);
       } catch {
@@ -114,7 +267,7 @@ if [ -f "$WALLET_FILE" ]; then
       }
     " 2>/dev/null || echo "(address check skipped)")
 
-    WALLET_BACKUP="$HOME/.openclaw/blockrun/wallet.key.bak.$(date +%s)"
+    WALLET_BACKUP="$(mktemp "$HOME/.openclaw/blockrun/wallet.key.bak.XXXXXX")"
     cp "$WALLET_FILE" "$WALLET_BACKUP"
     chmod 600 "$WALLET_BACKUP"
 
@@ -139,7 +292,17 @@ else
   echo "  ℹ No existing plugin files found"
 fi
 
+# Stage a pre-rename directory only when its package metadata proves ownership.
+# The same path may otherwise belong to OpenClaw's official bundled router.
+if is_blockrun_plugin_dir "$LEGACY_PLUGIN_DIR"; then
+  LEGACY_BLOCKRUN_INSTALL=1
+  LEGACY_PLUGIN_BACKUP="$HOME/.openclaw/blockrun/clawrouter.legacy.backup.$(date +%s)"
+  mv "$LEGACY_PLUGIN_DIR" "$LEGACY_PLUGIN_BACKUP"
+  echo "  ✓ Legacy BlockRun plugin staged at: $LEGACY_PLUGIN_BACKUP"
+fi
+
 if [ -f "$CONFIG_PATH" ]; then
+  CONFIG_EXISTED=1
   CONFIG_BACKUP="$CONFIG_PATH.clawrouter-update.$(date +%s).bak"
   cp "$CONFIG_PATH" "$CONFIG_BACKUP"
   echo "  ✓ Config backed up to: $CONFIG_BACKUP"
@@ -147,44 +310,9 @@ fi
 
 echo ""
 
-# ── Step 1b: Remove Crossmint/lobster extension ───────────────
-# lobster.cash is a third-party plugin that conflicts with /wallet command.
-# Remove it so ClawRouter owns /wallet without conflict.
-echo "→ Removing Crossmint/lobster extension..."
-LOBSTER_DIR="$HOME/.openclaw/extensions/lobster.cash"
-if [ -d "$LOBSTER_DIR" ]; then
-  rm -rf "$LOBSTER_DIR"
-  echo "  ✓ Removed $LOBSTER_DIR"
-else
-  echo "  ✓ Not installed"
-fi
-# Clean crossmint/lobster from openclaw.json
-node -e "
-const fs = require('fs');
-const configPath = '$CONFIG_PATH';
-if (!fs.existsSync(configPath)) process.exit(0);
-try {
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-  let changed = false;
-  // Remove from plugins.entries
-  for (const key of ['lobster.cash', 'lobster', 'crossmint']) {
-    if (config?.plugins?.entries?.[key]) { delete config.plugins.entries[key]; changed = true; console.log('  Removed plugins.entries.' + key); }
-    if (config?.plugins?.installs?.[key]) { delete config.plugins.installs[key]; changed = true; }
-  }
-  // Remove from plugins.allow
-  if (Array.isArray(config?.plugins?.allow)) {
-    const before = config.plugins.allow.length;
-    config.plugins.allow = config.plugins.allow.filter(p => !['lobster.cash','lobster','crossmint'].includes(p));
-    if (config.plugins.allow.length !== before) { changed = true; console.log('  Removed lobster/crossmint from plugins.allow'); }
-  }
-  if (changed) {
-    const tmp = configPath + '.tmp.' + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
-    fs.renameSync(tmp, configPath);
-  } else { console.log('  Config clean'); }
-} catch (e) { console.log('  Skipped: ' + e.message); }
-"
-echo ""
+# Third-party plugins are never removed by a ClawRouter update. If another
+# plugin owns the same slash command, OpenClaw reports the conflict and the
+# user can choose which plugin to disable.
 
 # ── Step 2: Kill old proxy ──────────────────────────────────────
 echo "→ Stopping old proxy..."
@@ -206,7 +334,7 @@ kill_port_processes 8402
 # The old plugin dir is staged in a backup above. Remove the stale
 # plugin entry so a fresh install can proceed, and restore it on error.
 echo "→ Cleaning config..."
-node -e "
+LEGACY_BLOCKRUN_INSTALL="$LEGACY_BLOCKRUN_INSTALL" node -e "
 const fs = require('fs');
 const path = require('path');
 const configPath = '$CONFIG_PATH';
@@ -215,33 +343,34 @@ try {
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   let changed = false;
 
-  // Remove stale plugin entries (check all case variants)
+  // Never remove lowercase clawrouter: OpenClaw's official router owns it.
   const entries = config?.plugins?.entries;
   const installs = config?.plugins?.installs;
-  for (const key of ['clawrouter', 'ClawRouter', '@blockrun/clawrouter']) {
+  for (const key of ['blockrun-clawrouter', 'ClawRouter', '@blockrun/clawrouter']) {
     if (entries?.[key]) { delete entries[key]; changed = true; console.log('  Removed plugins.entries.' + key); }
     if (installs?.[key]) { delete installs[key]; changed = true; console.log('  Removed plugins.installs.' + key); }
   }
+  if (process.env.LEGACY_BLOCKRUN_INSTALL === '1' && entries?.clawrouter) {
+    const legacy = entries.clawrouter;
+    for (const key of ['walletKey', 'routing']) {
+      if (Object.prototype.hasOwnProperty.call(legacy, key)) { delete legacy[key]; changed = true; }
+      if (legacy.config && Object.prototype.hasOwnProperty.call(legacy.config, key)) {
+        delete legacy.config[key];
+        changed = true;
+      }
+    }
+    if (legacy.config && Object.keys(legacy.config).length === 0) delete legacy.config;
+  }
 
-  // Clean plugins.allow — remove clawrouter (re-added later) and any stale bare
-  // single-word entries that aren't bundled OpenClaw plugins (e.g. "wallet" added
-  // by an AI agent — shows a warning on every gateway start).
+  // Clean plugins.allow — remove only ClawRouter entries; preserve every other
+  // plugin the user has allowed, including bare local/custom plugin IDs.
   if (Array.isArray(config?.plugins?.allow)) {
-    const BUNDLED = [
-      'http','mcp','computer-use','browser','code','image','voice',
-      'search','memory','calendar','email','slack','discord','telegram',
-      'whatsapp','matrix','teams','notion','github','jira','linear',
-      'comfyui',
-    ];
     const before = config.plugins.allow.length;
-    config.plugins.allow = config.plugins.allow.filter(p => {
-      if (p === 'clawrouter' || p === '@blockrun/clawrouter') return false;
-      if (BUNDLED.includes(p)) return true;
-      if (p.startsWith('@') || p.includes('/')) return true;
-      return false;
-    });
+    config.plugins.allow = config.plugins.allow.filter(
+      p => p !== 'blockrun-clawrouter' && p !== 'ClawRouter' && p !== '@blockrun/clawrouter'
+    );
     const removed = before - config.plugins.allow.length;
-    if (removed > 0) { changed = true; console.log('  Removed ' + removed + ' stale plugins.allow entry(ies)'); }
+    if (removed > 0) { changed = true; console.log('  Staged BlockRun plugin config for reinstall'); }
   }
 
   // OpenClaw 2026.5.2+ validates tools.web.search.provider at config-load
@@ -257,8 +386,9 @@ try {
 
   if (changed) {
     const tmp = configPath + '.tmp.' + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, configPath);
+    fs.chmodSync(configPath, 0o600);
   } else {
     console.log('  Config clean');
   }
@@ -282,17 +412,17 @@ try {
   if (!provider.apiKey) { provider.apiKey = 'x402-proxy-handles-auth'; changed = true; console.log('  Fixed missing apiKey'); }
   if (changed) {
     const tmp = configPath + '.tmp.' + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, configPath);
+    fs.chmodSync(configPath, 0o600);
   } else { console.log('  Provider config OK'); }
 } catch (err) { console.log('  Skipped: ' + err.message); }
 "
 
 # ── Step 4: Install latest version ─────────────────────────────
 # Back up OpenClaw credentials (channels, WhatsApp/Telegram state) before plugin install
-CREDS_DIR="$HOME/.openclaw/credentials"
-CREDS_BACKUP=""
-if [ -d "$CREDS_DIR" ] && [ "$(ls -A "$CREDS_DIR" 2>/dev/null)" ]; then
+if [ -d "$CREDS_DIR" ]; then
+  CREDS_EXISTED=1
   CREDS_BACKUP="$(mktemp -d)/openclaw-credentials-backup"
   cp -a "$CREDS_DIR" "$CREDS_BACKUP"
   echo "  ✓ Backed up OpenClaw credentials"
@@ -321,7 +451,9 @@ fi
 # openclaw plugins install scans the directory. If they exist during install,
 # OpenClaw writes them into config as duplicate plugins.
 for stale in "$HOME/.openclaw/extensions/clawrouter.backup."* "$HOME/.openclaw/extensions/.openclaw-install-stage-"*; do
-  [ -d "$stale" ] && rm -rf "$stale"
+  if is_blockrun_plugin_dir "$stale"; then
+    rm -rf "$stale"
+  fi
 done
 
 apply_scoped_model_trim() {
@@ -416,8 +548,9 @@ if (totalDrop <= 0 || modelListDrop / totalDrop < 0.65) {
 
 active.models.providers.blockrun.models = rejectedModels;
 const tmpPath = `${activePath}.tmp.${process.pid}`;
-fs.writeFileSync(tmpPath, JSON.stringify(active, null, 2));
+fs.writeFileSync(tmpPath, JSON.stringify(active, null, 2), { mode: 0o600 });
 fs.renameSync(tmpPath, activePath);
+fs.chmodSync(activePath, 0o600);
 
 console.log(
   `  ✓ Applied scoped BlockRun model-list trim (${activeModels.length} -> ${rejectedModels.length})`,
@@ -455,6 +588,10 @@ handle_openclaw_install_failure() {
 }
 
 echo "→ Installing latest ClawRouter..."
+OPENCLAW_CAPABILITY_ARGS=()
+if openclaw plugins install --help 2>&1 | grep -q -- '--accept-capabilities'; then
+  OPENCLAW_CAPABILITY_ARGS=(--accept-capabilities)
+fi
 # `--force` is required when the plugin is already installed at the same path
 # (which is always true on update). Without it, OpenClaw exits non-zero with
 # "plugin already exists" and our EXIT trap rolls back, stranding the user on
@@ -470,14 +607,14 @@ OPENCLAW_INSTALL_LOG="$(mktemp)"
 # "Installed plugin: clawrouter" in OpenClaw v2026.4.5 (parallel plugin loading).
 # 120s is enough for slow connections; the install itself completes in ~30s.
 if command -v timeout >/dev/null 2>&1; then
-  timeout 120 openclaw plugins install --force @blockrun/clawrouter 2>&1 | tee "$OPENCLAW_INSTALL_LOG" || {
+  timeout 120 openclaw plugins install --force "${OPENCLAW_CAPABILITY_ARGS[@]}" "$INSTALL_SPEC" 2>&1 | tee "$OPENCLAW_INSTALL_LOG" || {
     exit_code=$?
     handle_openclaw_install_failure "$exit_code" || {
       [ "$OPENCLAW_INSTALL_RECOVERABLE" = "1" ] || exit $exit_code
     }
   }
 else
-  openclaw plugins install --force @blockrun/clawrouter 2>&1 | tee "$OPENCLAW_INSTALL_LOG" || {
+  openclaw plugins install --force "${OPENCLAW_CAPABILITY_ARGS[@]}" "$INSTALL_SPEC" 2>&1 | tee "$OPENCLAW_INSTALL_LOG" || {
     exit_code=$?
     handle_openclaw_install_failure "$exit_code" || {
       [ "$OPENCLAW_INSTALL_RECOVERABLE" = "1" ] || exit $exit_code
@@ -486,16 +623,64 @@ else
 fi
 rm -f "$OPENCLAW_INSTALL_LOG"
 
-# Install is complete — clear the rollback trap immediately.
-# From this point on, Ctrl+C or errors should NOT roll back the install.
-if [ "$OPENCLAW_INSTALL_RECOVERABLE" != "1" ]; then
-  trap - EXIT INT TERM
-fi
+# Enable only after the package exists so OpenClaw does not report a stale id
+# while the previous install is staged outside extensions/.
+node - "$CONFIG_PATH" "$CONFIG_BACKUP" "$LEGACY_BLOCKRUN_INSTALL" <<'NODE'
+const fs = require('fs');
+const [configPath, backupPath, legacyOwned] = process.argv.slice(2);
+if (!fs.existsSync(configPath)) process.exit(0);
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const preserved = backupPath && fs.existsSync(backupPath)
+  ? JSON.parse(fs.readFileSync(backupPath, 'utf8'))
+  : {};
+config.plugins ??= {};
+config.plugins.entries ??= {};
+const current = config.plugins.entries['blockrun-clawrouter'] || {};
+const preservedCurrent = preserved?.plugins?.entries?.['blockrun-clawrouter'];
+const moveOwnedFields = (source, destination, removeFromSource = false) => {
+  if (!source || typeof source !== 'object') return;
+  for (const key of ['walletKey', 'routing']) {
+    if (!(key in destination) && key in source) destination[key] = source[key];
+    if (removeFromSource) delete source[key];
+  }
+  if (source.config && typeof source.config === 'object') {
+    destination.config ??= {};
+    for (const key of ['walletKey', 'routing']) {
+      if (!(key in destination.config) && key in source.config) destination.config[key] = source.config[key];
+      if (removeFromSource) delete source.config[key];
+    }
+    if (Object.keys(destination.config).length === 0) delete destination.config;
+    if (removeFromSource && Object.keys(source.config).length === 0) delete source.config;
+  }
+};
+moveOwnedFields(preservedCurrent, current);
+if (legacyOwned === '1') {
+  const legacy = config.plugins.entries.clawrouter;
+  const preservedLegacy = preserved?.plugins?.entries?.clawrouter;
+  if (typeof preservedLegacy?.enabled === 'boolean' && typeof current.enabled !== 'boolean') {
+    current.enabled = preservedLegacy.enabled;
+  }
+  moveOwnedFields(preservedLegacy, current);
+  moveOwnedFields(legacy, current, true);
+}
+current.enabled = true;
+config.plugins.entries['blockrun-clawrouter'] = current;
+if (Array.isArray(config.plugins.allow) && !config.plugins.allow.includes('blockrun-clawrouter')) {
+  config.plugins.allow.push('blockrun-clawrouter');
+}
+if (Array.isArray(config.plugins.deny)) {
+  config.plugins.deny = config.plugins.deny.filter(id => id !== 'blockrun-clawrouter');
+}
+const tmp = configPath + '.tmp.' + process.pid;
+fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
+fs.renameSync(tmp, configPath);
+fs.chmodSync(configPath, 0o600);
+NODE
 
 # Restore credentials after plugin install (always restore to preserve user's channels)
 if [ -n "$CREDS_BACKUP" ] && [ -d "$CREDS_BACKUP" ]; then
   mkdir -p "$CREDS_DIR"
-  cp -a "$CREDS_BACKUP/"* "$CREDS_DIR/"
+  cp -a "$CREDS_BACKUP/." "$CREDS_DIR/"
   echo "  ✓ Restored OpenClaw credentials (channels preserved)"
   rm -rf "$(dirname "$CREDS_BACKUP")"
 fi
@@ -506,8 +691,9 @@ if [ -n "$CHANNEL_CONFIG_BACKUP" ] && [ -f "$CHANNEL_CONFIG_BACKUP" ] && [ -f "$
 const fs = require('fs');
 function atomicWrite(filePath, data) {
   const tmpPath = filePath + '.tmp.' + process.pid;
-  fs.writeFileSync(tmpPath, data);
+  fs.writeFileSync(tmpPath, data, { mode: 0o600 });
   fs.renameSync(tmpPath, filePath);
+  fs.chmodSync(filePath, 0o600);
 }
 try {
   const config = JSON.parse(fs.readFileSync('$CONFIG_PATH', 'utf8'));
@@ -563,51 +749,46 @@ force_install_from_npm() {
   return 1
 }
 
-if [ "$OPENCLAW_INSTALL_RECOVERABLE" = "1" ]; then
-  LATEST_VER=$(npm view @blockrun/clawrouter@latest version 2>/dev/null || echo "")
-  if [ -z "$LATEST_VER" ]; then
-    echo "  ✗ Could not resolve latest ClawRouter version from npm"
-    exit 1
-  fi
-  force_install_from_npm "$LATEST_VER"
-  if [ ! -f "$PLUGIN_DIR/package.json" ]; then
-    echo "  ✗ ClawRouter package.json missing after npm fallback"
-    exit 1
-  fi
-  INSTALLED_VER=$(node -e "try{const p=require('$PLUGIN_DIR/package.json');console.log(p.version);}catch{console.log('');}" 2>/dev/null || echo "")
-  if [ -z "$INSTALLED_VER" ]; then
-    echo "  ✗ Could not verify ClawRouter version after npm fallback"
-    exit 1
-  fi
-  echo "  ✓ ClawRouter v${INSTALLED_VER} installed"
-  trap - EXIT INT TERM
-elif [ -d "$PLUGIN_DIR" ] && [ -f "$PLUGIN_DIR/package.json" ]; then
-  INSTALLED_VER=$(node -e "try{const p=require('$PLUGIN_DIR/package.json');console.log(p.version);}catch{console.log('');}" 2>/dev/null || echo "")
-  LATEST_VER=$(npm view @blockrun/clawrouter@latest version 2>/dev/null || echo "")
-  if [ -n "$LATEST_VER" ] && [ -n "$INSTALLED_VER" ] && [ "$INSTALLED_VER" != "$LATEST_VER" ]; then
-    echo "  ⚠️  openclaw installed v${INSTALLED_VER} (cached) but latest is v${LATEST_VER}"
-    force_install_from_npm "$LATEST_VER" || true
-  fi
-  INSTALLED_VER=$(node -e "try{const p=require('$PLUGIN_DIR/package.json');console.log(p.version);}catch{console.log('?');}" 2>/dev/null || echo "?")
-  echo "  ✓ ClawRouter v${INSTALLED_VER} installed"
+LATEST_VER=$(npm view @blockrun/clawrouter@latest version 2>/dev/null || echo "")
+if [ -z "$LATEST_VER" ]; then
+  echo "  ✗ Could not resolve latest ClawRouter version from npm"
+  exit 1
 fi
 
+ACTIVE_PACKAGE_DIR=$(find_clawrouter_package_dir)
+INSTALLED_VER=""
+if [ -n "$ACTIVE_PACKAGE_DIR" ] && [ -f "$ACTIVE_PACKAGE_DIR/package.json" ]; then
+  INSTALLED_VER=$(node -e "try{const p=require('$ACTIVE_PACKAGE_DIR/package.json');console.log(p.version);}catch{console.log('');}" 2>/dev/null || echo "")
+fi
+
+if [ "$OPENCLAW_INSTALL_RECOVERABLE" = "1" ] || [ -z "$INSTALLED_VER" ] || [ "$INSTALLED_VER" != "$LATEST_VER" ]; then
+  if [ -n "$INSTALLED_VER" ] && [ "$INSTALLED_VER" != "$LATEST_VER" ]; then
+    echo "  ⚠️  OpenClaw installed v${INSTALLED_VER} but latest is v${LATEST_VER}"
+  fi
+  force_install_from_npm "$LATEST_VER"
+  ACTIVE_PACKAGE_DIR=$(find_clawrouter_package_dir)
+  INSTALLED_VER=$(node -e "try{const p=require('$ACTIVE_PACKAGE_DIR/package.json');console.log(p.version);}catch{console.log('');}" 2>/dev/null || echo "")
+fi
+
+if [ -z "$ACTIVE_PACKAGE_DIR" ] || [ -z "$INSTALLED_VER" ]; then
+  echo "  ✗ Could not verify ClawRouter install"
+  exit 1
+fi
+
+echo "  ✓ ClawRouter v${INSTALLED_VER} installed at $ACTIVE_PACKAGE_DIR"
+sync_cli_shim "$ACTIVE_PACKAGE_DIR"
 # ── Step 4c: Ensure all dependencies are installed ────────────
 # openclaw's plugin installer may skip native/optional deps like @solana/kit.
 # Run npm install in the plugin directory to fill any gaps.
-if [ -d "$PLUGIN_DIR" ] && [ -f "$PLUGIN_DIR/package.json" ]; then
+if [ -n "$ACTIVE_PACKAGE_DIR" ] && [ -f "$ACTIVE_PACKAGE_DIR/package.json" ]; then
   echo "→ Installing dependencies (Solana, x402, etc.)..."
-  run_dependency_install "$PLUGIN_DIR"
+  run_dependency_install "$ACTIVE_PACKAGE_DIR"
 fi
 
 # ── Step 5: Verify wallet survived ─────────────────────────────
 # ── Step 4d: Post-install duplicate cleanup ──────────────────────
-# openclaw plugins install writes plugins.entries.ClawRouter (PascalCase, from
-# plugin name) AND plugins.installs.clawrouter (lowercase, from plugin id).
-# The extensions/ directory scan also discovers the plugin by id.
-# Having both entries + directory causes "duplicate plugin" warnings.
-# Fix: keep only the installs record (used by OpenClaw's matchInstalledPlugin),
-# remove the entries record that duplicates it.
+# Remove only obsolete BlockRun aliases. Preserve both the current
+# blockrun-clawrouter entry and OpenClaw's official clawrouter entry.
 echo "→ Cleaning duplicate plugin entries..."
 node -e "
 const fs = require('fs');
@@ -617,7 +798,7 @@ try {
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   let changed = false;
   // Remove entries that duplicate the installs record
-  for (const key of ['clawrouter', 'ClawRouter', '@blockrun/clawrouter']) {
+  for (const key of ['ClawRouter', '@blockrun/clawrouter']) {
     if (config?.plugins?.entries?.[key]) {
       delete config.plugins.entries[key];
       changed = true;
@@ -626,8 +807,9 @@ try {
   }
   if (changed) {
     const tmp = configPath + '.tmp.' + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, configPath);
+    fs.chmodSync(configPath, 0o600);
     console.log('  ✓ Duplicate entries cleaned');
   } else {
     console.log('  ✓ No duplicates found');
@@ -653,8 +835,9 @@ try {
   if (!provider.apiKey) { provider.apiKey = 'x402-proxy-handles-auth'; changed = true; console.log('  Fixed missing apiKey'); }
   if (changed) {
     const tmp = configPath + '.tmp.' + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, configPath);
+    fs.chmodSync(configPath, 0o600);
   } else { console.log('  ✓ Provider config OK'); }
 } catch (err) { console.log('  Skipped: ' + err.message); }
 "
@@ -701,8 +884,9 @@ const authDir = path.join(os.homedir(), '.openclaw', 'agents', 'main', 'agent');
 const authPath = path.join(authDir, 'auth-profiles.json');
 function atomicWrite(filePath, data) {
   const tmpPath = filePath + '.tmp.' + process.pid;
-  fs.writeFileSync(tmpPath, data);
+  fs.writeFileSync(tmpPath, data, { mode: 0o600 });
   fs.renameSync(tmpPath, filePath);
+  fs.chmodSync(filePath, 0o600);
 }
 
 fs.mkdirSync(authDir, { recursive: true });
@@ -736,7 +920,7 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
-const topModelsPath = '$SCRIPT_DIR/../src/top-models.json';
+const topModelsPath = path.join('$ACTIVE_PACKAGE_DIR', 'src', 'top-models.json');
 
 if (!fs.existsSync(configPath)) {
   console.log('  No config file found, skipping');
@@ -780,8 +964,9 @@ try {
 
   // Atomic write
   const tmpPath = configPath + '.tmp.' + process.pid;
-  fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+  fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2), { mode: 0o600 });
   fs.renameSync(tmpPath, configPath);
+  fs.chmodSync(configPath, 0o600);
 
   if (removed > 0) {
     console.log('  Removed ' + removed + ' deprecated models from allowlist');
@@ -806,8 +991,9 @@ const path = require('path');
 const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
 function atomicWrite(filePath, data) {
   const tmpPath = filePath + '.tmp.' + process.pid;
-  fs.writeFileSync(tmpPath, data);
+  fs.writeFileSync(tmpPath, data, { mode: 0o600 });
   fs.renameSync(tmpPath, filePath);
+  fs.chmodSync(filePath, 0o600);
 }
 
 if (fs.existsSync(configPath)) {
@@ -836,7 +1022,7 @@ if (fs.existsSync(configPath)) {
 echo "→ Cleaning up stale install stages..."
 CLEANED=0
 for stage_dir in "$HOME/.openclaw/extensions/.openclaw-install-stage-"*; do
-  if [ -d "$stage_dir" ]; then
+  if is_blockrun_plugin_dir "$stage_dir"; then
     rm -rf "$stage_dir"
     CLEANED=$((CLEANED + 1))
   fi
@@ -851,7 +1037,13 @@ fi
 # plugin detection), new ones live in blockrun/. Clean both locations.
 echo "→ Cleaning up stale plugin backups..."
 CLEANED=0
-for backup_dir in "$HOME/.openclaw/extensions/clawrouter.backup."* "$HOME/.openclaw/blockrun/clawrouter.backup."*; do
+for backup_dir in "$HOME/.openclaw/extensions/clawrouter.backup."*; do
+  if is_blockrun_plugin_dir "$backup_dir"; then
+    rm -rf "$backup_dir"
+    CLEANED=$((CLEANED + 1))
+  fi
+done
+for backup_dir in "$HOME/.openclaw/blockrun/clawrouter.backup."*; do
   if [ -d "$backup_dir" ]; then
     rm -rf "$backup_dir"
     CLEANED=$((CLEANED + 1))
@@ -873,11 +1065,12 @@ try {
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   let changed = false;
   const isStale = (p) => p.includes('.openclaw-install-stage-') || p.includes('clawrouter.backup.');
+  const blockrunIds = new Set(['blockrun-clawrouter', 'ClawRouter', '@blockrun/clawrouter']);
   // Remove plugins.entries pointing to stale directories
   if (config?.plugins?.entries) {
     for (const [key, val] of Object.entries(config.plugins.entries)) {
       const path = typeof val === 'string' ? val : val?.path || val?.main || '';
-      if (isStale(path)) {
+      if (blockrunIds.has(key) && isStale(path)) {
         delete config.plugins.entries[key];
         changed = true;
         console.log('  Removed plugins.entries.' + key + ' (stale)');
@@ -888,7 +1081,7 @@ try {
   if (config?.plugins?.installs) {
     for (const [key, val] of Object.entries(config.plugins.installs)) {
       const path = typeof val === 'string' ? val : val?.path || val?.main || '';
-      if (isStale(path)) {
+      if (blockrunIds.has(key) && isStale(path)) {
         delete config.plugins.installs[key];
         changed = true;
         console.log('  Removed plugins.installs.' + key + ' (stale)');
@@ -897,8 +1090,9 @@ try {
   }
   if (changed) {
     const tmp = configPath + '.tmp.' + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, configPath);
+    fs.chmodSync(configPath, 0o600);
     console.log('  ✓ Registry cleaned');
   } else {
     console.log('  ✓ Registry clean');
@@ -921,7 +1115,8 @@ const legacyPath = path.join(home, '.openclaw', 'plugins', 'installs.json');
 
 function currentPackageCandidates() {
   const candidates = [
-    { packagePath: path.join(home, '.openclaw', 'extensions', 'clawrouter', 'package.json'), priority: 0 },
+    { packagePath: path.join(home, '.openclaw', 'extensions', 'blockrun-clawrouter', 'package.json'), priority: 0 },
+    { packagePath: path.join(home, '.openclaw', 'extensions', 'clawrouter', 'package.json'), priority: 3 },
     {
       packagePath: path.join(home, '.openclaw', 'npm', 'node_modules', '@blockrun', 'clawrouter', 'package.json'),
       priority: 2,
@@ -978,9 +1173,10 @@ function newestCurrentPackage() {
 }
 
 function atomicWrite(filePath, data) {
-  const tmp = filePath + '.tmp.' + process.pid;
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, filePath);
+  const tmpPath = filePath + '.tmp.' + process.pid;
+  fs.writeFileSync(tmpPath, data, { mode: 0o600 });
+  fs.renameSync(tmpPath, filePath);
+  fs.chmodSync(filePath, 0o600);
 }
 
 try {
@@ -1003,6 +1199,19 @@ try {
     process.exit(0);
   }
 
+  const recordText = JSON.stringify(legacyRecord);
+  let provenBlockRun = recordText.includes('@blockrun/clawrouter');
+  if (!provenBlockRun) {
+    try {
+      const packagePath = path.join(String(legacyRecord.installPath || ''), 'package.json');
+      provenBlockRun = JSON.parse(fs.readFileSync(packagePath, 'utf8')).name === '@blockrun/clawrouter';
+    } catch {}
+  }
+  if (!provenBlockRun) {
+    console.log('  Preserved ambiguous official clawrouter install metadata');
+    process.exit(0);
+  }
+
   const currentVersion = String(currentPkg.version || '');
   const legacyVersion = String(legacyRecord.version || legacyRecord.resolvedVersion || '');
   const legacyPathValue = String(legacyRecord.installPath || '');
@@ -1016,7 +1225,13 @@ try {
 
   delete index.installRecords.clawrouter;
   if (Array.isArray(index.plugins)) {
-    index.plugins = index.plugins.filter((plugin) => plugin?.pluginId !== 'clawrouter');
+    index.plugins = index.plugins.filter((plugin) => {
+      if (plugin?.pluginId !== 'clawrouter') return true;
+      const text = JSON.stringify(plugin);
+      if (text.includes('@blockrun/clawrouter')) return false;
+      const pluginPath = String(plugin?.installPath || plugin?.path || '');
+      return !pluginPath || path.resolve(pluginPath) !== path.resolve(legacyPathValue);
+    });
   }
   index.refreshReason = 'clawrouter-stale-metadata-cleanup';
   index.generatedAtMs = Date.now();
@@ -1028,6 +1243,8 @@ try {
 "
 
 # ── Summary ─────────────────────────────────────────────────────
+cleanup_backups
+trap - EXIT INT TERM
 echo ""
 echo "✓ ClawRouter updated successfully!"
 echo ""
@@ -1037,7 +1254,7 @@ if [ -f "$WALLET_FILE" ]; then
   FINAL_KEY=$(cat "$WALLET_FILE" | tr -d '[:space:]')
   FINAL_ADDRESS=$(node -e "
     try {
-      const { privateKeyToAccount } = require('$HOME/.openclaw/extensions/clawrouter/node_modules/viem/accounts/index.js');
+      const { privateKeyToAccount } = require(require.resolve('viem/accounts', { paths: ['$ACTIVE_PACKAGE_DIR'] }));
       console.log(privateKeyToAccount('$FINAL_KEY').address);
     } catch { console.log('(run /wallet in OpenClaw to see your address)'); }
   " 2>/dev/null || echo "(run /wallet in OpenClaw to see your address)")

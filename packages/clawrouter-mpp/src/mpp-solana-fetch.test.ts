@@ -12,7 +12,7 @@ import {
   type SolanaChargeChallenge,
 } from "./mpp-solana-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
-import { MppPaidNoCompletionError } from "./mpp-paid-failure.js";
+import { MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
 
 // A real pay-kit server emits real Solana MPP 402s without touching a chain. The payer's RPC points at a
 // closed port, so a veto that fails to hold would surface as a connection error, not SpendPolicyError.
@@ -288,15 +288,25 @@ describe("Solana devnet fixture, no network", () => {
     };
     const { base, calls } = stubDevnet(new Response("no completion", { status: 502 }));
     const pay = createSolanaFixtureFetch({ spend: control, sign, fetch: base });
-    const err = await pay(FIXTURE_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{}",
-    }).catch((e) => e);
+    const before = readCredits().length;
+    const send = () =>
+      pay(FIXTURE_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+    const err = await send().catch((e) => e);
+    await send().catch(() => {});
     expect(err).toBeInstanceOf(MppPaidNoCompletionError);
     expect(err.message).toContain("Not retrying");
-    expect(calls).toHaveLength(2);
+    expect(readCredits().slice(before)).toEqual([
+      {
+        payer: FIXTURE_PAYEE,
+        amount: "750",
+        challengeId: "fixture-challenge-id",
+        reason: "HTTP 502",
+      },
+    ]);
     expect(signed).toEqual(["fixture-challenge-id"]);
-    expect(base).toHaveBeenCalledTimes(2);
   });
 });

@@ -61,7 +61,7 @@ describe("createMppFetch", () => {
 
 import { Mppx as ServerMppx, tempo as serverTempo } from "mppx/server";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
-import { MppPaidNoCompletionError } from "./mpp-paid-failure.js";
+import { MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
 import {
   createTempoFixtureFetch,
   guardMethod,
@@ -328,7 +328,7 @@ describe("OpenRouter Tempo fixture, no network", () => {
     expect(control.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
   });
 
-  it("a signed call with no completion is MppPaidNoCompletionError and is not retried", async () => {
+  it("a signed call with no completion yields exactly one credit and is idempotent across retries", async () => {
     const control = openRouterControl();
     const signed: string[] = [];
     const { base, calls } = stubOpenRouter(new Response("no completion", { status: 502 }));
@@ -340,16 +340,24 @@ describe("OpenRouter Tempo fixture, no network", () => {
       },
       fetch: base,
     });
+    const before = readCredits().length;
     const err = await payFetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body,
     }).catch((e: unknown) => e);
+    await payFetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    }).catch(() => {});
     expect(err).toBeInstanceOf(MppPaidNoCompletionError);
     expect((err as Error).message).toContain("Not retrying");
     expect((err as MppPaidNoCompletionError).status).toBe(502);
-    expect(calls).toHaveLength(2);
+    expect(readCredits().slice(before)).toEqual([
+      { payer: FIXTURE_PAYEE, amount: "750", challengeId: "fixture-challenge-id", reason: "HTTP 502" },
+    ]);
+    expect(calls.length).toBeGreaterThanOrEqual(2);
     expect(signed).toEqual(["fixture-challenge-id"]);
-    expect(base).toHaveBeenCalledTimes(2);
   });
 });

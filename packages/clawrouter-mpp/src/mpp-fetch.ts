@@ -23,7 +23,7 @@ import {
   type SpendControl,
   type SpendRecord,
 } from "@twzrd1111/clawrouter";
-import { guardPaid, markSigned } from "./mpp-paid-failure.js";
+import { creditFromChallenge, guardPaid, markSigned } from "./mpp-paid-failure.js";
 import { loadOptional, MPPX_RANGE } from "./mpp-optional.js";
 
 export type { PayFetch };
@@ -112,8 +112,9 @@ export function guardMethod<M extends MethodLike>(
   const guarded: MethodLike = {
     createCredential: async (options: { challenge: ChallengeLike }) => {
       const cached = signedOnce.get(reuseKey(options.challenge));
+      const credit = creditFromChallenge(options.challenge);
       if (cached) {
-        markSigned(cached.credential, cached.record);
+        markSigned(cached.credential, cached.record, credit);
         return cached.credential;
       }
       let reservationId: string | undefined;
@@ -139,7 +140,7 @@ export function guardMethod<M extends MethodLike>(
           ? control.settleReservation(reservationId, { action: "mpp tempo charge" })
           : undefined;
       signedOnce.set(reuseKey(options.challenge), { credential, record });
-      markSigned(credential, record);
+      markSigned(credential, record, credit);
       return credential;
     },
   };
@@ -253,8 +254,9 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
 
   const credentialFor = async (challenge: TempoChargeChallenge): Promise<string> => {
     const cached = signedOnce.get(reuseKey(challenge));
+    const credit = creditFromChallenge(challenge);
     if (cached) {
-      markSigned(cached.credential, cached.record);
+      markSigned(cached.credential, cached.record, credit);
       return cached.credential;
     }
     const { spend } = opts;
@@ -286,7 +288,7 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
         ? spend.settleReservation(reservationId, { action: "mpp tempo charge" })
         : undefined;
     signedOnce.set(reuseKey(challenge), { credential, record });
-    markSigned(credential, record);
+    markSigned(credential, record, credit);
     return credential;
   };
 

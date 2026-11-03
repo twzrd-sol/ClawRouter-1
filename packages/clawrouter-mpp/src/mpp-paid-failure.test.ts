@@ -4,7 +4,6 @@ import {
   guardPaid,
   markSigned,
   MppPaidNoCompletionError,
-  readCredits,
 } from "./mpp-paid-failure.js";
 import { guardMethod } from "./mpp-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
@@ -190,26 +189,4 @@ describe("optional MPP packages", () => {
   });
 });
 
-describe("credit for a paid call with no completion", () => {
-  const facts = {
-    payer: "0xfB9819456bd9248A9D3c9E12F4cb7bBda5fc2578",
-    amount: "750",
-    challengeId: "fixture-challenge-id",
-  };
 
-  it("records exactly one credit and a retry does not add another", async () => {
-    const before = readCredits().length;
-    const sign = vi.fn();
-    const miss = () =>
-      guardPaid(undefined, async () => {
-        markSigned("tx-sig-1", undefined, facts);
-        return new Response("down", { status: 502 });
-      });
-    const err = await miss().catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(MppPaidNoCompletionError);
-    await miss().catch(() => {});
-    const added = readCredits().slice(before);
-    expect(added).toEqual([{ ...facts, reason: "HTTP 502" }]);
-    expect(sign).not.toHaveBeenCalled();
-  });
-});

@@ -21,7 +21,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { PaymentCandidate, SolanaNetwork } from "@solana/pay-kit/client";
 import type { KeyPairSigner } from "@solana/kit";
-import { guardPaid, markSigned } from "./mpp-paid-failure.js";
+import { creditFromChallenge, guardPaid, markSigned } from "./mpp-paid-failure.js";
 import { loadOptional, PAY_KIT_RANGE } from "./mpp-optional.js";
 import {
   assertSpendPolicyAllows,
@@ -64,6 +64,7 @@ type Call = {
   /** The payee-aware check ran (the `challenge` event); signing without it is refused. */
   payeeChecked: boolean;
   quote?: { network: string; asset: string; amount?: string; priceable: boolean };
+  credit?: { payer: string; amount: string; challengeId: string };
 };
 
 export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise<PayFetch> {
@@ -124,10 +125,17 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
       if (!call) return;
       if (!spend) {
         // No limits: nothing to reserve, but a signed payment still has to be tracked (mpp-paid-failure.ts).
-        if (e.type === "signed" && typeof e.transaction === "string") markSigned(e.transaction);
+        if (e.type === "signed" && typeof e.transaction === "string")
+          markSigned(e.transaction, undefined, call.credit);
         return;
       }
       if (e.type === "challenge" && call.quote) {
+        const id = (event as { id?: unknown; challengeId?: unknown }).id;
+        const alt = (event as { challengeId?: unknown }).challengeId;
+        const challengeId = typeof id === "string" ? id : typeof alt === "string" ? alt : undefined;
+        if (typeof e.recipient === "string" && call.quote.amount && challengeId) {
+          call.credit = { payer: e.recipient, amount: call.quote.amount, challengeId };
+        }
         // Payee lists only: cost 0, because this payment's own amount is already reserved and counting
         // it again would block a payment that fits. Throws here, before the transaction is built, abort it.
         const result = spend.check(0, {
@@ -153,7 +161,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
           record = spend.settleReservation(call.reservationId, { action: "mpp solana charge" });
         }
         if (e.type === "signed" && typeof e.transaction === "string")
-          markSigned(e.transaction, record);
+          markSigned(e.transaction, record, call.credit);
       }
     })
     .build();
@@ -265,8 +273,9 @@ export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFe
 
   const credentialFor = async (challenge: SolanaChargeChallenge): Promise<string> => {
     const cached = signedOnce.get(reuseKey(challenge));
+    const credit = creditFromChallenge(challenge);
     if (cached) {
-      markSigned(cached.credential, cached.record);
+      markSigned(cached.credential, cached.record, credit);
       return cached.credential;
     }
     const { spend } = opts;
@@ -298,7 +307,7 @@ export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFe
         ? spend.settleReservation(reservationId, { action: "mpp solana charge" })
         : undefined;
     signedOnce.set(reuseKey(challenge), { credential, record });
-    markSigned(credential, record);
+    markSigned(credential, record, credit);
     return credential;
   };
 

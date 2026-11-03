@@ -66,11 +66,16 @@ export type PaidCall = {
 
 const credits = new CreditLedger();
 
-/** Attach the credit facts for the in-flight paid call. No signer. */
-export function bindCredit(fields: Pick<CreditEntry, "payer" | "amount" | "challengeId">): void {
-  const call = storage.getStore();
-  if (!call) return;
-  call.credit = fields;
+/** Payer, amount, and challenge id carried on the challenge itself. No signer. */
+export function creditFromChallenge(challenge: {
+  id: string;
+  request?: { amount?: unknown; recipient?: unknown } | Record<string, unknown>;
+}): Pick<CreditEntry, "payer" | "amount" | "challengeId"> | undefined {
+  const request = challenge.request;
+  const amount = request && "amount" in request ? request.amount : undefined;
+  const payer = request && "recipient" in request ? request.recipient : undefined;
+  if (typeof amount !== "string" || typeof payer !== "string" || challenge.id === "") return undefined;
+  return { payer, amount, challengeId: challenge.id };
 }
 
 /** Rows written by `fail` when a signed call returns no completion. */

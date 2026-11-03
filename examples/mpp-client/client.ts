@@ -12,15 +12,18 @@ import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 
 const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
 
-function endpointHost(args) {
-  const first = args[0];
+type ConnectArgs = Parameters<net.Socket["connect"]>;
+
+function endpointHost(args: ConnectArgs): string {
+  const first: unknown = args[0];
   if (typeof first === "object" && first !== null) {
-    if (typeof first.path === "string") return "localhost";
-    return first.host ?? first.hostname ?? "localhost";
+    const record = first as { path?: string; host?: string; hostname?: string };
+    if (typeof record.path === "string") return "localhost";
+    return record.host ?? record.hostname ?? "localhost";
   }
   if (typeof first === "string" && first.startsWith("/")) return "localhost";
   if (typeof first === "number" || (typeof first === "string" && /^\d+$/.test(first))) {
-    const host = args[1];
+    const host: unknown = args[1];
     if (host === undefined || typeof host === "function") return "localhost";
     return String(host);
   }
@@ -28,7 +31,7 @@ function endpointHost(args) {
 }
 
 const origConnect = net.Socket.prototype.connect;
-net.Socket.prototype.connect = function (...args) {
+net.Socket.prototype.connect = function (this: net.Socket, ...args: ConnectArgs) {
   const host = String(endpointHost(args));
   if (!LOOPBACK.has(host)) {
     throw new Error(`refusing non-local connection to ${host}`);
@@ -37,7 +40,7 @@ net.Socket.prototype.connect = function (...args) {
 };
 
 const realFetch = globalThis.fetch.bind(globalThis);
-globalThis.fetch = (input, init) => {
+globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
   const url =
     typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   let host = "";
@@ -55,16 +58,15 @@ globalThis.fetch = (input, init) => {
 const SELLER = "https://openrouter.mpp.tempo.xyz";
 const MODEL = "openai/gpt-4o-mini";
 
-const COMPLETION = {
-  id: "chatcmpl-fixture",
-  object: "chat.completion",
-  created: 0,
-  model: MODEL,
-  choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
-  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+interface ChatCompletion {
+  choices: { message: { content: string } }[];
+}
+
+const COMPLETION: ChatCompletion = {
+  choices: [{ message: { content: "ok" } }],
 };
 
-function memoryFetch() {
+function memoryFetch(): Promise<Response> {
   return Promise.resolve(
     new Response(JSON.stringify(COMPLETION), {
       status: 200,
@@ -78,7 +80,7 @@ function memoryFetch() {
 
 const account = privateKeyToAccount(generatePrivateKey());
 const spend = new SpendControl({ storage: new InMemorySpendControlStorage() });
-const payFetch = createMppFetch(account, memoryFetch, { spend });
+const payFetch = createMppFetch(account, memoryFetch as unknown as typeof fetch, { spend });
 
 const proxy = await startProxy({
   spendControl: spend,
@@ -105,7 +107,7 @@ try {
   const text = await r.text();
   let content = "";
   try {
-    content = JSON.parse(text)?.choices?.[0]?.message?.content ?? "";
+    content = (JSON.parse(text) as ChatCompletion)?.choices?.[0]?.message?.content ?? "";
   } catch {
     content = "";
   }

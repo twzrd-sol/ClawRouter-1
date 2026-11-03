@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Outside payer dry run: ClawRouter fork + MPP rail pointed at an MPP seller, with the completion answered from memory.",
   "scripts": {
-    "start": "node client.mjs"
+    "start": "node client.ts"
   },
   "dependencies": {
     "@twzrd1111/clawrouter": "0.12.306",

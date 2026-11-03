@@ -297,6 +297,8 @@ describe("OpenRouter Tempo fixture, no network", () => {
     const payFetch = createTempoFixtureFetch({
       spend: control,
       sign: async (challenge) => {
+        expect(control.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
+        expect(signed).toEqual([]);
         signed.push(challenge.id);
         return challenge.id;
       },

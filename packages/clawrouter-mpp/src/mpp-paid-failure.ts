@@ -21,6 +21,9 @@ import {
   type SpendControl,
   type SpendRecord,
 } from "@twzrd1111/clawrouter";
+import { CreditLedger, readCredits, type CreditEntry } from "./credit-record.js";
+
+export { CreditLedger, readCredits, type CreditEntry };
 
 export class MppPaidNoCompletionError extends Error {
   readonly reference: string;
@@ -32,6 +35,24 @@ export class MppPaidNoCompletionError extends Error {
     this.reference = reference;
     this.status = status;
   }
+}
+
+/**
+ * Record one credit for a paid call that returned no completion.
+ * A retry of the same payer and challenge returns the first row.
+ * `sign`, when passed, is never called.
+ */
+export function creditPaidNoCompletion(
+  ledger: CreditLedger,
+  err: MppPaidNoCompletionError,
+  fields: CreditEntry,
+  hooks?: { sign?: () => Promise<unknown> },
+): CreditEntry {
+  if (!(err instanceof MppPaidNoCompletionError)) {
+    throw new TypeError("credit requires MppPaidNoCompletionError");
+  }
+  void hooks;
+  return ledger.recordOnce(fields);
 }
 
 export type PaidCall = {

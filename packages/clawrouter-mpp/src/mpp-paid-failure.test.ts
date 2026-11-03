@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   boundedSnippet,
+  creditPaidNoCompletion,
+  CreditLedger,
   guardPaid,
   markSigned,
   MppPaidNoCompletionError,
+  readCredits,
 } from "./mpp-paid-failure.js";
 import { guardMethod } from "./mpp-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
@@ -186,5 +189,31 @@ describe("optional MPP packages", () => {
         throw dep;
       }),
     ).rejects.toBe(dep);
+  });
+});
+
+describe("credit for a paid call with no completion", () => {
+  const fields = {
+    payer: "0xfB9819456bd9248A9D3c9E12F4cb7bBda5fc2578",
+    amount: "750",
+    challengeId: "fixture-challenge-id",
+    reason: "HTTP 502",
+  };
+
+  it("records exactly one credit and a retry does not add another", async () => {
+    const ledger = new CreditLedger();
+    const sign = vi.fn();
+    const err = await guardPaid(undefined, async () => {
+      markSigned("tx-sig-1");
+      return new Response("down", { status: 502 });
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MppPaidNoCompletionError);
+    const first = creditPaidNoCompletion(ledger, err as MppPaidNoCompletionError, fields, { sign });
+    const second = creditPaidNoCompletion(ledger, err as MppPaidNoCompletionError, fields, { sign });
+    const rows = readCredits(ledger);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual(fields);
+    expect(second).toBe(first);
+    expect(sign).not.toHaveBeenCalled();
   });
 });

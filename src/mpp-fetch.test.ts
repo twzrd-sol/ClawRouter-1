@@ -23,6 +23,33 @@ describe("createMppFetch", () => {
     expect(base).toHaveBeenCalledTimes(1); // no retry: nothing was signed
   });
 
+  it("concurrent calls each get their own unpayable 402 back", async () => {
+    // An MPP challenge for a method this client cannot pay: mppx throws, and the caller must receive
+    // THIS call's 402, not whichever 402 another in-flight call stored last.
+    const challenge = (m: string) =>
+      `Payment id="${m}", realm="t", method="${m}", intent="charge", request="e30"`;
+    // Both responses resolve in the same tick, so each call's 402 is stored before either call reads it.
+    let started = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const base = vi.fn(async (input: RequestInfo | URL) => {
+      const tag = String(input).endsWith("/slow") ? "slow" : "fast";
+      if (++started === 2) release();
+      await gate;
+      return new Response(`body-${tag}`, {
+        status: 402,
+        headers: { "www-authenticate": challenge(`nope-${tag}`) },
+      });
+    }) as unknown as typeof fetch;
+    const payFetch = createMppFetch(account, base);
+    const [slow, fast] = await Promise.all([
+      payFetch("http://127.0.0.1:1/slow"),
+      payFetch("http://127.0.0.1:1/fast"),
+    ]);
+    expect(await slow.text()).toBe("body-slow");
+    expect(await fast.text()).toBe("body-fast");
+  });
+
   it("does not touch globalThis.fetch", () => {
     const before = globalThis.fetch;
     createMppFetch(account, vi.fn() as unknown as typeof fetch);

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { guardPaid, markSigned, MppPaidNoCompletionError } from "./mpp-paid-failure.js";
+import {
+  boundedSnippet,
+  guardPaid,
+  markSigned,
+  MppPaidNoCompletionError,
+} from "./mpp-paid-failure.js";
 import { guardMethod } from "./mpp-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "./spend-control.js";
 
@@ -49,6 +54,36 @@ describe("failure after an MPP payment was signed", () => {
     expect(history(c)).toHaveLength(1); // the spend stays
     expect(history(c)[0].note).toContain("signed, no completion (HTTP 500)");
     expect(history(c)[0].note).toContain(err.reference);
+  });
+
+  it("a never-ending error body cannot stall the failure report", async () => {
+    const c = control();
+    let pulled = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        pulled++;
+        ctrl.enqueue(new TextEncoder().encode("x".repeat(4096)));
+      },
+    });
+    const started = Date.now();
+    const err = await paidCall(c, () => new Response(endless, { status: 500 })).catch((e) => e);
+    expect(err).toBeInstanceOf(MppPaidNoCompletionError);
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(pulled).toBeLessThan(50); // read a bounded amount, not the whole stream
+    expect(err.message.length).toBeLessThan(600);
+    expect(history(c)[0].note).toContain("signed, no completion (HTTP 500)");
+  });
+
+  it("a body that goes silent mid-read is cut off by the timeout", async () => {
+    const stalled = new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        ctrl.enqueue(new TextEncoder().encode("partial"));
+      }, // never closes, never sends more
+    });
+    const started = Date.now();
+    const snippet = await boundedSnippet(new Response(stalled, { status: 500 }), 100);
+    expect(snippet).toBe("partial");
+    expect(Date.now() - started).toBeLessThan(1500);
   });
 
   it("a thrown error after signing is the same outcome, with the cause kept", async () => {

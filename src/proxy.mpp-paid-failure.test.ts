@@ -49,3 +49,29 @@ describe("proxy: MPP payment signed, then no completion", () => {
     expect(payFetch).toHaveBeenCalledTimes(1); // no retry, no fallback model
   });
 });
+
+// A rail that cannot honour configured spend limits must not be started, or it signs past them.
+describe("proxy: payFetch that does not enforce spend limits", () => {
+  const unguarded = vi.fn() as unknown as PayFetch; // enforcesSpend left unset
+  const opts = (spendControl: SpendControl) => ({
+    spendControl,
+    wallet: generatePrivateKey(),
+    apiBase: "http://127.0.0.1:9",
+    payFetch: unguarded,
+    skipBalanceCheck: true,
+    port: 0,
+    allowExistingProxy: false,
+  });
+
+  it("refuses to start when amount limits are configured", async () => {
+    const sc = new SpendControl({ storage: new InMemorySpendControlStorage() });
+    sc.setLimit("perRequest", 0.1);
+    await expect(startProxy(opts(sc))).rejects.toThrow(/does not enforce spend limits/);
+  });
+
+  it("still starts when no amount limits are configured", async () => {
+    const sc = new SpendControl({ storage: new InMemorySpendControlStorage() });
+    const p = await startProxy(opts(sc));
+    await p.close();
+  });
+});

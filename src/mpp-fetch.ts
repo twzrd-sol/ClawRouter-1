@@ -13,6 +13,7 @@
  *
  * The account is supplied by the caller; this module reads no env vars and no key files.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Mppx as MppxClient } from "mppx/client";
 import type { Account } from "viem";
 import { assertSpendPolicyAllows, SpendPolicyError, type SpendControl } from "./spend-control.js";
@@ -125,10 +126,12 @@ export function createMppFetch(
   // Remember the last 402 the upstream sent. mppx throws "No method found for challenges" when a 402
   // offers nothing this client can pay (e.g. a non-MPP gateway); callers expect to see that 402, not
   // an exception, so the proxy can classify it as a payment error like the other rails do.
-  let last402: Response | undefined;
+  // Kept per call (AsyncLocalStorage), not per fetch instance: concurrent requests share this fetch.
+  const calls = new AsyncLocalStorage<{ last402?: Response }>();
   const recording: typeof fetch = async (input, init) => {
     const res = await base(input, init);
-    last402 = res.status === 402 ? res.clone() : undefined;
+    const call = calls.getStore();
+    if (call) call.last402 = res.status === 402 ? res.clone() : undefined;
     return res;
   };
   // polyfill:false keeps globalThis.fetch untouched: only calls routed through this wrapper can pay.
@@ -146,13 +149,15 @@ export function createMppFetch(
     ));
 
   const payFetch: PayFetch = async (input, init) => {
-    last402 = undefined;
+    const call: { last402?: Response } = {};
     const mppx = await getMppx();
     try {
       // After a credential is signed, a failed or non-2xx result ends in MppPaidNoCompletionError.
-      return await guardPaid(spend, () => mppx.fetch(input, init));
+      return await calls.run(call, () => guardPaid(spend, () => mppx.fetch(input, init)));
     } catch (e) {
-      if (last402 && /No method found for challenges/.test((e as Error).message)) return last402;
+      if (call.last402 && /No method found for challenges/.test((e as Error).message)) {
+        return call.last402;
+      }
       throw e;
     }
   };

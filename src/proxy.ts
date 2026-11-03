@@ -3105,8 +3105,10 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   if (options.payFetch && !options.payFetch.enforcesSpend) {
     const sc = options.spendControl ?? getSharedSpendControl();
     if (sc.hasAmountLimits()) {
-      console.warn(
-        "[ClawRouter] \u26A0 payFetch override does not enforce spend limits; the configured perRequest/hourly/daily/session limits will NOT apply to this rail.",
+      // A rail that cannot honour configured limits must not be used: it would sign payments past them.
+      throw new Error(
+        "[ClawRouter] payFetch override does not enforce spend limits, but perRequest/hourly/daily/session limits are configured. " +
+          "Refusing to start. Build the rail with its spend option (e.g. createMppFetch(account, fetch, { spend })) or remove the limits.",
       );
     }
   }

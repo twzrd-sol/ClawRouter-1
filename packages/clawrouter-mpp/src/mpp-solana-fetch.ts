@@ -67,37 +67,37 @@ type Call = {
   credit?: { payer: string; amount: string; challengeId: string };
 };
 
+type SolanaProgressCall = {
+  quote?: { amount?: string };
+  /** Recipient from `{ type: "challenge", recipient }`, before amount or id arrive. */
+  payer?: string;
+  credit?: { payer: string; amount: string; challengeId: string };
+};
+
+type SolanaProgressEvent = {
+  type?: string;
+  recipient?: string;
+  transaction?: string;
+  id?: string;
+  challengeId?: string;
+  amount?: string;
+};
+
 /** Facts from a pay-kit progress event. Runs whether or not a spend control is set. */
-export function noteSolanaProgress(
-  call: { quote?: { amount?: string }; credit?: { payer: string; amount: string; challengeId: string } },
-  event: {
-    type?: string;
-    recipient?: string;
-    transaction?: string;
-    id?: string;
-    challengeId?: string;
-    amount?: string;
-  },
-): void {
-  const challengeId = event.challengeId ?? event.id;
-  const amount = event.amount ?? call.quote?.amount;
-  if (typeof event.recipient === "string" && challengeId && amount) {
-    call.credit = { payer: event.recipient, amount, challengeId };
+export function noteSolanaProgress(call: SolanaProgressCall, event: SolanaProgressEvent): void {
+  if (event.type === "challenge" && typeof event.recipient === "string") {
+    call.payer = event.recipient;
+  }
+  const challengeId = event.challengeId ?? event.id ?? (event.type === "signed" ? event.transaction : undefined);
+  const amount = event.amount ?? call.quote?.amount ?? "";
+  const payer = event.recipient ?? call.payer;
+  if (payer && challengeId) {
+    call.credit = { payer, amount, challengeId };
   }
 }
 
 /** No spend control: note the challenge, then record the signed proof. */
-export function applySolanaNoSpend(
-  call: { quote?: { amount?: string }; credit?: { payer: string; amount: string; challengeId: string } },
-  event: {
-    type?: string;
-    recipient?: string;
-    transaction?: string;
-    id?: string;
-    challengeId?: string;
-    amount?: string;
-  },
-): void {
+export function applySolanaNoSpend(call: SolanaProgressCall, event: SolanaProgressEvent): void {
   noteSolanaProgress(call, event);
   if (event.type === "signed" && typeof event.transaction === "string" && call.credit) {
     markSigned(event.transaction, call.credit);

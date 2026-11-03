@@ -228,26 +228,21 @@ describe("createSolanaMppFetch with no spend control", () => {
     const call: {
       settled: boolean;
       payeeChecked: boolean;
+      payer?: string;
       quote?: { amount?: string };
       credit?: { payer: string; amount: string; challengeId: string };
     } = { settled: false, payeeChecked: false };
-    const event = {
-      type: "signed",
-      transaction: "tx-sol",
-      recipient: FIXTURE_PAYEE,
-      amount: "750",
-      challengeId: "sol-challenge",
-    };
     const miss = () =>
       guardPaid(undefined, async () => {
-        applySolanaNoSpend(call, event);
+        applySolanaNoSpend(call, { type: "challenge", recipient: FIXTURE_PAYEE });
+        applySolanaNoSpend(call, { type: "signed", transaction: "tx-sol" });
         return new Response("down", { status: 502 });
       });
     const err = await miss().catch((e: unknown) => e);
     await miss().catch(() => {});
     expect(err).toBeInstanceOf(MppPaidNoCompletionError);
     expect(readCredits().slice(before)).toEqual([
-      { payer: FIXTURE_PAYEE, amount: "750", challengeId: "sol-challenge", reason: "HTTP 502" },
+      { payer: FIXTURE_PAYEE, amount: "", challengeId: "tx-sol", reason: "HTTP 502" },
     ]);
   });
 });

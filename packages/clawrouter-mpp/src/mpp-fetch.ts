@@ -113,8 +113,9 @@ export function guardMethod<M extends MethodLike>(
     createCredential: async (options: { challenge: ChallengeLike }) => {
       const cached = signedOnce.get(reuseKey(options.challenge));
       const credit = creditFromChallenge(options.challenge);
+      if (!credit) throw new Error("challenge is missing payer, amount, or id");
       if (cached) {
-        markSigned(cached.credential, cached.record, credit);
+        markSigned(cached.credential, credit, cached.record);
         return cached.credential;
       }
       let reservationId: string | undefined;
@@ -140,7 +141,7 @@ export function guardMethod<M extends MethodLike>(
           ? control.settleReservation(reservationId, { action: "mpp tempo charge" })
           : undefined;
       signedOnce.set(reuseKey(options.challenge), { credential, record });
-      markSigned(credential, record, credit);
+      markSigned(credential, credit, record);
       return credential;
     },
   };
@@ -255,8 +256,9 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
   const credentialFor = async (challenge: TempoChargeChallenge): Promise<string> => {
     const cached = signedOnce.get(reuseKey(challenge));
     const credit = creditFromChallenge(challenge);
+    if (!credit) throw new Error("challenge is missing payer, amount, or id");
     if (cached) {
-      markSigned(cached.credential, cached.record, credit);
+      markSigned(cached.credential, credit, cached.record);
       return cached.credential;
     }
     const { spend } = opts;
@@ -288,7 +290,7 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
         ? spend.settleReservation(reservationId, { action: "mpp tempo charge" })
         : undefined;
     signedOnce.set(reuseKey(challenge), { credential, record });
-    markSigned(credential, record, credit);
+    markSigned(credential, credit, record);
     return credential;
   };
 

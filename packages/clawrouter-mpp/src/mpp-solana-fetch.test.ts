@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairSigner } from "@solana/kit";
 import { createPayKit, usd } from "@solana/pay-kit";
 import {
+  applySolanaNoSpend,
   createSolanaFixtureFetch,
   createSolanaMppFetch,
   parseSolanaChargeHeader,
@@ -12,7 +13,7 @@ import {
   type SolanaChargeChallenge,
 } from "./mpp-solana-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
-import { MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
+import { guardPaid, MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
 
 // A real pay-kit server emits real Solana MPP 402s without touching a chain. The payer's RPC points at a
 // closed port, so a veto that fails to hold would surface as a connection error, not SpendPolicyError.
@@ -220,6 +221,31 @@ function stubDevnet(paid: Response) {
   }) as unknown as typeof fetch;
   return { base, calls };
 }
+
+describe("createSolanaMppFetch with no spend control", () => {
+  it("a signed 502 records one credit from the challenge and a retry stays one row", async () => {
+    const before = readCredits().length;
+    const call = { settled: false, payeeChecked: false };
+    const event = {
+      type: "signed",
+      transaction: "tx-sol",
+      recipient: FIXTURE_PAYEE,
+      amount: "750",
+      challengeId: "sol-challenge",
+    };
+    const miss = () =>
+      guardPaid(undefined, async () => {
+        applySolanaNoSpend(call, event);
+        return new Response("down", { status: 502 });
+      });
+    const err = await miss().catch((e: unknown) => e);
+    await miss().catch(() => {});
+    expect(err).toBeInstanceOf(MppPaidNoCompletionError);
+    expect(readCredits().slice(before)).toEqual([
+      { payer: FIXTURE_PAYEE, amount: "750", challengeId: "sol-challenge", reason: "HTTP 502" },
+    ]);
+  });
+});
 
 describe("Solana devnet fixture, no network", () => {
   const parsed = parseSolanaChargeHeader(FIXTURE_HEADER);

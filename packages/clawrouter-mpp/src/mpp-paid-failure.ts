@@ -70,7 +70,7 @@ const credits = new CreditLedger();
 export function creditFromChallenge(challenge: {
   id: string;
   request?: { amount?: unknown; recipient?: unknown } | Record<string, unknown>;
-}): Pick<CreditEntry, "payer" | "amount" | "challengeId"> | undefined {
+}): CreditFacts | undefined {
   const request = challenge.request;
   const amount = request && "amount" in request ? request.amount : undefined;
   const payer = request && "recipient" in request ? request.recipient : undefined;
@@ -95,18 +95,16 @@ export function paymentReference(payload: string): string {
   return `mpp-${createHash("sha256").update(payload).digest("hex").slice(0, 16)}`;
 }
 
-/** Record that this call produced a signed payment. First one wins; a call pays at most once. */
-export function markSigned(
-  payload: string,
-  record?: SpendRecord,
-  credit?: Pick<CreditEntry, "payer" | "amount" | "challengeId">,
-): void {
+export type CreditFacts = Pick<CreditEntry, "payer" | "amount" | "challengeId">;
+
+/** Record that this call produced a signed payment. Facts are required. First one wins. */
+export function markSigned(payload: string, facts: CreditFacts, record?: SpendRecord): void {
   const call = storage.getStore();
   if (!call || call.signed) return;
   call.signed = true;
   call.reference = paymentReference(payload);
   call.record = record;
-  if (credit) call.credit = credit;
+  call.credit = facts;
 }
 
 /**

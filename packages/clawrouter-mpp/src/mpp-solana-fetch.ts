@@ -67,6 +67,43 @@ type Call = {
   credit?: { payer: string; amount: string; challengeId: string };
 };
 
+/** Facts from a pay-kit progress event. Runs whether or not a spend control is set. */
+export function noteSolanaProgress(
+  call: { quote?: { amount?: string }; credit?: { payer: string; amount: string; challengeId: string } },
+  event: {
+    type?: string;
+    recipient?: string;
+    transaction?: string;
+    id?: string;
+    challengeId?: string;
+    amount?: string;
+  },
+): void {
+  const challengeId = event.challengeId ?? event.id;
+  const amount = event.amount ?? call.quote?.amount;
+  if (typeof event.recipient === "string" && challengeId && amount) {
+    call.credit = { payer: event.recipient, amount, challengeId };
+  }
+}
+
+/** No spend control: note the challenge, then record the signed proof. */
+export function applySolanaNoSpend(
+  call: { quote?: { amount?: string }; credit?: { payer: string; amount: string; challengeId: string } },
+  event: {
+    type?: string;
+    recipient?: string;
+    transaction?: string;
+    id?: string;
+    challengeId?: string;
+    amount?: string;
+  },
+): void {
+  noteSolanaProgress(call, event);
+  if (event.type === "signed" && typeof event.transaction === "string" && call.credit) {
+    markSigned(event.transaction, call.credit);
+  }
+}
+
 export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise<PayFetch> {
   const { spend, network } = opts;
   const usd = new Set([...DEFAULT_SOLANA_USD_MINTS, ...(opts.usdMints ?? [])]);
@@ -121,12 +158,18 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
     .permissions(permissions as any)
     .onProgress((event) => {
       const call = calls.getStore();
-      const e = event as { type?: string; recipient?: string; transaction?: string };
+      const e = event as {
+        type?: string;
+        recipient?: string;
+        transaction?: string;
+        id?: string;
+        challengeId?: string;
+        amount?: string;
+      };
       if (!call) return;
+      noteSolanaProgress(call, e);
       if (!spend) {
-        // No limits: nothing to reserve, but a signed payment still has to be tracked (mpp-paid-failure.ts).
-        if (e.type === "signed" && typeof e.transaction === "string")
-          markSigned(e.transaction, undefined, call.credit);
+        applySolanaNoSpend(call, e);
         return;
       }
       if (e.type === "challenge" && call.quote) {
@@ -160,8 +203,8 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
           call.settled = true;
           record = spend.settleReservation(call.reservationId, { action: "mpp solana charge" });
         }
-        if (e.type === "signed" && typeof e.transaction === "string")
-          markSigned(e.transaction, record, call.credit);
+        if (e.type === "signed" && typeof e.transaction === "string" && call.credit)
+          markSigned(e.transaction, call.credit, record);
       }
     })
     .build();
@@ -274,8 +317,9 @@ export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFe
   const credentialFor = async (challenge: SolanaChargeChallenge): Promise<string> => {
     const cached = signedOnce.get(reuseKey(challenge));
     const credit = creditFromChallenge(challenge);
+    if (!credit) throw new Error("challenge is missing payer, amount, or id");
     if (cached) {
-      markSigned(cached.credential, cached.record, credit);
+      markSigned(cached.credential, credit, cached.record);
       return cached.credential;
     }
     const { spend } = opts;
@@ -307,7 +351,7 @@ export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFe
         ? spend.settleReservation(reservationId, { action: "mpp solana charge" })
         : undefined;
     signedOnce.set(reuseKey(challenge), { credential, record });
-    markSigned(credential, record, credit);
+    markSigned(credential, credit, record);
     return credential;
   };
 

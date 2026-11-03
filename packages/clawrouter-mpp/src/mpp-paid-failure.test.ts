@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   boundedSnippet,
+  creditFromChallenge,
   guardPaid,
   markSigned,
   MppPaidNoCompletionError,
+  readCredits,
 } from "./mpp-paid-failure.js";
 import { guardMethod } from "./mpp-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
@@ -42,6 +44,7 @@ const paidCall = (c: SpendControl, respond: () => Response | Promise<Response>) 
 describe("failure after an MPP payment was signed", () => {
   it("a seller 500 after signing stops the call, keeps the spend, and notes it in the ledger", async () => {
     const c = control();
+    const before = readCredits().length;
     const err = await paidCall(c, () => new Response("model crashed", { status: 500 })).catch(
       (e) => e,
     );
@@ -54,6 +57,16 @@ describe("failure after an MPP payment was signed", () => {
     expect(history(c)).toHaveLength(1); // the spend stays
     expect(history(c)[0].note).toContain("signed, no completion (HTTP 500)");
     expect(history(c)[0].note).toContain(err.reference);
+    await paidCall(c, () => new Response("model crashed", { status: 500 })).catch(() => {});
+    const added = readCredits().slice(before);
+    expect(added).toEqual([
+      {
+        payer: challenge.request.recipient,
+        amount: challenge.request.amount,
+        challengeId: challenge.id,
+        reason: "HTTP 500",
+      },
+    ]);
   });
 
   it("a never-ending error body cannot stall the failure report", async () => {
@@ -127,7 +140,7 @@ describe("failure after an MPP payment was signed", () => {
 
   it("works without a spend control: still stops, no ledger to annotate", async () => {
     const err = await guardPaid(undefined, async () => {
-      markSigned("tx-bytes");
+      markSigned("tx-bytes", creditFromChallenge(challenge)!);
       return new Response("bad gateway", { status: 502 });
     }).catch((e) => e);
     expect(err).toBeInstanceOf(MppPaidNoCompletionError);
@@ -136,7 +149,7 @@ describe("failure after an MPP payment was signed", () => {
 
   it("runs the call once: the guard itself never retries", async () => {
     const run = vi.fn(async () => {
-      markSigned("tx");
+      markSigned("tx", creditFromChallenge(challenge)!);
       return new Response("x", { status: 503 });
     });
     await guardPaid(undefined, run).catch(() => {});
@@ -147,7 +160,7 @@ describe("failure after an MPP payment was signed", () => {
     const ref = async (p: string) =>
       (
         await guardPaid(undefined, async () => {
-          markSigned(p);
+          markSigned(p, creditFromChallenge(challenge)!);
           return new Response("", { status: 500 });
         }).catch((e) => e)
       ).reference;

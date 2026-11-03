@@ -254,7 +254,7 @@ describe("createSolanaMppFetch with no spend control", () => {
             return chain;
           },
         },
-      }) as Awaited<ReturnType<typeof realLoad>>;
+      }) as unknown as Awaited<ReturnType<typeof realLoad>>;
     try {
       const pay = await createSolanaMppFetch({
         signer: await generateKeyPairSigner(),

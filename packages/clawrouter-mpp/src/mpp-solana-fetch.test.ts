@@ -1,10 +1,18 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairSigner } from "@solana/kit";
 import { createPayKit, usd } from "@solana/pay-kit";
-import { createSolanaMppFetch } from "./mpp-solana-fetch.js";
+import {
+  createSolanaFixtureFetch,
+  createSolanaMppFetch,
+  parseSolanaChargeHeader,
+  quoteFromSolanaChallenge,
+  SOLANA_DEVNET_USDC_MINT,
+  type SolanaChargeChallenge,
+} from "./mpp-solana-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
+import { MppPaidNoCompletionError } from "./mpp-paid-failure.js";
 
 // A real pay-kit server emits real Solana MPP 402s without touching a chain. The payer's RPC points at a
 // closed port, so a veto that fails to hold would surface as a connection error, not SpendPolicyError.
@@ -170,5 +178,125 @@ describe("Solana MPP spend controls", () => {
     });
     expect(plain.enforcesSpend).toBe(false);
     expect(guarded.enforcesSpend).toBe(true);
+  });
+});
+
+const DEVNET_NETWORK = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+const FIXTURE_PAYEE = "DevnetFixturePayee11111111111111111111111111";
+const FIXTURE_RECEIPT = "solana-receipt-fixture";
+const COMPLETION_BODY = { id: "chatcmpl-fixture", choices: [{ message: { content: "hi" } }] };
+const FIXTURE_URL = "https://devnet.fixture.invalid/v1/chat/completions";
+const FIXTURE_REQUEST = {
+  amount: "750",
+  currency: SOLANA_DEVNET_USDC_MINT,
+  recipient: FIXTURE_PAYEE,
+  methodDetails: { network: DEVNET_NETWORK, decimals: 6 },
+};
+const FIXTURE_HEADER = `Payment id="fixture-challenge-id", realm="devnet.fixture", method="solana", intent="charge", request="${Buffer.from(JSON.stringify(FIXTURE_REQUEST)).toString("base64url")}"`;
+
+function devnetControl() {
+  const c = new SpendControl({ storage: new InMemorySpendControlStorage() });
+  c.setLimit("perRequest", 0.001);
+  c.setLimit("daily", 1);
+  c.setPolicy("allowedPayees", [FIXTURE_PAYEE]);
+  c.setPolicy("allowedNetworks", [DEVNET_NETWORK]);
+  return c;
+}
+
+/** Stub the seller. No socket and no signer: 402 from the inline fixture, then the scripted paid response. */
+function stubDevnet(paid: Response) {
+  const calls: Array<{ url: string; authorization: string | null }> = [];
+  const base = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    const authorization = headers.get("authorization");
+    calls.push({ url: String(input), authorization });
+    if (!authorization) {
+      return new Response(JSON.stringify({ title: "Payment Required" }), {
+        status: 402,
+        headers: { "www-authenticate": FIXTURE_HEADER },
+      });
+    }
+    return paid.clone();
+  }) as unknown as typeof fetch;
+  return { base, calls };
+}
+
+describe("Solana devnet fixture, no network", () => {
+  const parsed = parseSolanaChargeHeader(FIXTURE_HEADER);
+
+  it("parses the devnet charge: 750 units, USDC devnet mint, devnet CAIP-2, fixture payee", () => {
+    expect(parsed.request).toEqual(FIXTURE_REQUEST);
+    expect(parsed.realm).toBe("devnet.fixture");
+    expect(quoteFromSolanaChallenge(parsed)).toMatchObject({
+      payTo: FIXTURE_PAYEE,
+      network: DEVNET_NETWORK,
+      asset: SOLANA_DEVNET_USDC_MINT,
+      amount: "750",
+      priceable: true,
+    });
+  });
+
+  it("reserves, signs once, attaches the credential, and returns the completion plus receipt", async () => {
+    const control = devnetControl();
+    const seenPending: number[] = [];
+    const historyAtSign: number[] = [];
+    const signed: string[] = [];
+    const sign = async (c: SolanaChargeChallenge) => {
+      seenPending.push(control.getSpending("daily"));
+      historyAtSign.push((control as unknown as { history: unknown[] }).history.length);
+      signed.push(c.id);
+      return c.id;
+    };
+    const { base, calls } = stubDevnet(
+      new Response(JSON.stringify(COMPLETION_BODY), {
+        status: 200,
+        headers: { "content-type": "application/json", "Payment-Receipt": FIXTURE_RECEIPT },
+      }),
+    );
+    const body = JSON.stringify({ model: "fixture" });
+    const pay = createSolanaFixtureFetch({ spend: control, sign, fetch: base });
+    const once = () =>
+      pay(FIXTURE_URL, { method: "POST", headers: { "content-type": "application/json" }, body });
+
+    const res = await once();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(COMPLETION_BODY);
+    expect(res.headers.get("payment-receipt")).toBe(FIXTURE_RECEIPT);
+    expect(seenPending[0]).toBeCloseTo(0.00075, 8);
+    expect(historyAtSign).toEqual([0]);
+    expect(signed).toEqual(["fixture-challenge-id"]);
+    expect(calls[0].authorization).toBeNull();
+    expect(calls[1].authorization).toBe("Payment fixture-challenge-id");
+    expect(calls.every((c) => c.url === FIXTURE_URL)).toBe(true);
+    expect(control.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
+
+    const again = await once();
+    expect(again.status).toBe(200);
+    expect(again.headers.get("payment-receipt")).toBe(FIXTURE_RECEIPT);
+    expect(signed).toEqual(["fixture-challenge-id"]);
+    expect(calls).toHaveLength(4);
+    expect(calls[3].authorization).toBe("Payment fixture-challenge-id");
+    expect(control.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
+  });
+
+  it("a signed call with no completion is MppPaidNoCompletionError and is not retried", async () => {
+    const control = devnetControl();
+    const signed: string[] = [];
+    const sign = async (c: SolanaChargeChallenge) => {
+      signed.push(c.id);
+      return c.id;
+    };
+    const { base, calls } = stubDevnet(new Response("no completion", { status: 502 }));
+    const pay = createSolanaFixtureFetch({ spend: control, sign, fetch: base });
+    const err = await pay(FIXTURE_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(MppPaidNoCompletionError);
+    expect(err.message).toContain("Not retrying");
+    expect(calls).toHaveLength(2);
+    expect(signed).toEqual(["fixture-challenge-id"]);
+    expect(base).toHaveBeenCalledTimes(2);
   });
 });

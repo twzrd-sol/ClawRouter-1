@@ -28,6 +28,7 @@ import {
   SpendPolicyError,
   type PayFetch,
   type SpendControl,
+  type SpendRecord,
 } from "@twzrd1111/clawrouter";
 
 /**
@@ -170,5 +171,155 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
     }
   };
   payFetch.enforcesSpend = spend !== undefined;
+  return payFetch;
+}
+
+/** USDC on Solana devnet. Priced as 6-decimal USD, same as `DEFAULT_SOLANA_USD_MINTS`. */
+export const SOLANA_DEVNET_USDC_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+
+export type SolanaChargeChallenge = {
+  id: string;
+  realm?: string;
+  method: string;
+  intent: string;
+  request: {
+    amount?: unknown;
+    currency?: unknown;
+    recipient?: unknown;
+    methodDetails?: { network?: unknown };
+  };
+};
+
+/** Map a challenge network (name or CAIP-2) onto the id `allowedNetworks` stores. */
+function solanaNetworkId(value: string): string {
+  if (value === "devnet" || value === CAIP2.devnet) return CAIP2.devnet;
+  if (value === "mainnet" || value === "mainnet-beta" || value === CAIP2.mainnet) return CAIP2.mainnet;
+  if (value === "localnet" || value === CAIP2.localnet) return CAIP2.localnet;
+  return value;
+}
+
+/** The quote a Solana charge challenge presents to spend control. `amount` stays unset if unpriceable. */
+export function quoteFromSolanaChallenge(
+  challenge: { request?: SolanaChargeChallenge["request"] },
+  usdMints: ReadonlySet<string> = DEFAULT_SOLANA_USD_MINTS,
+) {
+  const req = challenge.request ?? {};
+  const asset = typeof req.currency === "string" ? req.currency : undefined;
+  const rawNetwork = req.methodDetails?.network;
+  const priceable =
+    asset !== undefined && usdMints.has(asset) && typeof req.amount === "string";
+  return {
+    payTo: typeof req.recipient === "string" ? req.recipient : undefined,
+    network: typeof rawNetwork === "string" ? solanaNetworkId(rawNetwork) : undefined,
+    asset,
+    amount: priceable ? (req.amount as string) : undefined,
+    priceable,
+  };
+}
+
+/** Parse one `WWW-Authenticate: Payment` charge header. Throws if the header is not that shape. */
+export function parseSolanaChargeHeader(header: string): SolanaChargeChallenge {
+  const pick = (name: string) => new RegExp(`${name}="([^"]*)"`).exec(header)?.[1];
+  const id = pick("id");
+  const realm = pick("realm");
+  const method = pick("method");
+  const intent = pick("intent");
+  const requestB64 = pick("request");
+  if (!id || !method || !intent || !requestB64) throw new Error("unparsed Solana MPP challenge");
+  const parsed: unknown = JSON.parse(Buffer.from(requestB64, "base64url").toString("utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("unparsed Solana MPP challenge");
+  }
+  const request = parsed as SolanaChargeChallenge["request"];
+  return { id, realm, method, intent, request };
+}
+
+export type SolanaFixtureFetchOptions = {
+  /** When set, the challenge is checked and reserved before `sign` runs. */
+  spend?: SpendControl;
+  /** Extra mints to treat as 6-decimal USD. */
+  usdMints?: Iterable<string>;
+  /**
+   * Produce the signed payload for this challenge. No key file and no RPC: the caller supplies it.
+   * Called at most once per challenge quote; a later call resends the same credential.
+   */
+  sign: (challenge: SolanaChargeChallenge) => string | Promise<string>;
+  /** Seller. Tests pass a stub; this helper never calls `globalThis.fetch`. */
+  fetch: typeof fetch;
+};
+
+/**
+ * Solana charge completion without pay-kit.
+ *
+ * pay-kit builds the transaction through an RPC and a `KeyPairSigner`, so `createSolanaMppFetch`
+ * cannot finish a devnet challenge offline. This runs the same spend checks (price, network, asset,
+ * payee, reserve, then settle) and attaches one cached `Payment` credential via `opts.fetch`.
+ */
+export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFetch {
+  const usd = new Set([...DEFAULT_SOLANA_USD_MINTS, ...(opts.usdMints ?? [])]);
+  const signedOnce = new Map<string, { credential: string; record?: SpendRecord }>();
+  const reuseKey = (challenge: SolanaChargeChallenge) => {
+    const quote = quoteFromSolanaChallenge(challenge, usd);
+    return `${challenge.id}|${quote.amount ?? ""}|${quote.asset ?? ""}|${quote.payTo ?? ""}|${quote.network ?? ""}`;
+  };
+
+  const credentialFor = async (challenge: SolanaChargeChallenge): Promise<string> => {
+    const cached = signedOnce.get(reuseKey(challenge));
+    if (cached) {
+      markSigned(cached.credential, cached.record);
+      return cached.credential;
+    }
+    const { spend } = opts;
+    let reservationId: string | undefined;
+    if (spend) {
+      const quote = quoteFromSolanaChallenge(challenge, usd);
+      if (!quote.priceable && spend.hasAmountLimits()) {
+        throw new SpendPolicyError(
+          `MPP quote is in a mint ClawRouter cannot price (${quote.asset ?? "none"}); refusing to pay against a configured spend limit`,
+        );
+      }
+      reservationId = assertSpendPolicyAllows(spend, {
+        payTo: quote.payTo,
+        network: quote.network,
+        asset: quote.asset,
+        amount: quote.amount,
+      });
+    }
+    let payload: string;
+    try {
+      payload = await opts.sign(challenge);
+    } catch (err) {
+      if (spend && reservationId !== undefined) spend.releaseReservation(reservationId);
+      throw err;
+    }
+    const credential = payload.startsWith("Payment ") ? payload : `Payment ${payload}`;
+    const record =
+      spend && reservationId !== undefined
+        ? spend.settleReservation(reservationId, { action: "mpp solana charge" })
+        : undefined;
+    signedOnce.set(reuseKey(challenge), { credential, record });
+    markSigned(credential, record);
+    return credential;
+  };
+
+  const payFetch: PayFetch = async (input, init) =>
+    guardPaid(opts.spend, async () => {
+      const challengeRes = await opts.fetch(input, init);
+      if (challengeRes.status !== 402) return challengeRes;
+      const header = challengeRes.headers.get("www-authenticate");
+      let challenge: SolanaChargeChallenge;
+      try {
+        if (!header) return challengeRes;
+        challenge = parseSolanaChargeHeader(header);
+      } catch {
+        return challengeRes;
+      }
+      if (challenge.method !== "solana" || challenge.intent !== "charge") return challengeRes;
+      const credential = await credentialFor(challenge);
+      const headers = new Headers(init?.headers);
+      headers.set("authorization", credential);
+      return opts.fetch(input, { ...init, headers });
+    });
+  payFetch.enforcesSpend = opts.spend !== undefined;
   return payFetch;
 }

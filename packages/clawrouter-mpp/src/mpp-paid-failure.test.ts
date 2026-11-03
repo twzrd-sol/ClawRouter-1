@@ -1,8 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  bindCredit,
   boundedSnippet,
-  creditPaidNoCompletion,
-  CreditLedger,
   guardPaid,
   markSigned,
   MppPaidNoCompletionError,
@@ -193,27 +192,26 @@ describe("optional MPP packages", () => {
 });
 
 describe("credit for a paid call with no completion", () => {
-  const fields = {
+  const facts = {
     payer: "0xfB9819456bd9248A9D3c9E12F4cb7bBda5fc2578",
     amount: "750",
     challengeId: "fixture-challenge-id",
-    reason: "HTTP 502",
   };
 
   it("records exactly one credit and a retry does not add another", async () => {
-    const ledger = new CreditLedger();
+    const before = readCredits().length;
     const sign = vi.fn();
-    const err = await guardPaid(undefined, async () => {
-      markSigned("tx-sig-1");
-      return new Response("down", { status: 502 });
-    }).catch((e: unknown) => e);
+    const miss = () =>
+      guardPaid(undefined, async () => {
+        markSigned("tx-sig-1");
+        bindCredit(facts);
+        return new Response("down", { status: 502 });
+      });
+    const err = await miss().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MppPaidNoCompletionError);
-    const first = creditPaidNoCompletion(ledger, err as MppPaidNoCompletionError, fields, { sign });
-    const second = creditPaidNoCompletion(ledger, err as MppPaidNoCompletionError, fields, { sign });
-    const rows = readCredits(ledger);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toEqual(fields);
-    expect(second).toBe(first);
+    await miss().catch(() => {});
+    const added = readCredits().slice(before);
+    expect(added).toEqual([{ ...facts, reason: "HTTP 502" }]);
     expect(sign).not.toHaveBeenCalled();
   });
 });

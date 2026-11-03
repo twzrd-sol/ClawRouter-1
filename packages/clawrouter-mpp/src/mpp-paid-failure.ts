@@ -21,9 +21,7 @@ import {
   type SpendControl,
   type SpendRecord,
 } from "@twzrd1111/clawrouter";
-import { CreditLedger, readCredits, type CreditEntry } from "./credit-record.js";
-
-export { CreditLedger, readCredits, type CreditEntry };
+import { CreditLedger, type CreditEntry } from "./credit-record.js";
 
 export class MppPaidNoCompletionError extends Error {
   readonly reference: string;
@@ -62,7 +60,23 @@ export type PaidCall = {
   reference?: string;
   /** The ledger entry written when the payment was signed, if limits made one. */
   record?: SpendRecord;
+  /** Payer, amount, and challenge known before the model runs. Reason is filled on failure. */
+  credit?: Pick<CreditEntry, "payer" | "amount" | "challengeId">;
 };
+
+const credits = new CreditLedger();
+
+/** Attach the credit facts for the in-flight paid call. No signer. */
+export function bindCredit(fields: Pick<CreditEntry, "payer" | "amount" | "challengeId">): void {
+  const call = storage.getStore();
+  if (!call) return;
+  call.credit = fields;
+}
+
+/** Rows written by `fail` when a signed call returns no completion. */
+export function readCredits(): readonly CreditEntry[] {
+  return credits.read();
+}
 
 const storage = new AsyncLocalStorage<PaidCall>();
 
@@ -171,11 +185,15 @@ function fail(
   if (spend && call.record) {
     spend.annotateRecord(call.record, `signed, no completion (${why}) ref ${reference}`);
   }
-  return new MppPaidNoCompletionError(
+  const error = new MppPaidNoCompletionError(
     `MPP payment was signed and sent but no completion came back (${why}${detail ? `: ${detail}` : ""}). ` +
       `Not retrying, to avoid paying twice. Payment reference: ${reference}`,
     reference,
     status,
     { cause },
   );
+  if (call.credit) {
+    creditPaidNoCompletion(credits, error, { ...call.credit, reason: why });
+  }
+  return error;
 }

@@ -104,6 +104,12 @@ export function applySolanaNoSpend(call: SolanaProgressCall, event: SolanaProgre
   }
 }
 
+/** Loads pay-kit. Tests replace this with a client whose fetch emits progress events. */
+export const payKitClientDeps = {
+  load: () =>
+    loadOptional("@solana/pay-kit", PAY_KIT_RANGE, () => import("@solana/pay-kit/client")),
+};
+
 export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise<PayFetch> {
   const { spend, network } = opts;
   const usd = new Set([...DEFAULT_SOLANA_USD_MINTS, ...(opts.usdMints ?? [])]);
@@ -144,11 +150,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
     : undefined;
 
   // `@solana/pay-kit` is an optional peer dependency (see mpp-optional.ts).
-  const { PayKitClient } = await loadOptional(
-    "@solana/pay-kit",
-    PAY_KIT_RANGE,
-    () => import("@solana/pay-kit/client"),
-  );
+  const { PayKitClient } = await payKitClientDeps.load();
   const client = await PayKitClient.builder()
     .signer(opts.signer)
     .rpcUrl(opts.rpcUrl)

@@ -4,16 +4,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairSigner } from "@solana/kit";
 import { createPayKit, usd } from "@solana/pay-kit";
 import {
-  applySolanaNoSpend,
   createSolanaFixtureFetch,
   createSolanaMppFetch,
   parseSolanaChargeHeader,
+  payKitClientDeps,
   quoteFromSolanaChallenge,
   SOLANA_DEVNET_USDC_MINT,
   type SolanaChargeChallenge,
 } from "./mpp-solana-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
-import { guardPaid, MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
+import { MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
 
 // A real pay-kit server emits real Solana MPP 402s without touching a chain. The payer's RPC points at a
 // closed port, so a veto that fails to hold would surface as a connection error, not SpendPolicyError.
@@ -225,25 +225,52 @@ function stubDevnet(paid: Response) {
 describe("createSolanaMppFetch with no spend control", () => {
   it("a signed 502 records one credit from the challenge and a retry stays one row", async () => {
     const before = readCredits().length;
-    const call: {
-      settled: boolean;
-      payeeChecked: boolean;
-      payer?: string;
-      quote?: { amount?: string };
-      credit?: { payer: string; amount: string; challengeId: string };
-    } = { settled: false, payeeChecked: false };
-    const miss = () =>
-      guardPaid(undefined, async () => {
-        applySolanaNoSpend(call, { type: "challenge", recipient: FIXTURE_PAYEE });
-        applySolanaNoSpend(call, { type: "signed", transaction: "tx-sol" });
-        return new Response("down", { status: 502 });
+    const realLoad = payKitClientDeps.load;
+    payKitClientDeps.load = async () =>
+      ({
+        PayKitClient: {
+          builder() {
+            let progress: (event: unknown) => void = () => {};
+            const chain = {
+              signer: () => chain,
+              rpcUrl: () => chain,
+              network: () => chain,
+              accept: () => chain,
+              permissions: () => chain,
+              onProgress(cb: (event: unknown) => void) {
+                progress = cb;
+                return chain;
+              },
+              async build() {
+                return {
+                  async fetch() {
+                    progress({ type: "challenge", recipient: FIXTURE_PAYEE });
+                    progress({ type: "signed", transaction: "tx-sol" });
+                    return new Response("down", { status: 502 });
+                  },
+                };
+              },
+            };
+            return chain;
+          },
+        },
+      }) as Awaited<ReturnType<typeof realLoad>>;
+    try {
+      const pay = await createSolanaMppFetch({
+        signer: await generateKeyPairSigner(),
+        rpcUrl: DEAD_RPC,
+        network: "devnet",
       });
-    const err = await miss().catch((e: unknown) => e);
-    await miss().catch(() => {});
-    expect(err).toBeInstanceOf(MppPaidNoCompletionError);
-    expect(readCredits().slice(before)).toEqual([
-      { payer: FIXTURE_PAYEE, amount: "", challengeId: "tx-sol", reason: "HTTP 502" },
-    ]);
+      const send = () => pay(FIXTURE_URL, { method: "POST", body: "{}" });
+      const err = await send().catch((e: unknown) => e);
+      await send().catch(() => {});
+      expect(err).toBeInstanceOf(MppPaidNoCompletionError);
+      expect(readCredits().slice(before)).toEqual([
+        { payer: FIXTURE_PAYEE, amount: "", challengeId: "tx-sol", reason: "HTTP 502" },
+      ]);
+    } finally {
+      payKitClientDeps.load = realLoad;
+    }
   });
 });
 

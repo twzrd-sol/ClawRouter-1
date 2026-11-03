@@ -225,7 +225,12 @@ function stubDevnet(paid: Response) {
 describe("createSolanaMppFetch with no spend control", () => {
   it("a signed 502 records one credit from the challenge and a retry stays one row", async () => {
     const before = readCredits().length;
-    const call = { settled: false, payeeChecked: false };
+    const call: {
+      settled: boolean;
+      payeeChecked: boolean;
+      quote?: { amount?: string };
+      credit?: { payer: string; amount: string; challengeId: string };
+    } = { settled: false, payeeChecked: false };
     const event = {
       type: "signed",
       transaction: "tx-sol",

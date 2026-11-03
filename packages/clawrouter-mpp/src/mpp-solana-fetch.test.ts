@@ -47,6 +47,26 @@ const control = (configure: (c: SpendControl) => void) => {
   return c;
 };
 const payer = () => generateKeyPairSigner();
+/** Counts `signMessages` / `signTransactions`. A policy veto must leave this at 0. */
+async function watchedPayer() {
+  const base = await payer();
+  let calls = 0;
+  const count =
+    <A extends unknown[], R>(fn: (...args: A) => R) =>
+    (...args: A): R => {
+      calls += 1;
+      return fn(...args);
+    };
+  return {
+    signer: {
+      address: base.address,
+      keyPair: base.keyPair,
+      signMessages: count(base.signMessages),
+      signTransactions: count(base.signTransactions),
+    },
+    calls: () => calls,
+  };
+}
 const call = (f: (u: string, i?: RequestInit) => Promise<Response>, url: string) =>
   f(url, { method: "POST", body: "{}" });
 
@@ -54,14 +74,16 @@ describe("Solana MPP spend controls", () => {
   it("refuses over the per-request limit before anything is signed", async () => {
     const s = await seller();
     const spend = control((c) => c.setLimit("perRequest", 0.0005));
+    const watched = await watchedPayer();
     const f = await createSolanaMppFetch({
-      signer: await payer(),
+      signer: watched.signer,
       rpcUrl: DEAD_RPC,
       network: "localnet",
       spend,
     });
     await expect(call(f, s.url)).rejects.toBeInstanceOf(SpendPolicyError);
     expect(spend.getStatus().spending.daily).toBe(0);
+    expect(watched.calls()).toBe(0);
   });
 
   it("refuses a mint it cannot price while amount limits are set", async () => {
@@ -79,13 +101,15 @@ describe("Solana MPP spend controls", () => {
   it("enforces payee lists from the challenge recipient, before signing", async () => {
     const s = await seller();
     const spend = control((c) => c.setPolicy("blockedPayees", [s.operator.address]));
+    const watched = await watchedPayer();
     const f = await createSolanaMppFetch({
-      signer: await payer(),
+      signer: watched.signer,
       rpcUrl: DEAD_RPC,
       network: "localnet",
       spend,
     });
     await expect(call(f, s.url)).rejects.toThrow(/Payee is blocked by policy/);
+    expect(watched.calls()).toBe(0);
   });
 
   it("lets an allowlisted payee reach signing (regression: authorize() ran the payee check with no payTo)", async () => {
@@ -105,13 +129,15 @@ describe("Solana MPP spend controls", () => {
     const s = await seller();
     const other = (await payer()).address;
     const spend = control((c) => c.setPolicy("allowedPayees", [other]));
+    const watched = await watchedPayer();
     const f = await createSolanaMppFetch({
-      signer: await payer(),
+      signer: watched.signer,
       rpcUrl: DEAD_RPC,
       network: "localnet",
       spend,
     });
     await expect(call(f, s.url)).rejects.toThrow(/not in the configured allowlist/);
+    expect(watched.calls()).toBe(0);
   });
 
   it("releases the held budget when the payment fails before a signed credential", async () => {

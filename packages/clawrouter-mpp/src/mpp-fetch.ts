@@ -31,11 +31,13 @@ export type { PayFetch };
  * Tempo TIP-20 USD stablecoins priced here, lower-case, all 6 decimals (the challenge carries no
  * `decimals`). Any other asset cannot be priced, so it is refused while amount limits are set.
  *  - 0x20c0…0000   pathUSD (Moderato testnet 42431, also on mainnet 4217)
- *  - 0x20c0…b9537d11c60e8b50   the USD token a Tempo-run MPP proxy quoted on mainnet 4217 (2026-11-03)
+ *  - 0x20c0…b9537d11c60e8b50   fee token a Tempo-run MPP proxy quoted on mainnet 4217 (2026-11-03)
+ *  - 0x20c0…f37de3740adec032   charge currency on that same OpenRouter challenge (6 decimals, 750 = 0.00075 USD)
  */
 export const DEFAULT_TEMPO_USD_ASSETS: ReadonlySet<string> = new Set([
   "0x20c0000000000000000000000000000000000000",
   "0x20c000000000000000000000b9537d11c60e8b50",
+  "0x20c000000000000000000000f37de3740adec032",
 ]);
 
 export type MppFetchOptions = {
@@ -89,8 +91,30 @@ export function guardMethod<M extends MethodLike>(
   control: SpendControl | undefined,
   usdAssets: ReadonlySet<string> = DEFAULT_TEMPO_USD_ASSETS,
 ): M {
+  // One signed credential per challenge quote. A second call resends it and does not reserve or sign again.
+  const signedOnce = new Map<
+    string,
+    { credential: string; record?: ReturnType<SpendControl["settleReservation"]> }
+  >();
+  const reuseKey = (challenge: ChallengeLike) => {
+    const req = (challenge.request ?? {}) as {
+      amount?: unknown;
+      currency?: unknown;
+      recipient?: unknown;
+      methodDetails?: { chainId?: unknown };
+    };
+    const currency = typeof req.currency === "string" ? req.currency.toLowerCase() : "";
+    const recipient = typeof req.recipient === "string" ? req.recipient.toLowerCase() : "";
+    const chainId = req.methodDetails?.chainId;
+    return `${challenge.id}|${req.amount ?? ""}|${currency}|${recipient}|${chainId ?? ""}`;
+  };
   const guarded: MethodLike = {
     createCredential: async (options: { challenge: ChallengeLike }) => {
+      const cached = signedOnce.get(reuseKey(options.challenge));
+      if (cached) {
+        markSigned(cached.credential, cached.record);
+        return cached.credential;
+      }
       let reservationId: string | undefined;
       if (control) {
         const quote = quoteFromChallenge(options.challenge, usdAssets);
@@ -113,6 +137,7 @@ export function guardMethod<M extends MethodLike>(
         control && reservationId !== undefined
           ? control.settleReservation(reservationId, { action: "mpp tempo charge" })
           : undefined;
+      signedOnce.set(reuseKey(options.challenge), { credential, record });
       markSigned(credential, record);
       return credential;
     },

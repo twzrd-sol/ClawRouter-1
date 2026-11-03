@@ -1,37 +1,99 @@
-// Outside payer, dry path only: @twzrd1111/clawrouter + @twzrd1111/clawrouter-mpp pointed at an MPP
-// inference seller. The per-request cap (0.0001 USD) is below the seller's listed price (0.00075 USD),
-// so the spend check refuses with 403 spend_policy_denied before anything is signed.
-//
-// The payer is a throwaway key generated fresh on every run. It holds no funds and is never persisted.
+// Local payer against a fixture seller. The proxy is aimed at the Tempo MPP seller
+// and openai/gpt-4o-mini, but createMppFetch is given an in-memory fetch: a 200
+// chat completion whose content is "ok", plus a Payment-Receipt header.
+// No key is read. The account is generated in memory and discarded. Sockets are
+// refused unless they stay on the local proxy port.
 //
 //   npm install && npm start
-//   DEMO_SELLER=https://... DEMO_MODEL=... npm start   (optional overrides)
+import net from "node:net";
 import { startProxy, SpendControl, InMemorySpendControlStorage } from "@twzrd1111/clawrouter";
 import { createMppFetch } from "@twzrd1111/clawrouter-mpp";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 
-const SELLER = process.env.DEMO_SELLER ?? "https://openrouter.mpp.tempo.xyz";
-const MODEL = process.env.DEMO_MODEL ?? "openai/gpt-4o-mini";
-const CAP_USD = 0.0001; // listed price is 0.00075 USD; the cap is below it on purpose
+const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
+
+function endpointHost(args) {
+  const first = args[0];
+  if (typeof first === "object" && first !== null) {
+    if (typeof first.path === "string") return "localhost";
+    return first.host ?? first.hostname ?? "localhost";
+  }
+  if (typeof first === "string" && first.startsWith("/")) return "localhost";
+  if (typeof first === "number" || (typeof first === "string" && /^\d+$/.test(first))) {
+    const host = args[1];
+    if (host === undefined || typeof host === "function") return "localhost";
+    return String(host);
+  }
+  return "unknown";
+}
+
+const origConnect = net.Socket.prototype.connect;
+net.Socket.prototype.connect = function (...args) {
+  const host = String(endpointHost(args));
+  if (!LOOPBACK.has(host)) {
+    throw new Error(`refusing non-local connection to ${host}`);
+  }
+  return origConnect.apply(this, args);
+};
+
+const realFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = (input, init) => {
+  const url =
+    typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  let host = "";
+  try {
+    host = new URL(url, "http://127.0.0.1").hostname;
+  } catch {
+    host = "";
+  }
+  if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
+    return realFetch(input, init);
+  }
+  return Promise.resolve(new Response("{}", { status: 404, headers: { "content-type": "application/json" } }));
+};
+
+const SELLER = "https://openrouter.mpp.tempo.xyz";
+const MODEL = "openai/gpt-4o-mini";
+
+const COMPLETION = {
+  id: "chatcmpl-fixture",
+  object: "chat.completion",
+  created: 0,
+  model: MODEL,
+  choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+};
+
+function memoryFetch() {
+  return Promise.resolve(
+    new Response(JSON.stringify(COMPLETION), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "Payment-Receipt": "fixture.receipt.not-a-credential",
+      },
+    }),
+  );
+}
 
 const account = privateKeyToAccount(generatePrivateKey());
 const spend = new SpendControl({ storage: new InMemorySpendControlStorage() });
-spend.setLimit("perRequest", CAP_USD);
-const payFetch = createMppFetch(account, fetch, { spend });
+const payFetch = createMppFetch(account, memoryFetch, { spend });
 
 const proxy = await startProxy({
   spendControl: spend,
   payFetch,
   apiBase: SELLER,
+  paymentChain: "base",
   wallet: generatePrivateKey(),
   skipBalanceCheck: true,
   port: 0,
   allowExistingProxy: false,
 });
 
-let ok = false;
+let exitCode = 1;
 try {
-  const r = await fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+  const r = await realFetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -41,24 +103,19 @@ try {
     }),
   });
   const text = await r.text();
-  let errorType = null;
+  let content = "";
   try {
-    errorType = JSON.parse(text)?.error?.type ?? null;
+    content = JSON.parse(text)?.choices?.[0]?.message?.content ?? "";
   } catch {
-    // non-JSON body; errorType stays null
+    content = "";
   }
-  const receipt = r.headers.get("payment-receipt") ? "present" : "absent";
-
-  console.log("seller:", SELLER, "| model:", MODEL);
-  console.log("payer (throwaway):", account.address, "| cap USD:", CAP_USD);
-  console.log("status:", r.status);
-  console.log("error type:", errorType ?? "(none)");
-  console.log("receipt header:", receipt);
-
-  ok = r.status === 403 && errorType === "spend_policy_denied";
-  console.log(ok ? "result: refused before signing (expected)" : "result: UNEXPECTED, expected 403 spend_policy_denied");
-  if (!ok) console.log("body:", text.slice(0, 400));
+  if (r.status === 200 && content) {
+    console.log(content);
+    exitCode = 0;
+  } else {
+    console.error(text.slice(0, 500));
+  }
 } finally {
   await proxy.close();
 }
-process.exit(ok ? 0 : 1);
+process.exit(exitCode);

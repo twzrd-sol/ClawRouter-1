@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { createMppFetch } from "./mpp-fetch.js";
@@ -59,6 +61,7 @@ describe("createMppFetch", () => {
 
 import { Mppx as ServerMppx, tempo as serverTempo } from "mppx/server";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
+import { guardPaid, MppPaidNoCompletionError } from "./mpp-paid-failure.js";
 import { guardMethod, quoteFromChallenge } from "./mpp-fetch.js";
 
 const PATHUSD = "0x20c0000000000000000000000000000000000000";
@@ -215,5 +218,186 @@ describe("MPP spend controls (guardMethod)", () => {
       pay("https://test.local/x", { method: "POST", body: "{}" }),
     ).rejects.toBeInstanceOf(SpendPolicyError);
     expect(control.getStatus().spending.daily).toBe(0);
+  });
+});
+
+const OPENROUTER_FIXTURE = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL("../test/fixtures/openrouter-tempo-402.json", import.meta.url)),
+    "utf8",
+  ),
+) as {
+  request: { url: string; body: unknown };
+  response: { headers: Record<string, string>; body: unknown };
+  decoded: { request: Record<string, unknown>; realm?: string };
+};
+
+const FIXTURE_PAYEE = "0xca4e835F803cB0b7C428222B3A3B98518d4779Fe";
+const FIXTURE_RECEIPT = "tempo-receipt-fixture";
+const COMPLETION_BODY = { id: "chatcmpl-fixture", choices: [{ message: { content: "hi" } }] };
+
+function challengeFromHeader(header: string) {
+  const pick = (name: string) => new RegExp(`${name}="([^"]+)"`).exec(header)?.[1];
+  const id = pick("id");
+  const realm = pick("realm");
+  const method = pick("method");
+  const intent = pick("intent");
+  const requestB64 = pick("request");
+  if (!id || !realm || !method || !intent || !requestB64) throw new Error("unparsed fixture challenge");
+  const request = JSON.parse(Buffer.from(requestB64, "base64url").toString("utf8")) as Record<
+    string,
+    unknown
+  >;
+  return { id, realm, method, intent, request };
+}
+
+function openRouterControl() {
+  const control = new SpendControl({ storage: new InMemorySpendControlStorage() });
+  control.setLimit("perRequest", 0.001);
+  control.setLimit("daily", 1);
+  control.setPolicy("allowedPayees", [FIXTURE_PAYEE]);
+  control.setPolicy("allowedNetworks", ["eip155:4217"]);
+  return control;
+}
+
+/** Stub the seller. No socket: 402 from the fixture, then the scripted paid response. */
+function stubOpenRouter(paid: Response) {
+  const calls: Array<{ url: string; authorization: string | null }> = [];
+  const base = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    const authorization = headers.get("authorization");
+    calls.push({ url: String(input), authorization });
+    if (!authorization) {
+      return new Response(JSON.stringify(OPENROUTER_FIXTURE.response.body), {
+        status: 402,
+        headers: OPENROUTER_FIXTURE.response.headers,
+      });
+    }
+    return paid.clone();
+  }) as unknown as typeof fetch;
+  return { base, calls };
+}
+
+describe("OpenRouter Tempo fixture, no network", () => {
+  const header = OPENROUTER_FIXTURE.response.headers["www-authenticate"];
+  const parsed = challengeFromHeader(header);
+
+  it("parses the recorded charge: 750 units, chain 4217, fixture payee", () => {
+    expect(parsed.request).toEqual(OPENROUTER_FIXTURE.decoded.request);
+    expect(parsed.realm).toBe("openrouter.mpp.tempo.xyz");
+    expect(quoteFromChallenge(parsed)).toMatchObject({
+      payTo: FIXTURE_PAYEE,
+      network: "eip155:4217",
+      amount: "750",
+      priceable: true,
+    });
+  });
+
+  it("reserves, signs once, attaches the credential, and returns the completion plus receipt", async () => {
+    const control = openRouterControl();
+    const seenPending: number[] = [];
+    const historyAtSign: number[] = [];
+    const signed: string[] = [];
+    const method = guardMethod(
+      {
+        name: "tempo",
+        intent: "charge",
+        createCredential: async ({ challenge: c }: { challenge: { id: string } }) => {
+          seenPending.push(control.getSpending("daily"));
+          historyAtSign.push(
+            (control as unknown as { history: unknown[] }).history.length,
+          );
+          signed.push(c.id);
+          return `Payment ${c.id}`;
+        },
+      },
+      control,
+    );
+    const { base, calls } = stubOpenRouter(
+      new Response(JSON.stringify(COMPLETION_BODY), {
+        status: 200,
+        headers: { "content-type": "application/json", "Payment-Receipt": FIXTURE_RECEIPT },
+      }),
+    );
+    const url = OPENROUTER_FIXTURE.request.url;
+    const body = JSON.stringify(OPENROUTER_FIXTURE.request.body);
+    const once = () =>
+      guardPaid(control, async () => {
+        const challengeRes = await base(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+        });
+        if (challengeRes.status !== 402) return challengeRes;
+        const challenge = challengeFromHeader(challengeRes.headers.get("www-authenticate") ?? "");
+        const quote = quoteFromChallenge(challenge);
+        expect(quote.amount).toBe("750");
+        expect(quote.payTo).toBe(FIXTURE_PAYEE);
+        const credential = await method.createCredential({ challenge });
+        return base(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: credential },
+          body,
+        });
+      });
+
+    const res = await once();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(COMPLETION_BODY);
+    expect(res.headers.get("payment-receipt")).toBe(FIXTURE_RECEIPT);
+    expect(seenPending[0]).toBeCloseTo(0.00075, 8);
+    expect(historyAtSign).toEqual([0]);
+    expect(signed).toEqual(["fixture-challenge-id"]);
+    expect(calls[0].authorization).toBeNull();
+    expect(calls[1].authorization).toBe("Payment fixture-challenge-id");
+    expect(calls.every((c) => c.url === "https://openrouter.mpp.tempo.xyz/v1/chat/completions")).toBe(
+      true,
+    );
+    expect(control.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
+
+    const again = await once();
+    expect(again.status).toBe(200);
+    expect(again.headers.get("payment-receipt")).toBe(FIXTURE_RECEIPT);
+    expect(signed).toEqual(["fixture-challenge-id"]);
+    expect(calls).toHaveLength(4);
+    expect(calls[3].authorization).toBe("Payment fixture-challenge-id");
+    expect(control.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
+  });
+
+  it("a signed call with no completion is MppPaidNoCompletionError and is not retried", async () => {
+    const control = openRouterControl();
+    const signed: string[] = [];
+    const method = guardMethod(
+      {
+        ...fakeMethod().method,
+        createCredential: async ({ challenge: c }: { challenge: { id: string } }) => {
+          signed.push(c.id);
+          return `Payment ${c.id}`;
+        },
+      },
+      control,
+    );
+    const { base, calls } = stubOpenRouter(new Response("no completion", { status: 502 }));
+    const url = OPENROUTER_FIXTURE.request.url;
+    const body = JSON.stringify(OPENROUTER_FIXTURE.request.body);
+    const err = await guardPaid(control, async () => {
+      const challengeRes = await base(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      const challenge = challengeFromHeader(challengeRes.headers.get("www-authenticate") ?? "");
+      const credential = await method.createCredential({ challenge });
+      return base(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: credential },
+        body,
+      });
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(MppPaidNoCompletionError);
+    expect(err.message).toContain("Not retrying");
+    expect(calls).toHaveLength(2);
+    expect(signed).toEqual(["fixture-challenge-id"]);
+    expect(base).toHaveBeenCalledTimes(2);
   });
 });

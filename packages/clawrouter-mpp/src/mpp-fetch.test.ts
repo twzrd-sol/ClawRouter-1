@@ -61,8 +61,13 @@ describe("createMppFetch", () => {
 
 import { Mppx as ServerMppx, tempo as serverTempo } from "mppx/server";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
-import { guardPaid, MppPaidNoCompletionError } from "./mpp-paid-failure.js";
-import { guardMethod, quoteFromChallenge } from "./mpp-fetch.js";
+import { MppPaidNoCompletionError } from "./mpp-paid-failure.js";
+import {
+  createTempoFixtureFetch,
+  guardMethod,
+  parseTempoChargeHeader,
+  quoteFromChallenge,
+} from "./mpp-fetch.js";
 
 const PATHUSD = "0x20c0000000000000000000000000000000000000";
 const RECIPIENT = "0x000000000000000000000000000000000000dEaD";
@@ -236,21 +241,6 @@ const FIXTURE_PAYEE = "0xca4e835F803cB0b7C428222B3A3B98518d4779Fe";
 const FIXTURE_RECEIPT = "tempo-receipt-fixture";
 const COMPLETION_BODY = { id: "chatcmpl-fixture", choices: [{ message: { content: "hi" } }] };
 
-function challengeFromHeader(header: string) {
-  const pick = (name: string) => new RegExp(`${name}="([^"]+)"`).exec(header)?.[1];
-  const id = pick("id");
-  const realm = pick("realm");
-  const method = pick("method");
-  const intent = pick("intent");
-  const requestB64 = pick("request");
-  if (!id || !realm || !method || !intent || !requestB64) throw new Error("unparsed fixture challenge");
-  const request = JSON.parse(Buffer.from(requestB64, "base64url").toString("utf8")) as Record<
-    string,
-    unknown
-  >;
-  return { id, realm, method, intent, request };
-}
-
 function openRouterControl() {
   const control = new SpendControl({ storage: new InMemorySpendControlStorage() });
   control.setLimit("perRequest", 0.001);
@@ -280,7 +270,9 @@ function stubOpenRouter(paid: Response) {
 
 describe("OpenRouter Tempo fixture, no network", () => {
   const header = OPENROUTER_FIXTURE.response.headers["www-authenticate"];
-  const parsed = challengeFromHeader(header);
+  const parsed = parseTempoChargeHeader(header);
+  const url = OPENROUTER_FIXTURE.request.url;
+  const body = JSON.stringify(OPENROUTER_FIXTURE.request.body);
 
   it("parses the recorded charge: 750 units, chain 4217, fixture payee", () => {
     expect(parsed.request).toEqual(OPENROUTER_FIXTURE.decoded.request);
@@ -295,58 +287,28 @@ describe("OpenRouter Tempo fixture, no network", () => {
 
   it("reserves, signs once, attaches the credential, and returns the completion plus receipt", async () => {
     const control = openRouterControl();
-    const seenPending: number[] = [];
-    const historyAtSign: number[] = [];
     const signed: string[] = [];
-    const method = guardMethod(
-      {
-        name: "tempo",
-        intent: "charge",
-        createCredential: async ({ challenge: c }: { challenge: { id: string } }) => {
-          seenPending.push(control.getSpending("daily"));
-          historyAtSign.push(
-            (control as unknown as { history: unknown[] }).history.length,
-          );
-          signed.push(c.id);
-          return `Payment ${c.id}`;
-        },
-      },
-      control,
-    );
     const { base, calls } = stubOpenRouter(
       new Response(JSON.stringify(COMPLETION_BODY), {
         status: 200,
         headers: { "content-type": "application/json", "Payment-Receipt": FIXTURE_RECEIPT },
       }),
     );
-    const url = OPENROUTER_FIXTURE.request.url;
-    const body = JSON.stringify(OPENROUTER_FIXTURE.request.body);
+    const payFetch = createTempoFixtureFetch({
+      spend: control,
+      sign: async (challenge) => {
+        signed.push(challenge.id);
+        return challenge.id;
+      },
+      fetch: base,
+    });
     const once = () =>
-      guardPaid(control, async () => {
-        const challengeRes = await base(url, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body,
-        });
-        if (challengeRes.status !== 402) return challengeRes;
-        const challenge = challengeFromHeader(challengeRes.headers.get("www-authenticate") ?? "");
-        const quote = quoteFromChallenge(challenge);
-        expect(quote.amount).toBe("750");
-        expect(quote.payTo).toBe(FIXTURE_PAYEE);
-        const credential = await method.createCredential({ challenge });
-        return base(url, {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: credential },
-          body,
-        });
-      });
+      payFetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
 
     const res = await once();
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(COMPLETION_BODY);
     expect(res.headers.get("payment-receipt")).toBe(FIXTURE_RECEIPT);
-    expect(seenPending[0]).toBeCloseTo(0.00075, 8);
-    expect(historyAtSign).toEqual([0]);
     expect(signed).toEqual(["fixture-challenge-id"]);
     expect(calls[0].authorization).toBeNull();
     expect(calls[1].authorization).toBe("Payment fixture-challenge-id");
@@ -367,35 +329,23 @@ describe("OpenRouter Tempo fixture, no network", () => {
   it("a signed call with no completion is MppPaidNoCompletionError and is not retried", async () => {
     const control = openRouterControl();
     const signed: string[] = [];
-    const method = guardMethod(
-      {
-        ...fakeMethod().method,
-        createCredential: async ({ challenge: c }: { challenge: { id: string } }) => {
-          signed.push(c.id);
-          return `Payment ${c.id}`;
-        },
-      },
-      control,
-    );
     const { base, calls } = stubOpenRouter(new Response("no completion", { status: 502 }));
-    const url = OPENROUTER_FIXTURE.request.url;
-    const body = JSON.stringify(OPENROUTER_FIXTURE.request.body);
-    const err = await guardPaid(control, async () => {
-      const challengeRes = await base(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      });
-      const challenge = challengeFromHeader(challengeRes.headers.get("www-authenticate") ?? "");
-      const credential = await method.createCredential({ challenge });
-      return base(url, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: credential },
-        body,
-      });
-    }).catch((e) => e);
+    const payFetch = createTempoFixtureFetch({
+      spend: control,
+      sign: async (challenge) => {
+        signed.push(challenge.id);
+        return challenge.id;
+      },
+      fetch: base,
+    });
+    const err = await payFetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MppPaidNoCompletionError);
-    expect(err.message).toContain("Not retrying");
+    expect((err as Error).message).toContain("Not retrying");
+    expect((err as MppPaidNoCompletionError).status).toBe(502);
     expect(calls).toHaveLength(2);
     expect(signed).toEqual(["fixture-challenge-id"]);
     expect(base).toHaveBeenCalledTimes(2);

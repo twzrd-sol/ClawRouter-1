@@ -21,6 +21,7 @@ import {
   SpendPolicyError,
   type PayFetch,
   type SpendControl,
+  type SpendRecord,
 } from "@twzrd1111/clawrouter";
 import { guardPaid, markSigned } from "./mpp-paid-failure.js";
 import { loadOptional, MPPX_RANGE } from "./mpp-optional.js";
@@ -188,6 +189,125 @@ export function createMppFetch(
       throw e;
     }
   };
+  payFetch.enforcesSpend = opts.spend !== undefined;
+  return payFetch;
+}
+
+export type TempoChargeChallenge = {
+  id: string;
+  realm?: string;
+  method: string;
+  intent: string;
+  request: {
+    amount?: string;
+    currency?: string;
+    recipient?: string;
+    methodDetails?: { chainId?: number };
+  };
+};
+
+/** Parse one `WWW-Authenticate: Payment` Tempo charge header. Throws if the header is not that shape. */
+export function parseTempoChargeHeader(header: string): TempoChargeChallenge {
+  const pick = (name: string) => new RegExp(`${name}="([^"]*)"`).exec(header)?.[1];
+  const id = pick("id");
+  const realm = pick("realm");
+  const method = pick("method");
+  const intent = pick("intent");
+  const requestB64 = pick("request");
+  if (!id || !method || !intent || !requestB64) throw new Error("unparsed Tempo MPP challenge");
+  const parsed: unknown = JSON.parse(Buffer.from(requestB64, "base64url").toString("utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("unparsed Tempo MPP challenge");
+  }
+  return { id, realm, method, intent, request: parsed as TempoChargeChallenge["request"] };
+}
+
+export type TempoFixtureFetchOptions = {
+  /** When set, the challenge is checked and reserved before `sign` runs. */
+  spend?: SpendControl;
+  /** Extra TIP-20 assets to treat as 6-decimal USD. */
+  usdAssets?: Iterable<string>;
+  /**
+   * Produce the signed payload for this challenge. No key file and no network: the caller supplies it.
+   * Called at most once per challenge quote; a later call resends the same credential.
+   */
+  sign: (challenge: TempoChargeChallenge) => string | Promise<string>;
+  /** Seller. Tests pass a stub; this helper never calls `globalThis.fetch`. */
+  fetch: typeof fetch;
+};
+
+/**
+ * Tempo charge completion without mppx.
+ *
+ * `createMppFetch` loads mppx and signs with a viem account. This runs the same spend checks
+ * (price, network, asset, payee, reserve, then settle) and attaches one cached `Payment`
+ * credential via `opts.fetch`.
+ */
+export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetch {
+  const usd = new Set([...DEFAULT_TEMPO_USD_ASSETS, ...(opts.usdAssets ?? [])].map((a) => a.toLowerCase()));
+  const signedOnce = new Map<string, { credential: string; record?: SpendRecord }>();
+  const reuseKey = (challenge: TempoChargeChallenge) => {
+    const quote = quoteFromChallenge(challenge, usd);
+    return `${challenge.id}|${quote.amount ?? ""}|${quote.asset ?? ""}|${quote.payTo ?? ""}|${quote.network ?? ""}`;
+  };
+
+  const credentialFor = async (challenge: TempoChargeChallenge): Promise<string> => {
+    const cached = signedOnce.get(reuseKey(challenge));
+    if (cached) {
+      markSigned(cached.credential, cached.record);
+      return cached.credential;
+    }
+    const { spend } = opts;
+    let reservationId: string | undefined;
+    if (spend) {
+      const quote = quoteFromChallenge(challenge, usd);
+      if (!quote.priceable && spend.hasAmountLimits()) {
+        throw new SpendPolicyError(
+          `MPP quote is in an asset or shape ClawRouter cannot price (${quote.asset ?? "none"}); refusing to pay against a configured spend limit`,
+        );
+      }
+      reservationId = assertSpendPolicyAllows(spend, {
+        payTo: quote.payTo,
+        network: quote.network,
+        asset: quote.asset,
+        amount: quote.amount,
+      });
+    }
+    let payload: string;
+    try {
+      payload = await opts.sign(challenge);
+    } catch (err) {
+      if (spend && reservationId !== undefined) spend.releaseReservation(reservationId);
+      throw err;
+    }
+    const credential = payload.startsWith("Payment ") ? payload : `Payment ${payload}`;
+    const record =
+      spend && reservationId !== undefined
+        ? spend.settleReservation(reservationId, { action: "mpp tempo charge" })
+        : undefined;
+    signedOnce.set(reuseKey(challenge), { credential, record });
+    markSigned(credential, record);
+    return credential;
+  };
+
+  const payFetch: PayFetch = async (input, init) =>
+    guardPaid(opts.spend, async () => {
+      const challengeRes = await opts.fetch(input, init);
+      if (challengeRes.status !== 402) return challengeRes;
+      const header = challengeRes.headers.get("www-authenticate");
+      let challenge: TempoChargeChallenge;
+      try {
+        if (!header) return challengeRes;
+        challenge = parseTempoChargeHeader(header);
+      } catch {
+        return challengeRes;
+      }
+      if (challenge.method !== "tempo" || challenge.intent !== "charge") return challengeRes;
+      const credential = await credentialFor(challenge);
+      const headers = new Headers(init?.headers);
+      headers.set("authorization", credential);
+      return opts.fetch(input, { ...init, headers });
+    });
   payFetch.enforcesSpend = opts.spend !== undefined;
   return payFetch;
 }

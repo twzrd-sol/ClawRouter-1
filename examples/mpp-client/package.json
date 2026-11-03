@@ -1,0 +1,16 @@
+{
+  "name": "clawrouter-mpp-client-example",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Outside payer dry run: ClawRouter fork + MPP rail against an MPP seller; the spend cap refuses before anything is signed.",
+  "scripts": {
+    "start": "node client.mjs"
+  },
+  "dependencies": {
+    "@twzrd1111/clawrouter": "0.12.306",
+    "@twzrd1111/clawrouter-mpp": "0.1.0",
+    "mppx": "~0.17.0",
+    "viem": "^2.0.0"
+  }
+}

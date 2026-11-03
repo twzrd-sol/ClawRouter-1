@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  bindCredit,
   boundedSnippet,
   guardPaid,
   markSigned,
@@ -203,8 +202,7 @@ describe("credit for a paid call with no completion", () => {
     const sign = vi.fn();
     const miss = () =>
       guardPaid(undefined, async () => {
-        markSigned("tx-sig-1");
-        bindCredit(facts);
+        markSigned("tx-sig-1", undefined, facts);
         return new Response("down", { status: 502 });
       });
     const err = await miss().catch((e: unknown) => e);

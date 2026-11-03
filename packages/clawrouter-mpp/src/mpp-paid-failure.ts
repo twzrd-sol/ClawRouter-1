@@ -91,12 +91,17 @@ export function paymentReference(payload: string): string {
 }
 
 /** Record that this call produced a signed payment. First one wins; a call pays at most once. */
-export function markSigned(payload: string, record?: SpendRecord): void {
+export function markSigned(
+  payload: string,
+  record?: SpendRecord,
+  credit?: Pick<CreditEntry, "payer" | "amount" | "challengeId">,
+): void {
   const call = storage.getStore();
   if (!call || call.signed) return;
   call.signed = true;
   call.reference = paymentReference(payload);
   call.record = record;
+  if (credit) call.credit = credit;
 }
 
 /**

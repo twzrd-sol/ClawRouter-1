@@ -22,6 +22,13 @@ export type PayFetch = ((input: RequestInfo | URL, init?: RequestInit) => Promis
    * status. Unset keeps the early-SSE behavior. Independent of `enforcesSpend`.
    */
   deferStreamingHeaders?: boolean;
+  /**
+   * The host found a provider error hidden in a successful HTTP response. A rail
+   * that paid for this response must throw PaymentSettledNoCompletionError here
+   * so the host records the failure instead of paying a fallback model.
+   * Leave unsigned responses alone so ordinary provider fallback still works.
+   */
+  onNoCompletion?: (response: Response, reason: string) => void;
 };
 
 /** `Error.name` that marks "signed and sent, no completion". Matched by name so a rail in another package works. */

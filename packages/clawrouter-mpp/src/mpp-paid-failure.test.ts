@@ -6,6 +6,7 @@ import {
   markSigned,
   MppPaidNoCompletionError,
   readCredits,
+  rejectPaidNoCompletion,
 } from "./mpp-paid-failure.js";
 import { guardMethod } from "./mpp-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
@@ -38,13 +39,43 @@ const history = (c: SpendControl) =>
   (c as unknown as { history: Array<{ amount: number; note?: string }> }).history;
 
 /** Sign through the real guard, then return what the seller says. */
-const paidCall = (c: SpendControl, respond: () => Response | Promise<Response>) =>
+const paidCall = (
+  c: SpendControl,
+  respond: () => Response | Promise<Response>,
+  id = challenge.id,
+) =>
   guardPaid(c, async () => {
-    await guardMethod(fakeMethod(), c).createCredential({ challenge });
+    await guardMethod(fakeMethod(), c).createCredential({ challenge: { ...challenge, id } });
     return respond();
   });
 
 describe("failure after an MPP payment was signed", () => {
+  it("turns a host-detected HTTP 200 error into a terminal paid failure with one credit", async () => {
+    const c = control();
+    const response = await paidCall(
+      c,
+      () =>
+        new Response('{"error":"overloaded"}', { headers: { "content-type": "application/json" } }),
+      "paid-200-error-unit",
+    );
+    const reject = () => rejectPaidNoCompletion(response, "provider overloaded");
+    expect(reject).toThrow(MppPaidNoCompletionError);
+    expect(reject).toThrow(MppPaidNoCompletionError);
+    expect(
+      readCredits().filter(
+        (r) => r.payer === TEST_PAYER && r.challengeId === "paid-200-error-unit",
+      ),
+    ).toHaveLength(1);
+    expect(history(c)).toHaveLength(1);
+    expect(history(c)[0].note).toContain("signed, no completion (HTTP 200)");
+  });
+
+  it("leaves an unsigned HTTP 200 error eligible for ordinary provider fallback", () => {
+    expect(() =>
+      rejectPaidNoCompletion(new Response('{"error":"overloaded"}'), "provider overloaded"),
+    ).not.toThrow();
+  });
+
   it("a seller 500 after signing stops the call, keeps the spend, and notes it in the ledger", async () => {
     const c = control();
     const before = readCredits().length;

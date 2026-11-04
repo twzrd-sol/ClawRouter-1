@@ -2,7 +2,7 @@ name: MPP fork integration
 
 on:
   push:
-    branches: [codex/clawrouter-integration, claude/twzrd-fork]
+    branches: [claude/twzrd-fork]
   pull_request:
     branches: [claude/twzrd-fork, claude/stream-receipt]
 

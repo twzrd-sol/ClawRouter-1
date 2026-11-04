@@ -89,6 +89,13 @@ export function readCredits(ledger: CreditLedger = credits): readonly CreditEntr
 }
 
 const storage = new AsyncLocalStorage<PaidCall>();
+const paidResponses = new WeakMap<Response, { spend: SpendControl | undefined; call: PaidCall }>();
+
+/** Called by the host when an HTTP-success response contains no usable completion. */
+export function rejectPaidNoCompletion(response: Response, reason: string): void {
+  const paid = paidResponses.get(response);
+  if (paid) throw fail(paid.spend, paid.call, response.status, reason);
+}
 
 /** The current call's payment state; undefined outside `guardPaid`. */
 export function currentPaidCall(): PaidCall | undefined {
@@ -138,6 +145,7 @@ export async function guardPaid(
   if (call.signed && response.status >= 400) {
     throw fail(spend, call, response.status, await boundedSnippet(response));
   }
+  if (call.signed) paidResponses.set(response, { spend, call });
   return response;
 }
 

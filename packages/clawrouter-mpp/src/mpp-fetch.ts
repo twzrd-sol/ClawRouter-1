@@ -23,7 +23,13 @@ import {
   type SpendControl,
   type SpendRecord,
 } from "@twzrd1111/clawrouter";
-import { creditFromChallenge, currentPaidCall, guardPaid, markSigned } from "./mpp-paid-failure.js";
+import {
+  creditFromChallenge,
+  currentPaidCall,
+  guardPaid,
+  markSigned,
+  rejectPaidNoCompletion,
+} from "./mpp-paid-failure.js";
 import { loadOptional, MPPX_RANGE } from "./mpp-optional.js";
 
 export type { PayFetch };
@@ -197,6 +203,7 @@ export function createMppFetch(
   };
   payFetch.enforcesSpend = opts.spend !== undefined;
   payFetch.deferStreamingHeaders = true;
+  payFetch.onNoCompletion = rejectPaidNoCompletion;
   return payFetch;
 }
 
@@ -327,5 +334,6 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
     );
   payFetch.enforcesSpend = opts.spend !== undefined;
   payFetch.deferStreamingHeaders = true;
+  payFetch.onNoCompletion = rejectPaidNoCompletion;
   return payFetch;
 }

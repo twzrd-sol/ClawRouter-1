@@ -2489,7 +2489,7 @@ async function proxyPaidApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
   apiBase: string,
-  payFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
+  payFetch: PayFetch,
   getActualPaymentUsd: () => number,
   accountPassthrough = false,
   authMode: AuthMode = "wallet",
@@ -4867,7 +4867,7 @@ async function tryModelRequest(
   body: Buffer,
   modelId: string,
   maxTokens: number,
-  payFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
+  payFetch: PayFetch,
   balanceMonitor: AnyBalanceMonitor,
   signal: AbortSignal,
   catalogReasoning = false,
@@ -4950,23 +4950,27 @@ async function tryModelRequest(
     // Detect provider degradation hidden inside HTTP 200 responses.
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("json") || contentType.includes("text")) {
+      let degradedReason: string | undefined;
       try {
         const clonedChunks = await readBodyWithTimeout(
           response.clone().body,
           ERROR_BODY_READ_TIMEOUT_MS,
         );
         const responseBody = Buffer.concat(clonedChunks).toString();
-        const degradedReason = detectDegradedSuccessResponse(responseBody);
-        if (degradedReason) {
-          return {
-            success: false,
-            errorBody: degradedReason,
-            errorStatus: 503,
-            isProviderError: true,
-          };
-        }
+        degradedReason = detectDegradedSuccessResponse(responseBody);
       } catch {
         // Ignore body inspection failures and pass through response.
+      }
+      if (degradedReason) {
+        // Deliberately outside the inspection catch: a paid rail's terminal
+        // error must reach the payment-in-doubt handler, never be swallowed.
+        payFetch.onNoCompletion?.(response, degradedReason);
+        return {
+          success: false,
+          errorBody: degradedReason,
+          errorStatus: 503,
+          isProviderError: true,
+        };
       }
     }
 

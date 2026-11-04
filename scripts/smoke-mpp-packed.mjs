@@ -189,12 +189,69 @@ for (const rail of ["tempo", "solana"]) {
     await proxy.close();
   }
 }
+let degradedPaidStops = 0;
+for (const stream of [false, true]) {
+  let attempts = 0;
+  const id = `installed-paid-200-${stream}`;
+  const header = `Payment id="${id}", realm="fixture", method="solana", intent="charge", request="${Buffer.from(JSON.stringify(request)).toString("base64url")}"`;
+  const base = async (input) => {
+    attempts++;
+    return input.headers.has("authorization")
+      ? new Response(
+          JSON.stringify({ error: { message: "Provider overloaded, service unavailable" } }),
+          { headers: { "content-type": "application/json" } },
+        )
+      : new Response("", { status: 402, headers: { "www-authenticate": header } });
+  };
+  const spend = new SpendControl({ storage: new InMemorySpendControlStorage() });
+  spend.setLimit("daily", 1);
+  const paid = await createSolanaMppFetch({
+    signer: payer,
+    rpcUrl: "http://127.0.0.1:1",
+    network: "devnet",
+    fetch: base,
+    spend,
+  });
+  const proxy = await startProxy({
+    wallet: generatePrivateKey(),
+    port: 0,
+    allowExistingProxy: false,
+    apiBase: "http://127.0.0.1:1",
+    skipBalanceCheck: true,
+    paymentChain: "base",
+    payFetch: paid,
+    spendControl: spend,
+  });
+  try {
+    const response = await fetch(proxy.baseUrl + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "blockrun/auto",
+        stream,
+        max_tokens: 8,
+        messages: [{ role: "user", content: id }],
+      }),
+    });
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).error.type, "payment_settled_no_completion");
+    assert.equal(attempts, 2); // probe + paid response; no fallback payment
+    assert.deepEqual(
+      readCredits().filter((row) => row.payer === payer.address && row.challengeId === id),
+      [{ payer: payer.address, amount: "750", challengeId: id, reason: "HTTP 200" }],
+    );
+    degradedPaidStops++;
+  } finally {
+    await proxy.close();
+  }
+}
 assert.equal(networkCalls, 0);
 console.log(
   JSON.stringify(
     {
       passed: true,
       streamResults,
+      degradedPaidStops,
       networkCalls,
       fixtureSignerCalls: signerCalls,
       creditSignerCalls,

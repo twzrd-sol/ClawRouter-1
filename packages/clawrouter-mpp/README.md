@@ -88,6 +88,12 @@ Both rails record `{ payer, amount, challengeId, reason }` on a signed call's HT
 transport failure. Payer comes from the supplied account/signer, never the seller's recipient.
 Amount is the original integer base-unit string. Repeating a payer/challenge records one row.
 
+When the proxy detects a provider error hidden inside HTTP 200, it calls the rail's
+`onNoCompletion(response, reason)` hook. For a signed response this records the credit and
+throws the same terminal error before any fallback model is paid. Unsigned responses retain
+the ordinary provider fallback behavior. A custom host using these rails can invoke that
+hook after its own completion validation; the response must be the one returned by the rail.
+
 `CreditLedger` and `creditPaidNoCompletion(ledger, error, fields)` are also public for callers
 with their own ledger; `readCredits(ledger)` reads that ledger. Retrying the credit operation
 returns the same immutable row and invokes no signer. It does not retry a model request.

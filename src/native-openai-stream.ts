@@ -179,30 +179,33 @@ export class TextualToolCallStream {
   private fullContent = "";
   private sentRawLength = 0;
   private emittedContent = "";
-  private emittedCalls = 0;
 
   constructor(private readonly tools: unknown) {}
 
+  flushLiteral(value = ""): string {
+    this.fullContent += value;
+    const content = this.fullContent.slice(this.sentRawLength);
+    this.sentRawLength = this.fullContent.length;
+    this.emittedContent += content;
+    return content;
+  }
+
   push(value: string, final = false): TextualToolPushResult {
     this.fullContent += value;
-    const candidate = findToolSyntaxCandidate(this.fullContent, this.sentRawLength, this.tools);
-    const extraction =
-      candidate !== undefined || final
-        ? extractTextualToolCalls(this.fullContent, { tools: this.tools })
-        : { toolCalls: [], cleanedContent: this.fullContent };
-    if (extraction.toolCalls.length > this.emittedCalls) {
-      const cleaned = extraction.cleanedContent;
-      const remainder = cleaned.startsWith(this.emittedContent)
-        ? cleaned.slice(this.emittedContent.length)
+    if (final) {
+      // The legacy extractor classifies whole/trailing objects. Applying it
+      // before the choice finishes can mistake a nested argument object for
+      // a completed call and leak its surrounding wrapper as prose.
+      const extraction = extractTextualToolCalls(this.fullContent, { tools: this.tools });
+      const content = extraction.cleanedContent.startsWith(this.emittedContent)
+        ? extraction.cleanedContent.slice(this.emittedContent.length)
         : "";
       this.sentRawLength = this.fullContent.length;
-      this.emittedContent = cleaned;
-      const toolCalls = extraction.toolCalls.slice(this.emittedCalls);
-      this.emittedCalls = extraction.toolCalls.length;
-      return { content: remainder, toolCalls };
+      this.emittedContent = extraction.cleanedContent;
+      return { content, toolCalls: extraction.toolCalls };
     }
-
-    const safeEnd = final ? this.fullContent.length : (candidate ?? this.fullContent.length);
+    const candidate = findToolSyntaxCandidate(this.fullContent, this.sentRawLength, this.tools);
+    const safeEnd = candidate ?? this.fullContent.length;
     const content =
       safeEnd > this.sentRawLength ? this.fullContent.slice(this.sentRawLength, safeEnd) : "";
     this.sentRawLength = Math.max(this.sentRawLength, safeEnd);
@@ -250,7 +253,12 @@ function findToolSyntaxCandidate(
   if (Array.isArray(tools)) {
     for (const tool of tools) {
       const name = tool?.function?.name;
-      if (typeof name === "string" && from === 0 && name.startsWith(content)) add(0);
+      if (
+        typeof name === "string" &&
+        from === 0 &&
+        `${name}(parameters=`.startsWith(content.replace(/\s/g, ""))
+      )
+        add(0);
     }
   }
 
@@ -402,7 +410,7 @@ export async function pumpNativeOpenAIStream(
       if (typeof rawContent === "string") {
         const visible = state.thinking.push(rawContent);
         const transformed = state.structuredToolCalls
-          ? { content: visible, toolCalls: [] }
+          ? { content: state.tools.flushLiteral() + visible, toolCalls: [] }
           : state.tools.push(visible);
         if (options.forwardToolCallProse === false) {
           state.heldContent += transformed.content;
@@ -433,7 +441,9 @@ export async function pumpNativeOpenAIStream(
         result.sawFinish = true;
         state.finished = true;
         const lastThinking = state.thinking.push("", true);
-        const lastText = state.tools.push(lastThinking, true);
+        const lastText = state.structuredToolCalls
+          ? { content: state.tools.flushLiteral(lastThinking), toolCalls: [] }
+          : state.tools.push(lastThinking, true);
         if (options.forwardToolCallProse === false) {
           state.heldContent += lastText.content;
           lastText.content =
@@ -459,7 +469,7 @@ export async function pumpNativeOpenAIStream(
             ...synthetic,
           ];
         }
-        if (state.recoveredToolCalls) {
+        if (state.recoveredToolCalls || state.structuredToolCalls) {
           choice.finish_reason = "tool_calls";
         }
       }

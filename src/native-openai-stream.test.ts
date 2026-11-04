@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { extractTextualToolCalls } from "./textual-tool-calls.js";
 import {
   pumpNativeOpenAIStream,
   readSseEvents,
@@ -21,6 +22,44 @@ function frame(data: unknown): string {
 }
 
 describe("native OpenAI SSE stream helpers", () => {
+  it.each([
+    "<tool_call>lookup<arg_key>query</arg_key><arg_value>x</arg_value></tool_call>",
+    '<function_calls><invoke name="lookup"><parameter name="query">x</parameter></invoke></function_calls>',
+    '[Called function "lookup" with args: {"query":"x"}]',
+    'lookup(parameters={"query":"x"})',
+    '{\n "type":"function", "name":"lookup", "parameters":{"query":"x"}}',
+    '{"query":"x"}',
+  ])("recovers supported tool syntax across arbitrary token boundaries: %s", (content) => {
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "lookup",
+          parameters: { type: "object", properties: { query: {} }, required: ["query"] },
+        },
+      },
+    ];
+    const expected = extractTextualToolCalls(content, { tools });
+    expect(expected.toolCalls).toHaveLength(1);
+    for (let split = 1; split < content.length; split++) {
+      const recovery = new TextualToolCallStream(tools);
+      const pieces = [
+        recovery.push(content.slice(0, split)),
+        recovery.push(content.slice(split)),
+        recovery.push("", true),
+      ];
+      expect(pieces.flatMap((piece) => piece.toolCalls).map((call) => call.function)).toEqual(
+        expected.toolCalls.map((call) => call.function),
+      );
+      expect(
+        pieces
+          .map((piece) => piece.content)
+          .join("")
+          .trim(),
+      ).toBe(expected.cleanedContent.trim());
+    }
+  });
+
   it("forwards a one-character delta immediately", async () => {
     const output: string[] = [];
     await pumpNativeOpenAIStream(
@@ -154,9 +193,10 @@ describe("native OpenAI SSE stream helpers", () => {
   it("recovers a text-encoded tool call without forwarding its markup", () => {
     const recovery = new TextualToolCallStream(undefined);
     expect(recovery.push("Before <tool_ca")).toEqual({ content: "Before ", toolCalls: [] });
-    const completed = recovery.push(
+    recovery.push(
       "ll>lookup<arg_key>query</arg_key><arg_value>weather</arg_value></tool_call> after",
     );
+    const completed = recovery.push("", true);
     expect(completed.content).toBe(" after");
     expect(completed.toolCalls).toHaveLength(1);
     expect(completed.toolCalls[0]).toMatchObject({
@@ -191,7 +231,7 @@ describe("native OpenAI SSE stream helpers", () => {
           },
         ],
       }),
-      frame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+      frame({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
       frame({ choices: [], usage: { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11 } }),
       "data: [DONE]\n\n",
     ];
@@ -211,6 +251,7 @@ describe("native OpenAI SSE stream helpers", () => {
     });
     const wire = output.join("");
     expect(wire).toContain('"name":"lookup"');
+    expect(wire).toContain('"finish_reason":"tool_calls"');
     expect(wire).toContain('"arguments":"{"');
     expect(wire).not.toContain("private");
     expect(wire).not.toContain("hidden");

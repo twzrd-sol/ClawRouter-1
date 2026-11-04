@@ -41,8 +41,10 @@ before signing. `@solana/pay-kit` is used only by development tests as a fixture
   exact `Payment-Receipt` on the final streaming response. It does not fabricate a missing receipt.
   Both also set `supportsNativeStreaming`: streaming chat requests retain `stream: true`
   upstream and request usage chunks. Native SSE flows incrementally, including structured
-  tool calls, with reasoning filtered and token/cost accounting retained. JSON-only replies
-  use the existing simulated stream. In-flight coalesced callers receive live chunks from
+  tool calls, with reasoning filtered and token/cost accounting retained.
+  Ambiguous text-encoded calls wait for the choice to finish so recovery matches the existing
+  whole-message parser; structured tool deltas and ordinary text flow incrementally.
+  JSON-only replies use the existing simulated stream. In-flight coalesced callers receive live chunks from
   one paid attempt; completed cache replays do not claim a new receipt.
   HTTP 102 does not extend OpenClaw's deadline. Real content/tool deltas reset client activity
   timers as the model streams. Payment/header wait and stalled output still have deadlines.

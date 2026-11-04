@@ -41,8 +41,7 @@ net.Socket.prototype.connect = function (this: net.Socket, ...args: ConnectArgs)
 
 const realFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
-  const url =
-    typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   let host = "";
   try {
     host = new URL(url, "http://127.0.0.1").hostname;
@@ -52,7 +51,9 @@ globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
   if (host === "127.0.0.1" || host === "localhost" || host === "::1") {
     return realFetch(input, init);
   }
-  return Promise.resolve(new Response("{}", { status: 404, headers: { "content-type": "application/json" } }));
+  return Promise.resolve(
+    new Response("{}", { status: 404, headers: { "content-type": "application/json" } }),
+  );
 };
 
 const SELLER = "https://openrouter.mpp.tempo.xyz";

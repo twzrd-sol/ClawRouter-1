@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
 import { MppPaidNoCompletionError } from "./mpp-paid-failure.js";
-import { createStripePayFetch, STRIPE_ALREADY_PAID_HEADER, type StripeQuote } from "./stripe-rail.js";
+import {
+  createStripePayFetch,
+  STRIPE_ALREADY_PAID_HEADER,
+  type StripeQuote,
+} from "./stripe-rail.js";
 
 const quote: StripeQuote = { amount: "750", currency: "usd", payee: "acct_merchant" };
 const url = "http://127.0.0.1:1/stripe";

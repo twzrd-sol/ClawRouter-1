@@ -13,11 +13,7 @@ import {
   type SpendControl,
 } from "@twzrd1111/clawrouter";
 import type { PayFetch } from "./mpp-fetch.js";
-import {
-  boundedSnippet,
-  MppPaidNoCompletionError,
-  paymentReference,
-} from "./mpp-paid-failure.js";
+import { boundedSnippet, MppPaidNoCompletionError, paymentReference } from "./mpp-paid-failure.js";
 
 /** Quote checked before any HTTP. `amount` is canonical micro-USD when currency is usd. */
 export type StripeQuote = {
@@ -124,7 +120,9 @@ export function createStripePayFetch(opts: StripePayFetchOptions): PayFetch {
       throw paidNoCompletion(
         signaled ?? paidWithoutCompletion ?? "stripe-unknown",
         undefined,
-        signaled ? "caller signaled payment already happened" : "an earlier charge did not complete",
+        signaled
+          ? "caller signaled payment already happened"
+          : "an earlier charge did not complete",
       );
     }
 
@@ -142,9 +140,7 @@ export function createStripePayFetch(opts: StripePayFetchOptions): PayFetch {
       throw err;
     }
 
-    const reference = paymentReference(
-      `stripe:${quote.currency}:${quote.amount}:${quote.payee}`,
-    );
+    const reference = paymentReference(`stripe:${quote.currency}:${quote.amount}:${quote.payee}`);
     const record =
       spend && reservationId !== undefined
         ? spend.settleReservation(reservationId, { action: "stripe charge" })

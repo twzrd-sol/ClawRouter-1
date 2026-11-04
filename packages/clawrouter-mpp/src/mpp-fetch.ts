@@ -23,7 +23,7 @@ import {
   type SpendControl,
   type SpendRecord,
 } from "@twzrd1111/clawrouter";
-import { creditFromChallenge, guardPaid, markSigned } from "./mpp-paid-failure.js";
+import { creditFromChallenge, currentPaidCall, guardPaid, markSigned } from "./mpp-paid-failure.js";
 import { loadOptional, MPPX_RANGE } from "./mpp-optional.js";
 
 export type { PayFetch };
@@ -112,8 +112,10 @@ export function guardMethod<M extends MethodLike>(
   const guarded: MethodLike = {
     createCredential: async (options: { challenge: ChallengeLike }) => {
       const cached = signedOnce.get(reuseKey(options.challenge));
-      const credit = creditFromChallenge(options.challenge);
-      if (!credit) throw new Error("challenge is missing payer, amount, or id");
+      const call = currentPaidCall();
+      const credit = creditFromChallenge(options.challenge, call?.payer ?? "");
+      if (call && !credit)
+        throw new Error("challenge is missing amount or id, or payer is missing");
       if (cached) {
         markSigned(cached.credential, credit, cached.record);
         return cached.credential;
@@ -183,7 +185,9 @@ export function createMppFetch(
     const mppx = await getMppx();
     try {
       // After a credential is signed, a failed or non-2xx result ends in MppPaidNoCompletionError.
-      return await calls.run(call, () => guardPaid(spend, () => mppx.fetch(input, init)));
+      return await calls.run(call, () =>
+        guardPaid(spend, () => mppx.fetch(input, init), account.address),
+      );
     } catch (e) {
       if (call.last402 && /No method found for challenges/.test((e as Error).message)) {
         return call.last402;
@@ -192,6 +196,7 @@ export function createMppFetch(
     }
   };
   payFetch.enforcesSpend = opts.spend !== undefined;
+  payFetch.deferStreamingHeaders = true;
   return payFetch;
 }
 
@@ -225,6 +230,8 @@ export function parseTempoChargeHeader(header: string): TempoChargeChallenge {
 }
 
 export type TempoFixtureFetchOptions = {
+  /** Actual payer identity supplied by the caller, distinct from the seller recipient. */
+  payer: string;
   /** When set, the challenge is checked and reserved before `sign` runs. */
   spend?: SpendControl;
   /** Extra TIP-20 assets to treat as 6-decimal USD. */
@@ -246,7 +253,9 @@ export type TempoFixtureFetchOptions = {
  * credential via `opts.fetch`.
  */
 export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetch {
-  const usd = new Set([...DEFAULT_TEMPO_USD_ASSETS, ...(opts.usdAssets ?? [])].map((a) => a.toLowerCase()));
+  const usd = new Set(
+    [...DEFAULT_TEMPO_USD_ASSETS, ...(opts.usdAssets ?? [])].map((a) => a.toLowerCase()),
+  );
   const signedOnce = new Map<string, { credential: string; record?: SpendRecord }>();
   const reuseKey = (challenge: TempoChargeChallenge) => {
     const quote = quoteFromChallenge(challenge, usd);
@@ -255,7 +264,7 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
 
   const credentialFor = async (challenge: TempoChargeChallenge): Promise<string> => {
     const cached = signedOnce.get(reuseKey(challenge));
-    const credit = creditFromChallenge(challenge);
+    const credit = creditFromChallenge(challenge, opts.payer);
     if (!credit) throw new Error("challenge is missing payer, amount, or id");
     if (cached) {
       markSigned(cached.credential, credit, cached.record);
@@ -295,23 +304,28 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
   };
 
   const payFetch: PayFetch = async (input, init) =>
-    guardPaid(opts.spend, async () => {
-      const challengeRes = await opts.fetch(input, init);
-      if (challengeRes.status !== 402) return challengeRes;
-      const header = challengeRes.headers.get("www-authenticate");
-      let challenge: TempoChargeChallenge;
-      try {
-        if (!header) return challengeRes;
-        challenge = parseTempoChargeHeader(header);
-      } catch {
-        return challengeRes;
-      }
-      if (challenge.method !== "tempo" || challenge.intent !== "charge") return challengeRes;
-      const credential = await credentialFor(challenge);
-      const headers = new Headers(init?.headers);
-      headers.set("authorization", credential);
-      return opts.fetch(input, { ...init, headers });
-    });
+    guardPaid(
+      opts.spend,
+      async () => {
+        const challengeRes = await opts.fetch(input, init);
+        if (challengeRes.status !== 402) return challengeRes;
+        const header = challengeRes.headers.get("www-authenticate");
+        let challenge: TempoChargeChallenge;
+        try {
+          if (!header) return challengeRes;
+          challenge = parseTempoChargeHeader(header);
+        } catch {
+          return challengeRes;
+        }
+        if (challenge.method !== "tempo" || challenge.intent !== "charge") return challengeRes;
+        const credential = await credentialFor(challenge);
+        const headers = new Headers(init?.headers);
+        headers.set("authorization", credential);
+        return opts.fetch(input, { ...init, headers });
+      },
+      opts.payer,
+    );
   payFetch.enforcesSpend = opts.spend !== undefined;
+  payFetch.deferStreamingHeaders = true;
   return payFetch;
 }

@@ -408,6 +408,31 @@ export function toUpstreamModelId(modelId: string): string {
 const MAX_MESSAGES = 200; // BlockRun API limit - truncate older messages if exceeded
 const CONTEXT_LIMIT_KB = 5120; // Server-side limit: 5MB in KB
 const HEARTBEAT_INTERVAL_MS = 2_000;
+
+/**
+ * Keep a deferred streaming response alive with HTTP 102 Processing: the first after
+ * HEARTBEAT_INTERVAL_MS / 2, then every HEARTBEAT_INTERVAL_MS. A 1xx response is informational and leaves
+ * `res.headersSent` false, so the final status and headers (including `Payment-Receipt`) are still open.
+ * Stops on its own once the final headers go out or the socket closes; callers also clear it.
+ */
+function startProcessingKeepalive(res: ServerResponse): ReturnType<typeof setInterval> {
+  let ticks = 0;
+  const timer = setInterval(() => {
+    if (res.headersSent || res.writableEnded || res.destroyed) {
+      clearInterval(timer);
+      return;
+    }
+    ticks++;
+    if (ticks % 2 === 1) {
+      try {
+        res.writeProcessing();
+      } catch {
+        clearInterval(timer);
+      }
+    }
+  }, HEARTBEAT_INTERVAL_MS / 2);
+  return timer;
+}
 // Hard ceiling on the pre-request balance check. It runs before SSE headers
 // are flushed, so a slow RPC must not eat into OpenClaw's ~10-15s silence
 // timeout. On expiry the request proceeds optimistically.
@@ -855,6 +880,64 @@ export function sanitizeHeaderValue(value: string): string {
       return "?"; // lone surrogate — not encodable
     }
   });
+}
+
+/**
+ * Hop-by-hop headers (RFC 9110 §7.6.1) never cross the proxy, plus the two that stop being true once the
+ * proxy has decoded or rewritten the upstream body (fetch decompresses; the proxy re-serializes JSON or
+ * converts it to SSE, and Node computes framing for the new body).
+ */
+const NON_FORWARDED_RESPONSE_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "content-length",
+  "content-encoding",
+]);
+
+/** Settlement metadata from a paid upstream response. Wire name `Payment-Receipt`. */
+const PAYMENT_RECEIPT_HEADER = "payment-receipt";
+
+/**
+ * Copy the end-to-end headers of an upstream response (lowercase names). If the upstream returned a
+ * `Payment-Receipt`, it is kept and added to `Access-Control-Expose-Headers` so browser callers can read it.
+ */
+export function endToEndResponseHeaders(upstream: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  upstream.forEach((value, key) => {
+    if (NON_FORWARDED_RESPONSE_HEADERS.has(key)) return;
+    out[key] = value;
+  });
+  if (out[PAYMENT_RECEIPT_HEADER] !== undefined) {
+    const exposed = (out["access-control-expose-headers"] ?? "")
+      .split(",")
+      .map((n) => n.trim())
+      .filter(Boolean);
+    if (!exposed.some((n) => n === "*" || n.toLowerCase() === PAYMENT_RECEIPT_HEADER)) {
+      exposed.push("Payment-Receipt");
+    }
+    out["access-control-expose-headers"] = exposed.join(", ");
+  }
+  return out;
+}
+
+/**
+ * Headers for a response served from the dedup or response cache. That request made no payment, so it must
+ * not present the original caller's `Payment-Receipt` as its own; `X-ClawRouter-Cache: HIT` marks the replay.
+ */
+export function replayResponseHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === PAYMENT_RECEIPT_HEADER) continue;
+    out[key] = value;
+  }
+  out["x-clawrouter-cache"] = "HIT";
+  return out;
 }
 
 /**
@@ -2443,6 +2526,7 @@ async function proxyPaidApiRequest(
     )
       continue;
     if (key.startsWith("x-stainless-") || key.startsWith("anthropic-")) continue;
+    if (key === PAYMENT_RECEIPT_HEADER) continue; // settlement output, never caller input
     if (typeof value === "string") headers[key] = value;
   }
   if (!headers["content-type"]) headers["content-type"] = "application/json";
@@ -4988,7 +5072,7 @@ async function proxyRequest(
   req: IncomingMessage,
   res: ServerResponse,
   apiBase: string,
-  payFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
+  payFetch: PayFetch,
   options: ProxyOptions,
   routerOpts: RouterOptions,
   deduplicator: RequestDeduplicator,
@@ -6250,7 +6334,7 @@ async function proxyRequest(
     const cachedResponse = responseCache.get(cacheKey);
     if (cachedResponse) {
       console.log(`[ClawRouter] Cache HIT for ${cachedResponse.model} (saved API call)`);
-      res.writeHead(cachedResponse.status, cachedResponse.headers);
+      res.writeHead(cachedResponse.status, replayResponseHeaders(cachedResponse.headers));
       res.end(cachedResponse.body);
       return;
     }
@@ -6267,7 +6351,7 @@ async function proxyRequest(
   // Check dedup cache (catches retries within 30s)
   const cached = deduplicator.getCached(dedupKey);
   if (cached) {
-    res.writeHead(cached.status, cached.headers);
+    res.writeHead(cached.status, replayResponseHeaders(cached.headers));
     res.end(cached.body);
     return;
   }
@@ -6275,6 +6359,22 @@ async function proxyRequest(
   // Check in-flight — wait for the original request to complete
   const inflight = deduplicator.getInflight(dedupKey);
   if (inflight) {
+    if (isStreaming && payFetch.deferStreamingHeaders === true) {
+      // Deferred mode: the original holds its final headers until payment settles, so this waiter does too.
+      // It shares the original's single paid attempt, so it gets the same status, headers (including
+      // Payment-Receipt), and SSE transcript; an error keeps its real status.
+      const waiterProcessing = startProcessingKeepalive(res);
+      try {
+        const result = await inflight;
+        if (canWrite(res)) {
+          res.writeHead(result.status, result.headers);
+          res.end(result.body);
+        }
+      } finally {
+        clearInterval(waiterProcessing);
+      }
+      return;
+    }
     if (isStreaming) {
       // The original may take minutes (reasoning models get 180s/attempt).
       // Waiting silently recreates the client-timeout/retry storm the
@@ -6562,10 +6662,18 @@ async function proxyRequest(
   }
 
   // --- Streaming: early header flush + heartbeat ---
+  // `headersSentEarly` means "the SSE 200 is committed". With a rail that sets
+  // `deferStreamingHeaders`, nothing is committed while the paid call runs: the client gets HTTP 102
+  // keepalives instead, the final 200 carries the upstream headers (Payment-Receipt), and every error
+  // branch below sees headersSentEarly=false and answers with its real status. `heartbeatInterval` holds
+  // the 102 timer in that mode so every existing clear site stops it.
   let heartbeatInterval: ReturnType<typeof setInterval> | undefined;
   let headersSentEarly = false;
+  const deferStreamingHeaders = isStreaming && payFetch.deferStreamingHeaders === true;
 
-  if (isStreaming) {
+  if (deferStreamingHeaders) {
+    heartbeatInterval = startProcessingKeepalive(res);
+  } else if (isStreaming) {
     // Send 200 + SSE headers immediately, before x402 flow
     res.writeHead(200, {
       "content-type": "text/event-stream",
@@ -6606,6 +6714,8 @@ async function proxyRequest(
     // SDK attribution headers (OpenAI x-stainless-*, Anthropic anthropic-*)
     // These are client-side telemetry/protocol headers — not meaningful to BlockRun.
     if (key.startsWith("x-stainless-") || key.startsWith("anthropic-")) continue;
+    // A receipt is settlement output from the seller, never caller input.
+    if (key === PAYMENT_RECEIPT_HEADER) continue;
     if (typeof value === "string") {
       headers[key] = value;
     }
@@ -7547,9 +7657,67 @@ async function proxyRequest(
     // --- Stream response and collect for dedup cache ---
     const responseChunks: Buffer[] = [];
 
-    if (headersSentEarly) {
-      // Streaming: headers already sent. Response should be 200 at this point
-      // (non-200 responses are handled in the fallback loop above)
+    // Context, routing-debug, and cost headers shared by the non-streaming response and the deferred SSE 200.
+    // Reasoning can contain matched multilingual keywords (Cyrillic/CJK) —
+    // must be sanitized or res.writeHead throws ERR_INVALID_CHAR after the
+    // upstream call has already been paid for.
+    const applyRouterHeaders = (target: Record<string, string>): void => {
+      target["x-context-used-kb"] = String(originalContextSizeKB);
+      target["x-context-limit-kb"] = String(CONTEXT_LIMIT_KB);
+      if (debugMode && routingDecision) {
+        target["x-clawrouter-profile"] = routingProfile ?? "auto";
+        target["x-clawrouter-tier"] = routingDecision.tier;
+        target["x-clawrouter-model"] = actualModelUsed;
+        target["x-clawrouter-confidence"] = routingDecision.confidence.toFixed(2);
+        target["x-clawrouter-reasoning"] = sanitizeHeaderValue(routingDecision.reasoning);
+        if (routingDecision.agenticScore !== undefined) {
+          target["x-clawrouter-agentic-score"] = routingDecision.agenticScore.toFixed(2);
+        }
+      }
+      if (routingDecision) {
+        target["x-clawrouter-cost"] = routingDecision.costEstimate.toFixed(6);
+        target["x-clawrouter-savings"] = `${(routingDecision.savings * 100).toFixed(0)}%`;
+      }
+    };
+    const writeHeadSanitizing = (status: number, target: Record<string, string>): void => {
+      try {
+        res.writeHead(status, target);
+      } catch (headerError) {
+        // Defense in depth: a single invalid header value must never destroy a
+        // response the user has already paid for (the failed delivery makes
+        // clients retry — and re-pay — in a loop). Sanitize every value and
+        // deliver the body; the debug headers are best-effort metadata.
+        console.error(
+          `[ClawRouter] Invalid response header, sanitizing all values: ${String(headerError)}`,
+        );
+        for (const [key, value] of Object.entries(target)) {
+          target[key] = sanitizeHeaderValue(value);
+        }
+        res.writeHead(status, target);
+      }
+    };
+
+    // Final headers of the SSE response; kept for in-flight dedup waiters.
+    let streamResponseHeaders: Record<string, string> = { "content-type": "text/event-stream" };
+
+    if (isStreaming) {
+      // Response should be 200 at this point (non-200 responses are handled in the fallback loop above).
+      if (!headersSentEarly) {
+        // Deferred mode: the paid call is done, so the final headers can carry its settlement metadata.
+        streamResponseHeaders = endToEndResponseHeaders(upstream.headers);
+        streamResponseHeaders["content-type"] = "text/event-stream";
+        streamResponseHeaders["cache-control"] = "no-cache";
+        streamResponseHeaders.connection = "keep-alive";
+        applyRouterHeaders(streamResponseHeaders);
+        writeHeadSanitizing(200, streamResponseHeaders);
+        headersSentEarly = true;
+        if (debugMode && routingDecision) {
+          safeWrite(
+            res,
+            `: x-clawrouter-debug profile=${routingProfile ?? "auto"} tier=${routingDecision.tier} model=${actualModelUsed} agentic=${routingDecision.agenticScore?.toFixed(2) ?? "n/a"} confidence=${routingDecision.confidence.toFixed(2)} reasoning=${routingDecision.reasoning}\n\n`,
+          );
+        }
+      }
 
       // Convert non-streaming JSON response to SSE streaming format for client
       // (BlockRun API returns JSON since we forced stream:false)
@@ -7812,47 +7980,18 @@ async function proxyRequest(
       responseChunks.push(Buffer.from("data: [DONE]\n\n"));
       res.end();
 
-      // Cache for dedup
+      // Cache for dedup. In deferred mode these headers carry the original's Payment-Receipt: in-flight
+      // waiters shared that one payment and get it; completed replays strip it (replayResponseHeaders).
       deduplicator.complete(dedupKey, {
         status: 200,
-        headers: { "content-type": "text/event-stream" },
+        headers: streamResponseHeaders,
         body: Buffer.concat(responseChunks),
         completedAt: Date.now(),
       });
     } else {
-      // Non-streaming: forward status and headers from upstream
-      const responseHeaders: Record<string, string> = {};
-      upstream.headers.forEach((value, key) => {
-        // Skip hop-by-hop headers and content-encoding (fetch already decompresses)
-        if (key === "transfer-encoding" || key === "connection" || key === "content-encoding")
-          return;
-        responseHeaders[key] = value;
-      });
-
-      // Add context usage headers
-      responseHeaders["x-context-used-kb"] = String(originalContextSizeKB);
-      responseHeaders["x-context-limit-kb"] = String(CONTEXT_LIMIT_KB);
-
-      // Add routing debug headers (on by default; see debugMode above).
-      // Reasoning can contain matched multilingual keywords (Cyrillic/CJK) —
-      // must be sanitized or res.writeHead throws ERR_INVALID_CHAR after the
-      // upstream call has already been paid for.
-      if (debugMode && routingDecision) {
-        responseHeaders["x-clawrouter-profile"] = routingProfile ?? "auto";
-        responseHeaders["x-clawrouter-tier"] = routingDecision.tier;
-        responseHeaders["x-clawrouter-model"] = actualModelUsed;
-        responseHeaders["x-clawrouter-confidence"] = routingDecision.confidence.toFixed(2);
-        responseHeaders["x-clawrouter-reasoning"] = sanitizeHeaderValue(routingDecision.reasoning);
-        if (routingDecision.agenticScore !== undefined) {
-          responseHeaders["x-clawrouter-agentic-score"] = routingDecision.agenticScore.toFixed(2);
-        }
-      }
-
-      // Always include cost visibility headers when routing is active
-      if (routingDecision) {
-        responseHeaders["x-clawrouter-cost"] = routingDecision.costEstimate.toFixed(6);
-        responseHeaders["x-clawrouter-savings"] = `${(routingDecision.savings * 100).toFixed(0)}%`;
-      }
+      // Non-streaming: forward status and end-to-end headers from upstream
+      const responseHeaders = endToEndResponseHeaders(upstream.headers);
+      applyRouterHeaders(responseHeaders);
 
       // Collect full body for possible notice injection
       const bodyParts: Buffer[] = [];
@@ -8000,21 +8139,7 @@ async function proxyRequest(
 
       // Update content-length header since body may have changed
       responseHeaders["content-length"] = String(responseBody.length);
-      try {
-        res.writeHead(upstream.status, responseHeaders);
-      } catch (headerError) {
-        // Defense in depth: a single invalid header value must never destroy a
-        // response the user has already paid for (the failed delivery makes
-        // clients retry — and re-pay — in a loop). Sanitize every value and
-        // deliver the body; the debug headers are best-effort metadata.
-        console.error(
-          `[ClawRouter] Invalid response header, sanitizing all values: ${String(headerError)}`,
-        );
-        for (const [key, value] of Object.entries(responseHeaders)) {
-          responseHeaders[key] = sanitizeHeaderValue(value);
-        }
-        res.writeHead(upstream.status, responseHeaders);
-      }
+      writeHeadSanitizing(upstream.status, responseHeaders);
       safeWrite(res, responseBody);
       responseChunks.push(responseBody);
       res.end();

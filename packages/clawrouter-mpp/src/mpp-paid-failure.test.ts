@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   boundedSnippet,
   creditFromChallenge,
-  guardPaid,
+  guardPaid as guardWithPayer,
   markSigned,
   MppPaidNoCompletionError,
   readCredits,
@@ -11,6 +11,9 @@ import { guardMethod } from "./mpp-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
 
 const PATHUSD = "0x20c0000000000000000000000000000000000000";
+const TEST_PAYER = "0x0000000000000000000000000000000000000001";
+const guardPaid = (spend: SpendControl | undefined, run: () => Promise<Response>) =>
+  guardWithPayer(spend, run, TEST_PAYER);
 const challenge = {
   id: "c1",
   request: {
@@ -61,7 +64,7 @@ describe("failure after an MPP payment was signed", () => {
     const added = readCredits().slice(before);
     expect(added).toEqual([
       {
-        payer: challenge.request.recipient,
+        payer: TEST_PAYER,
         amount: challenge.request.amount,
         challengeId: challenge.id,
         reason: "HTTP 500",
@@ -140,7 +143,7 @@ describe("failure after an MPP payment was signed", () => {
 
   it("works without a spend control: still stops, no ledger to annotate", async () => {
     const err = await guardPaid(undefined, async () => {
-      markSigned("tx-bytes", creditFromChallenge(challenge)!);
+      markSigned("tx-bytes", creditFromChallenge(challenge, TEST_PAYER)!);
       return new Response("bad gateway", { status: 502 });
     }).catch((e) => e);
     expect(err).toBeInstanceOf(MppPaidNoCompletionError);
@@ -149,7 +152,7 @@ describe("failure after an MPP payment was signed", () => {
 
   it("runs the call once: the guard itself never retries", async () => {
     const run = vi.fn(async () => {
-      markSigned("tx", creditFromChallenge(challenge)!);
+      markSigned("tx", creditFromChallenge(challenge, TEST_PAYER)!);
       return new Response("x", { status: 503 });
     });
     await guardPaid(undefined, run).catch(() => {});
@@ -160,7 +163,7 @@ describe("failure after an MPP payment was signed", () => {
     const ref = async (p: string) =>
       (
         await guardPaid(undefined, async () => {
-          markSigned(p, creditFromChallenge(challenge)!);
+          markSigned(p, creditFromChallenge(challenge, TEST_PAYER)!);
           return new Response("", { status: 500 });
         }).catch((e) => e)
       ).reference;
@@ -201,5 +204,3 @@ describe("optional MPP packages", () => {
     ).rejects.toBe(dep);
   });
 });
-
-

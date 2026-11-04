@@ -54,6 +54,8 @@ export function creditPaidNoCompletion(
 }
 
 export type PaidCall = {
+  /** The paying account supplied to the rail, never the challenge recipient. */
+  payer: string;
   /** A credential or transaction was produced for this call. */
   signed: boolean;
   /** Stable, non-secret handle for the payment (hash of what was sent), for disputes. */
@@ -66,21 +68,24 @@ export type PaidCall = {
 
 const credits = new CreditLedger();
 
-/** Payer, amount, and challenge id carried on the challenge itself. No signer. */
-export function creditFromChallenge(challenge: {
-  id: string;
-  request?: { amount?: unknown; recipient?: unknown } | Record<string, unknown>;
-}): CreditFacts | undefined {
+/** Amount and id from the challenge, payer from the supplied account. No signer. */
+export function creditFromChallenge(
+  challenge: {
+    id: string;
+    request?: { amount?: unknown; recipient?: unknown } | Record<string, unknown>;
+  },
+  payer: string,
+): CreditFacts | undefined {
   const request = challenge.request;
   const amount = request && "amount" in request ? request.amount : undefined;
-  const payer = request && "recipient" in request ? request.recipient : undefined;
-  if (typeof amount !== "string" || typeof payer !== "string" || challenge.id === "") return undefined;
+  if (typeof amount !== "string" || !/^\d+$/.test(amount) || !payer || !challenge.id)
+    return undefined;
   return { payer, amount, challengeId: challenge.id };
 }
 
 /** Rows written by `fail` when a signed call returns no completion. */
-export function readCredits(): readonly CreditEntry[] {
-  return credits.read();
+export function readCredits(ledger: CreditLedger = credits): readonly CreditEntry[] {
+  return ledger.read();
 }
 
 const storage = new AsyncLocalStorage<PaidCall>();
@@ -98,7 +103,11 @@ export function paymentReference(payload: string): string {
 export type CreditFacts = Pick<CreditEntry, "payer" | "amount" | "challengeId">;
 
 /** Record that this call produced a signed payment. Facts are required. First one wins. */
-export function markSigned(payload: string, facts: CreditFacts, record?: SpendRecord): void {
+export function markSigned(
+  payload: string,
+  facts: CreditFacts | undefined,
+  record?: SpendRecord,
+): void {
   const call = storage.getStore();
   if (!call || call.signed) return;
   call.signed = true;
@@ -115,8 +124,9 @@ export function markSigned(payload: string, facts: CreditFacts, record?: SpendRe
 export async function guardPaid(
   spend: SpendControl | undefined,
   run: () => Promise<Response>,
+  payer: string,
 ): Promise<Response> {
-  const call: PaidCall = { signed: false };
+  const call: PaidCall = { signed: false, payer };
   let response: Response;
   try {
     response = await storage.run(call, run);

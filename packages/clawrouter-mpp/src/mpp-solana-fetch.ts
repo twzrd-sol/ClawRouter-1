@@ -1,28 +1,9 @@
 /**
- * MPP (Machine Payments Protocol) Solana charge upstream fetch — SPIKE.
- *
- * The Solana counterpart of `mpp-fetch.ts`: pays an HTTP 402 `WWW-Authenticate: Payment` challenge
- * (method `solana`, intent `charge`) with `@solana/pay-kit`'s client and retries. Same `PayFetch`
- * signature as every other rail.
- *
- * pay-kit builds its mppx client internally, so there is no `createCredential` seam like the Tempo rail
- * has. Two hooks it does expose are used instead, both called before anything is signed:
- *  - `permissions.authorize(candidate)`: called synchronously per payment candidate; a custom object
- *    here replaces pay-kit's default policy. This is where the amount, network and asset are checked
- *    against ClawRouter's `SpendControl` and the budget is reserved. A non-PermissionDenied throw
- *    propagates out of `client.fetch` (verified against pay-kit 0.13.1).
- *  - `onProgress({ type: "challenge", recipient })`: fires before the transaction is built, and is the
- *    only place the payee is visible, so payee lists are enforced here.
- * The reservation becomes spend on `signed` (the credential carries a signed transaction the server
- * will submit) and is released if the call ends without one.
- *
- * Reads no env vars and no key files: the signer is supplied by the caller.
+ * Solana MPP charge rail. Policy and credit facts are read from the complete
+ * challenge before signing; the SDK builds the transaction and the seller submits it.
+ * No environment variables, key files, or global fetch patches.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
-import type { PaymentCandidate, SolanaNetwork } from "@solana/pay-kit/client";
 import type { KeyPairSigner } from "@solana/kit";
-import { creditFromChallenge, guardPaid, markSigned } from "./mpp-paid-failure.js";
-import { loadOptional, PAY_KIT_RANGE } from "./mpp-optional.js";
 import {
   assertSpendPolicyAllows,
   SpendPolicyError,
@@ -30,18 +11,22 @@ import {
   type SpendControl,
   type SpendRecord,
 } from "@twzrd1111/clawrouter";
+import {
+  creditFromChallenge,
+  guardPaid,
+  markSigned,
+  MppPaidNoCompletionError,
+  paymentReference,
+} from "./mpp-paid-failure.js";
+import { loadOptional, SOLANA_MPP_RANGE } from "./mpp-optional.js";
 
-/**
- * 6-decimal USD stablecoin mints priced here (from pay-kit 0.13.1's own tables). Any other mint cannot be
- * priced, so it is refused while amount limits are set. Pass `usdMints` to add e.g. a localnet test mint.
- */
 export const DEFAULT_SOLANA_USD_MINTS: ReadonlySet<string> = new Set([
-  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC mainnet
-  "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", // USDC devnet
-  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT mainnet
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 ]);
 
-/** CAIP-2 ids the wallet rail and `allowedNetworks` use. localnet has no genesis constant. */
+type SolanaNetwork = "mainnet" | "devnet" | "localnet";
 const CAIP2: Record<SolanaNetwork, string> = {
   mainnet: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
   devnet: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
@@ -52,178 +37,132 @@ export type SolanaMppFetchOptions = {
   signer: KeyPairSigner;
   rpcUrl: string;
   network: SolanaNetwork;
-  /** When set, every payment is checked against these limits before it is signed. */
   spend?: SpendControl;
-  /** Extra mints to treat as 6-decimal USD (e.g. a localnet test mint). */
   usdMints?: Iterable<string>;
+  /** Injectable transport; defaults to fetch. The SDK's RPC transport is separate. */
+  fetch?: typeof fetch;
 };
 
-type Call = {
-  reservationId?: string;
-  settled: boolean;
-  /** The payee-aware check ran (the `challenge` event); signing without it is refused. */
-  payeeChecked: boolean;
-  quote?: { network: string; asset: string; amount?: string; priceable: boolean };
-  credit?: { payer: string; amount: string; challengeId: string };
-};
-
-type SolanaProgressCall = {
-  quote?: { amount?: string };
-  /** Recipient from `{ type: "challenge", recipient }`, before amount or id arrive. */
-  payer?: string;
-  credit?: { payer: string; amount: string; challengeId: string };
-};
-
-type SolanaProgressEvent = {
-  type?: string;
-  recipient?: string;
-  transaction?: string;
-  id?: string;
-  challengeId?: string;
-  amount?: string;
-};
-
-/** Facts from a pay-kit progress event. Runs whether or not a spend control is set. */
-export function noteSolanaProgress(call: SolanaProgressCall, event: SolanaProgressEvent): void {
-  if (event.type === "challenge" && typeof event.recipient === "string") {
-    call.payer = event.recipient;
-  }
-  const challengeId = event.challengeId ?? event.id ?? (event.type === "signed" ? event.transaction : undefined);
-  const amount = event.amount ?? call.quote?.amount ?? "";
-  const payer = event.recipient ?? call.payer;
-  if (payer && challengeId) {
-    call.credit = { payer, amount, challengeId };
-  }
-}
-
-/** No spend control: note the challenge, then record the signed proof. */
-export function applySolanaNoSpend(call: SolanaProgressCall, event: SolanaProgressEvent): void {
-  noteSolanaProgress(call, event);
-  if (event.type === "signed" && typeof event.transaction === "string" && call.credit) {
-    markSigned(event.transaction, call.credit);
-  }
-}
-
-/** Loads pay-kit. Tests replace this with a client whose fetch emits progress events. */
-export const payKitClientDeps = {
-  load: () =>
-    loadOptional("@solana/pay-kit", PAY_KIT_RANGE, () => import("@solana/pay-kit/client")),
+/** Official charge-method entry point. Tests replace only transaction construction. */
+export const solanaChargeDeps = {
+  load: () => loadOptional("@solana/mpp", SOLANA_MPP_RANGE, () => import("@solana/mpp/client")),
 };
 
 export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise<PayFetch> {
-  const { spend, network } = opts;
+  const { charge, selectSolanaChargeChallengeFromResponse, resolveStablecoinMint } =
+    await solanaChargeDeps.load();
+  const base = opts.fetch ?? fetch;
   const usd = new Set([...DEFAULT_SOLANA_USD_MINTS, ...(opts.usdMints ?? [])]);
-  const calls = new AsyncLocalStorage<Call>();
+  const network = opts.network === "mainnet" ? "mainnet-beta" : opts.network;
+  type Signed = { credential: string; payload: string; record?: SpendRecord };
+  // Share construction of the same credential, including overlapping requests.
+  const signedOnce = new Map<string, Promise<Signed>>();
 
-  // pay-kit's `ClientPermissions` has private fields, so a duck-typed object stands in for it (the
-  // client only ever calls `authorize`). Without `spend`, pay-kit's own default policy stays in force.
-  const permissions = spend
-    ? {
-        authorize(candidate: PaymentCandidate) {
-          const call = calls.getStore();
-          if (!call)
-            throw new SpendPolicyError("Solana MPP payment attempted outside a guarded call");
-          const priceable = usd.has(candidate.mint);
-          if (!priceable && spend.hasAmountLimits()) {
-            throw new SpendPolicyError(
-              `MPP quote is in a mint ClawRouter cannot price (${candidate.mint}); refusing to pay against a configured spend limit`,
-            );
-          }
-          const amount = priceable ? candidate.amount.toString() : undefined;
-          call.quote = {
-            network: CAIP2[candidate.network],
-            asset: candidate.mint,
-            amount,
-            priceable,
-          };
-          // payTo is not in the candidate, so payee lists are deferred to the `challenge` progress event
-          // below (which runs before the transaction is built). `signing` refuses if that never happened.
-          call.reservationId = assertSpendPolicyAllows(spend, {
-            network: call.quote.network,
-            asset: candidate.mint,
-            amount,
-            payeeDeferred: true,
-          });
-          return { maxAmountAtomic: candidate.amount };
-        },
-      }
-    : undefined;
-
-  // `@solana/pay-kit` is an optional peer dependency (see mpp-optional.ts).
-  const { PayKitClient } = await payKitClientDeps.load();
-  const client = await PayKitClient.builder()
-    .signer(opts.signer)
-    .rpcUrl(opts.rpcUrl)
-    .network(network)
-    .accept(["mpp"])
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    .permissions(permissions as any)
-    .onProgress((event) => {
-      const call = calls.getStore();
-      const e = event as {
-        type?: string;
-        recipient?: string;
-        transaction?: string;
-        id?: string;
-        challengeId?: string;
-        amount?: string;
-      };
-      if (!call) return;
-      noteSolanaProgress(call, e);
-      if (!spend) {
-        applySolanaNoSpend(call, e);
-        return;
-      }
-      if (e.type === "challenge" && call.quote) {
-        const id = (event as { id?: unknown; challengeId?: unknown }).id;
-        const alt = (event as { challengeId?: unknown }).challengeId;
-        const challengeId = typeof id === "string" ? id : typeof alt === "string" ? alt : undefined;
-        if (typeof e.recipient === "string" && call.quote.amount && challengeId) {
-          call.credit = { payer: e.recipient, amount: call.quote.amount, challengeId };
+  const payFetch: PayFetch = async (input, init) =>
+    guardPaid(
+      opts.spend,
+      async () => {
+        const request = new Request(input, init);
+        const probe = await base(request.clone());
+        if (probe.status !== 402) return probe;
+        if (probe.redirected)
+          throw new SpendPolicyError("Refusing a payment challenge reached through a redirect");
+        const challenge = selectSolanaChargeChallengeFromResponse(probe);
+        if (!challenge) return probe;
+        const challengeNetwork = challenge.request.methodDetails.network ?? "mainnet";
+        if (solanaNetworkId(challengeNetwork) !== CAIP2[opts.network]) {
+          throw new SpendPolicyError(
+            "Solana challenge network does not match the configured network",
+          );
         }
-        // Payee lists only: cost 0, because this payment's own amount is already reserved and counting
-        // it again would block a payment that fits. Throws here, before the transaction is built, abort it.
-        const result = spend.check(0, {
-          payTo: e.recipient,
-          network: call.quote.network,
-          asset: call.quote.asset,
-        });
-        if (!result.allowed) {
-          throw new SpendPolicyError(result.reason ?? "blocked by spend policy", {
-            blockedBy: result.blockedBy,
-            blockedByPolicy: result.blockedByPolicy,
-          });
+        const credit = creditFromChallenge(challenge, opts.signer.address);
+        if (!credit) throw new Error("challenge is missing amount or id");
+        const quote = quoteFromSolanaChallenge(
+          {
+            request: {
+              ...challenge.request,
+              methodDetails: { ...challenge.request.methodDetails, network: challengeNetwork },
+              currency:
+                resolveStablecoinMint(challenge.request.currency, network) ??
+                challenge.request.currency,
+            },
+          },
+          usd,
+        );
+        const key = JSON.stringify([challenge.id, challenge.request]);
+        let pending = signedOnce.get(key);
+        if (!pending) {
+          pending = (async (): Promise<Signed> => {
+            const spend = opts.spend;
+            if (spend && !quote.priceable && spend.hasAmountLimits()) {
+              throw new SpendPolicyError(
+                "MPP quote is in a mint ClawRouter cannot price; refusing to pay against a configured spend limit",
+              );
+            }
+            const reservationId = spend ? assertSpendPolicyAllows(spend, quote) : undefined;
+            let signed = false;
+            let record: SpendRecord | undefined;
+            let payload = "";
+            try {
+              const method = charge({
+                signer: opts.signer,
+                rpcUrl: opts.rpcUrl,
+                expectedNetwork: challengeNetwork,
+                broadcast: false,
+                onProgress(event) {
+                  if (event.type !== "signed") return;
+                  signed = true;
+                  payload = event.transaction;
+                  if (spend && reservationId !== undefined) {
+                    record = spend.settleReservation(reservationId, {
+                      action: "mpp solana charge",
+                    });
+                  }
+                  markSigned(payload, credit, record);
+                },
+              });
+              const credential = await method.createCredential({ challenge });
+              // Account for a compatible method which returns a credential without progress.
+              if (!signed) {
+                payload = credential;
+                if (spend && reservationId !== undefined) {
+                  record = spend.settleReservation(reservationId, { action: "mpp solana charge" });
+                }
+              }
+              return { credential, payload, record };
+            } catch (err) {
+              if (signed) {
+                throw new MppPaidNoCompletionError(
+                  "Solana payment was signed but credential construction failed; refusing to sign again",
+                  paymentReference(payload),
+                  undefined,
+                  { cause: err },
+                );
+              }
+              if (!signed && spend && reservationId !== undefined)
+                spend.releaseReservation(reservationId);
+              throw err;
+            }
+          })();
+          signedOnce.set(key, pending);
         }
-        call.payeeChecked = true;
-      } else if (e.type === "signing") {
-        if (!call.payeeChecked) {
-          throw new SpendPolicyError("payee was never checked before signing; refusing to sign");
+        let result: Signed;
+        try {
+          result = await pending;
+        } catch (err) {
+          if (!(err instanceof MppPaidNoCompletionError) && signedOnce.get(key) === pending)
+            signedOnce.delete(key);
+          throw err;
         }
-      } else if (e.type === "signed" || e.type === "paid") {
-        let record;
-        if (call.reservationId !== undefined && !call.settled) {
-          call.settled = true;
-          record = spend.settleReservation(call.reservationId, { action: "mpp solana charge" });
-        }
-        if (e.type === "signed" && typeof e.transaction === "string" && call.credit)
-          markSigned(e.transaction, call.credit, record);
-      }
-    })
-    .build();
-
-  const payFetch: PayFetch = async (input, init) => {
-    const call: Call = { settled: false, payeeChecked: false };
-    try {
-      // After a transaction is signed, a failed or non-2xx result ends in MppPaidNoCompletionError.
-      return await guardPaid(spend, () => calls.run(call, () => client.fetch(input, init, "mpp")));
-    } finally {
-      // Never signed (denied, failed, or no payable option): free the held budget.
-      if (spend && call.reservationId !== undefined && !call.settled) {
-        spend.releaseReservation(call.reservationId);
-      }
-    }
-  };
-  payFetch.enforcesSpend = spend !== undefined;
+        markSigned(result.payload, credit, result.record);
+        const headers = new Headers(request.headers);
+        headers.set("authorization", result.credential);
+        return base(new Request(request, { headers }));
+      },
+      opts.signer.address,
+    );
+  payFetch.enforcesSpend = opts.spend !== undefined;
+  payFetch.deferStreamingHeaders = true;
   return payFetch;
 }
 
@@ -246,7 +185,8 @@ export type SolanaChargeChallenge = {
 /** Map a challenge network (name or CAIP-2) onto the id `allowedNetworks` stores. */
 function solanaNetworkId(value: string): string {
   if (value === "devnet" || value === CAIP2.devnet) return CAIP2.devnet;
-  if (value === "mainnet" || value === "mainnet-beta" || value === CAIP2.mainnet) return CAIP2.mainnet;
+  if (value === "mainnet" || value === "mainnet-beta" || value === CAIP2.mainnet)
+    return CAIP2.mainnet;
   if (value === "localnet" || value === CAIP2.localnet) return CAIP2.localnet;
   return value;
 }
@@ -259,8 +199,7 @@ export function quoteFromSolanaChallenge(
   const req = challenge.request ?? {};
   const asset = typeof req.currency === "string" ? req.currency : undefined;
   const rawNetwork = req.methodDetails?.network;
-  const priceable =
-    asset !== undefined && usdMints.has(asset) && typeof req.amount === "string";
+  const priceable = asset !== undefined && usdMints.has(asset) && typeof req.amount === "string";
   return {
     payTo: typeof req.recipient === "string" ? req.recipient : undefined,
     network: typeof rawNetwork === "string" ? solanaNetworkId(rawNetwork) : undefined,
@@ -288,6 +227,8 @@ export function parseSolanaChargeHeader(header: string): SolanaChargeChallenge {
 }
 
 export type SolanaFixtureFetchOptions = {
+  /** Actual payer account, distinct from the seller recipient. */
+  payer: string;
   /** When set, the challenge is checked and reserved before `sign` runs. */
   spend?: SpendControl;
   /** Extra mints to treat as 6-decimal USD. */
@@ -302,10 +243,9 @@ export type SolanaFixtureFetchOptions = {
 };
 
 /**
- * Solana charge completion without pay-kit.
+ * Solana charge completion with a caller-supplied fixture signer.
  *
- * pay-kit builds the transaction through an RPC and a `KeyPairSigner`, so `createSolanaMppFetch`
- * cannot finish a devnet challenge offline. This runs the same spend checks (price, network, asset,
+ * The SDK may need an RPC to build a transaction. This runs the same spend checks (price, network, asset,
  * payee, reserve, then settle) and attaches one cached `Payment` credential via `opts.fetch`.
  */
 export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFetch {
@@ -318,7 +258,7 @@ export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFe
 
   const credentialFor = async (challenge: SolanaChargeChallenge): Promise<string> => {
     const cached = signedOnce.get(reuseKey(challenge));
-    const credit = creditFromChallenge(challenge);
+    const credit = creditFromChallenge(challenge, opts.payer);
     if (!credit) throw new Error("challenge is missing payer, amount, or id");
     if (cached) {
       markSigned(cached.credential, credit, cached.record);
@@ -358,23 +298,28 @@ export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFe
   };
 
   const payFetch: PayFetch = async (input, init) =>
-    guardPaid(opts.spend, async () => {
-      const challengeRes = await opts.fetch(input, init);
-      if (challengeRes.status !== 402) return challengeRes;
-      const header = challengeRes.headers.get("www-authenticate");
-      let challenge: SolanaChargeChallenge;
-      try {
-        if (!header) return challengeRes;
-        challenge = parseSolanaChargeHeader(header);
-      } catch {
-        return challengeRes;
-      }
-      if (challenge.method !== "solana" || challenge.intent !== "charge") return challengeRes;
-      const credential = await credentialFor(challenge);
-      const headers = new Headers(init?.headers);
-      headers.set("authorization", credential);
-      return opts.fetch(input, { ...init, headers });
-    });
+    guardPaid(
+      opts.spend,
+      async () => {
+        const challengeRes = await opts.fetch(input, init);
+        if (challengeRes.status !== 402) return challengeRes;
+        const header = challengeRes.headers.get("www-authenticate");
+        let challenge: SolanaChargeChallenge;
+        try {
+          if (!header) return challengeRes;
+          challenge = parseSolanaChargeHeader(header);
+        } catch {
+          return challengeRes;
+        }
+        if (challenge.method !== "solana" || challenge.intent !== "charge") return challengeRes;
+        const credential = await credentialFor(challenge);
+        const headers = new Headers(init?.headers);
+        headers.set("authorization", credential);
+        return opts.fetch(input, { ...init, headers });
+      },
+      opts.payer,
+    );
   payFetch.enforcesSpend = opts.spend !== undefined;
+  payFetch.deferStreamingHeaders = true;
   return payFetch;
 }

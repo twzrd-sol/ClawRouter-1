@@ -1,26 +1,27 @@
 /** In-memory credit row. No chain write and no signer. */
 
-export type CreditEntry = {
+export type CreditEntry = Readonly<{
   payer: string;
   amount: string;
   challengeId: string;
   reason: string;
-};
+}>;
 
 export class CreditLedger {
   private readonly rows: CreditEntry[] = [];
 
   /** One row per payer and challenge. A retry returns the first row. */
   recordOnce(entry: CreditEntry): CreditEntry {
-    const key = `${entry.payer}\0${entry.challengeId}`;
-    const prior = this.rows.find((row) => `${row.payer}\0${row.challengeId}` === key);
+    const prior = this.rows.find(
+      (row) => row.payer === entry.payer && row.challengeId === entry.challengeId,
+    );
     if (prior) return prior;
-    this.rows.push({ ...entry });
+    this.rows.push(Object.freeze({ ...entry }));
     return this.rows[this.rows.length - 1];
   }
 
   read(): readonly CreditEntry[] {
-    return this.rows;
+    return Object.freeze([...this.rows]);
   }
 }
 

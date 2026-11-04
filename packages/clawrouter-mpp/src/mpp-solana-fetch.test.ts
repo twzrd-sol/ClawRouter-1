@@ -2,12 +2,13 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateKeyPairSigner } from "@solana/kit";
+import { Credential } from "mppx";
 import { createPayKit, usd } from "@solana/pay-kit";
 import {
   createSolanaFixtureFetch,
   createSolanaMppFetch,
   parseSolanaChargeHeader,
-  payKitClientDeps,
+  solanaChargeDeps,
   quoteFromSolanaChallenge,
   SOLANA_DEVNET_USDC_MINT,
   type SolanaChargeChallenge,
@@ -222,56 +223,160 @@ function stubDevnet(paid: Response) {
   return { base, calls };
 }
 
-describe("createSolanaMppFetch with no spend control", () => {
-  it("a signed 502 records one credit from the challenge and a retry stays one row", async () => {
-    const before = readCredits().length;
-    const realLoad = payKitClientDeps.load;
-    payKitClientDeps.load = async () =>
-      ({
-        PayKitClient: {
-          builder() {
-            let progress: (event: unknown) => void = () => {};
-            const chain = {
-              signer: () => chain,
-              rpcUrl: () => chain,
-              network: () => chain,
-              accept: () => chain,
-              permissions: () => chain,
-              onProgress(cb: (event: unknown) => void) {
-                progress = cb;
-                return chain;
-              },
-              async build() {
-                return {
-                  async fetch() {
-                    progress({ type: "challenge", recipient: FIXTURE_PAYEE });
-                    progress({ type: "signed", transaction: "tx-sol" });
-                    return new Response("down", { status: 502 });
-                  },
-                };
-              },
-            };
-            return chain;
-          },
+describe("createSolanaMppFetch paid failures", () => {
+  it("never signs again if credential construction fails after signing, including concurrent waiters", async () => {
+    const realLoad = solanaChargeDeps.load;
+    const sdk = await realLoad();
+    const signer = await payer();
+    const signed = vi.fn();
+    solanaChargeDeps.load = async () => ({
+      ...sdk,
+      charge: (params) => ({
+        ...sdk.charge(params),
+        createCredential: async () => {
+          signed();
+          params.onProgress?.({ type: "signed", transaction: "fixture-signed" });
+          throw new Error("credential construction failed");
         },
-      }) as unknown as Awaited<ReturnType<typeof realLoad>>;
+      }),
+    });
+    const before = readCredits().length;
     try {
       const pay = await createSolanaMppFetch({
-        signer: await generateKeyPairSigner(),
+        signer,
         rpcUrl: DEAD_RPC,
         network: "devnet",
+        fetch: async () =>
+          new Response("", { status: 402, headers: { "www-authenticate": FIXTURE_HEADER } }),
       });
-      const send = () => pay(FIXTURE_URL, { method: "POST", body: "{}" });
-      const err = await send().catch((e: unknown) => e);
-      await send().catch(() => {});
-      expect(err).toBeInstanceOf(MppPaidNoCompletionError);
+      const send = () => pay(FIXTURE_URL);
+      const results = await Promise.allSettled([send(), send()]);
+      expect(
+        results.every(
+          (r) => r.status === "rejected" && r.reason instanceof MppPaidNoCompletionError,
+        ),
+      ).toBe(true);
+      await expect(send()).rejects.toBeInstanceOf(MppPaidNoCompletionError);
+      expect(signed).toHaveBeenCalledTimes(1);
       expect(readCredits().slice(before)).toEqual([
-        { payer: FIXTURE_PAYEE, amount: "", challengeId: "tx-sol", reason: "HTTP 502" },
+        {
+          payer: signer.address,
+          amount: "750",
+          challengeId: "fixture-challenge-id",
+          reason: "request failed",
+        },
       ]);
     } finally {
-      payKitClientDeps.load = realLoad;
+      solanaChargeDeps.load = realLoad;
     }
   });
+
+  it("uses the real charge SDK offline, retains the original challenge, and shares concurrent signing", async () => {
+    const watched = await watchedPayer();
+    const recipient = await payer();
+    const feePayer = await payer();
+    const id = "real-sdk-offline-fixture";
+    const request = {
+      ...FIXTURE_REQUEST,
+      recipient: recipient.address,
+      methodDetails: {
+        network: "devnet",
+        decimals: 6,
+        feePayer: true,
+        feePayerKey: feePayer.address,
+        tokenProgram: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        recentBlockhash: "11111111111111111111111111111111",
+      },
+    };
+    const header = `Payment id="${id}", realm="fixture", method="solana", intent="charge", request="${Buffer.from(JSON.stringify(request)).toString("base64url")}"`;
+    const credentials: string[] = [];
+    const base = vi.fn(async (input: RequestInfo | URL) => {
+      const authorization = (input as Request).headers.get("authorization");
+      if (!authorization)
+        return new Response("", { status: 402, headers: { "www-authenticate": header } });
+      credentials.push(authorization);
+      return new Response("model failed", { status: 502 });
+    }) as unknown as typeof fetch;
+    const before = readCredits().length;
+    const spend = control((c) => c.setLimit("daily", 1));
+    const pay = await createSolanaMppFetch({
+      signer: watched.signer,
+      rpcUrl: DEAD_RPC,
+      network: "devnet",
+      spend,
+      fetch: base,
+    });
+    const send = () => pay(FIXTURE_URL, { method: "POST", body: "{}" });
+    const results = await Promise.allSettled([send(), send()]);
+    expect(
+      results.every((r) => r.status === "rejected" && r.reason instanceof MppPaidNoCompletionError),
+    ).toBe(true);
+    expect(watched.calls()).toBe(1);
+    expect(credentials).toHaveLength(2);
+    expect(credentials[0]).toBe(credentials[1]);
+    const proof = Credential.deserialize<{ type: string; transaction: string }>(credentials[0]);
+    expect(proof.challenge.id).toBe(id);
+    expect(proof.payload.type).toBe("transaction");
+    expect(proof.payload.transaction.length).toBeGreaterThan(100);
+    expect(spend.getSpending("daily")).toBeCloseTo(0.00075, 8);
+    expect(readCredits().slice(before)).toEqual([
+      { payer: watched.signer.address, amount: "750", challengeId: id, reason: "HTTP 502" },
+    ]);
+  });
+
+  it.each([false, true])(
+    "retains the real payer and challenge with spend=%s, once across retries",
+    async (withSpend) => {
+      const before = readCredits().length;
+      const signer = await generateKeyPairSigner();
+      const realLoad = solanaChargeDeps.load;
+      const sdk = await realLoad();
+      const signed = vi.fn();
+      solanaChargeDeps.load = async () => ({
+        ...sdk,
+        charge: (params) =>
+          ({
+            ...sdk.charge(params),
+            createCredential: async () => {
+              signed();
+              params.onProgress?.({ type: "signed", transaction: "fixture-wire-transaction" });
+              return "Payment fixture-credential";
+            },
+          }) as ReturnType<typeof sdk.charge>,
+      });
+      const base = vi.fn(async (input: RequestInfo | URL) => {
+        const request = input as Request;
+        return request.headers.has("authorization")
+          ? new Response("down", { status: 502 })
+          : new Response("", { status: 402, headers: { "www-authenticate": FIXTURE_HEADER } });
+      }) as unknown as typeof fetch;
+      try {
+        const pay = await createSolanaMppFetch({
+          signer,
+          rpcUrl: DEAD_RPC,
+          network: "devnet",
+          spend: withSpend ? devnetControl() : undefined,
+          fetch: base,
+        });
+        const send = () => pay(FIXTURE_URL, { method: "POST", body: "{}" });
+        await expect(send()).rejects.toBeInstanceOf(MppPaidNoCompletionError);
+        await expect(send()).rejects.toBeInstanceOf(MppPaidNoCompletionError);
+        expect(readCredits().slice(before)).toEqual([
+          {
+            payer: signer.address,
+            amount: "750",
+            challengeId: "fixture-challenge-id",
+            reason: "HTTP 502",
+          },
+        ]);
+        expect(signed).toHaveBeenCalledTimes(1);
+        expect(pay.deferStreamingHeaders).toBe(true);
+        expect(base).toHaveBeenCalledTimes(4);
+      } finally {
+        solanaChargeDeps.load = realLoad;
+      }
+    },
+  );
 });
 
 describe("Solana devnet fixture, no network", () => {
@@ -307,7 +412,12 @@ describe("Solana devnet fixture, no network", () => {
       }),
     );
     const body = JSON.stringify({ model: "fixture" });
-    const pay = createSolanaFixtureFetch({ spend: control, sign, fetch: base });
+    const pay = createSolanaFixtureFetch({
+      payer: "FixturePayer11111111111111111111111111111111",
+      spend: control,
+      sign,
+      fetch: base,
+    });
     const once = () =>
       pay(FIXTURE_URL, { method: "POST", headers: { "content-type": "application/json" }, body });
 
@@ -340,7 +450,12 @@ describe("Solana devnet fixture, no network", () => {
       return c.id;
     };
     const { base, calls } = stubDevnet(new Response("no completion", { status: 502 }));
-    const pay = createSolanaFixtureFetch({ spend: control, sign, fetch: base });
+    const pay = createSolanaFixtureFetch({
+      payer: "FixturePayer11111111111111111111111111111111",
+      spend: control,
+      sign,
+      fetch: base,
+    });
     const before = readCredits().length;
     const send = () =>
       pay(FIXTURE_URL, {
@@ -354,7 +469,7 @@ describe("Solana devnet fixture, no network", () => {
     expect(err.message).toContain("Not retrying");
     expect(readCredits().slice(before)).toEqual([
       {
-        payer: FIXTURE_PAYEE,
+        payer: "FixturePayer11111111111111111111111111111111",
         amount: "750",
         challengeId: "fixture-challenge-id",
         reason: "HTTP 502",

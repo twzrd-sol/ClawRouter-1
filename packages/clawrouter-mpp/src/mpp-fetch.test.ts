@@ -295,6 +295,7 @@ describe("OpenRouter Tempo fixture, no network", () => {
       }),
     );
     const payFetch = createTempoFixtureFetch({
+      payer: account.address,
       spend: control,
       sign: async (challenge) => {
         expect(control.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
@@ -314,9 +315,9 @@ describe("OpenRouter Tempo fixture, no network", () => {
     expect(signed).toEqual(["fixture-challenge-id"]);
     expect(calls[0].authorization).toBeNull();
     expect(calls[1].authorization).toBe("Payment fixture-challenge-id");
-    expect(calls.every((c) => c.url === "https://openrouter.mpp.tempo.xyz/v1/chat/completions")).toBe(
-      true,
-    );
+    expect(
+      calls.every((c) => c.url === "https://openrouter.mpp.tempo.xyz/v1/chat/completions"),
+    ).toBe(true);
     expect(control.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
 
     const again = await once();
@@ -333,6 +334,7 @@ describe("OpenRouter Tempo fixture, no network", () => {
     const signed: string[] = [];
     const { base, calls } = stubOpenRouter(new Response("no completion", { status: 502 }));
     const payFetch = createTempoFixtureFetch({
+      payer: account.address,
       spend: control,
       sign: async (challenge) => {
         signed.push(challenge.id);
@@ -355,7 +357,12 @@ describe("OpenRouter Tempo fixture, no network", () => {
     expect((err as Error).message).toContain("Not retrying");
     expect((err as MppPaidNoCompletionError).status).toBe(502);
     expect(readCredits().slice(before)).toEqual([
-      { payer: FIXTURE_PAYEE, amount: "750", challengeId: "fixture-challenge-id", reason: "HTTP 502" },
+      {
+        payer: account.address,
+        amount: "750",
+        challengeId: "fixture-challenge-id",
+        reason: "HTTP 502",
+      },
     ]);
     expect(calls.length).toBeGreaterThanOrEqual(2);
     expect(signed).toEqual(["fixture-challenge-id"]);

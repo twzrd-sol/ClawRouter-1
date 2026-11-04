@@ -22,7 +22,9 @@ export class SpentProofLedger {
   private readonly spent = new Set<string>();
 
   claim(txSignature: string, challengeId: string): boolean {
-    const key = `${txSignature}\0${challengeId}`;
+    if (!txSignature || !challengeId)
+      throw new TypeError("transaction signature and challenge id are required");
+    const key = JSON.stringify([txSignature, challengeId]);
     if (this.spent.has(key)) return false;
     this.spent.add(key);
     return true;

@@ -15,6 +15,13 @@
 export type PayFetch = ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) & {
   /** True when this fetch checks the configured spend limits before signing. */
   enforcesSpend?: boolean;
+  /**
+   * For `stream: true` callers, hold the final response headers until this fetch returns, so settlement
+   * metadata such as `Payment-Receipt` can ride on the final HTTP 200. While waiting the proxy sends HTTP 102
+   * (informational, commits nothing) instead of an early 200 plus SSE heartbeats, and errors keep their real
+   * status. Unset keeps the early-SSE behavior. Independent of `enforcesSpend`.
+   */
+  deferStreamingHeaders?: boolean;
 };
 
 /** `Error.name` that marks "signed and sent, no completion". Matched by name so a rail in another package works. */

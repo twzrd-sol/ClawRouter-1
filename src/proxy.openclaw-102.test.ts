@@ -26,7 +26,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 vi.mock("./updater.js", () => ({ checkForUpdates: async () => {} }));
 import { generatePrivateKey } from "viem/accounts";
 import { startProxy } from "./proxy.js";
-import type { PayFetch } from "./pay-fetch.js";
+import { PAYMENT_SETTLED_NO_COMPLETION, type PayFetch } from "./pay-fetch.js";
 import { InMemorySpendControlStorage, SpendControl } from "./spend-control.js";
 
 type AiModules = {
@@ -98,6 +98,7 @@ type Timeline = {
   acceptedStatus?: number;
   receipt?: string;
   activityMs: number[];
+  progressMs: number[];
   text: string;
   terminal?: string;
   error?: string;
@@ -110,8 +111,22 @@ async function runOpenClaw(baseUrl: string): Promise<Timeline> {
   const runtime = ai.createNodeLlmRuntime(registry);
   const controller = new AbortController();
   const t0 = Date.now();
-  const tl: Timeline = { activityMs: [], text: "", totalMs: 0 };
-  const off = ai.onLlmRequestActivity(controller.signal, () => tl.activityMs.push(Date.now() - t0));
+  const tl: Timeline = { activityMs: [], progressMs: [], text: "", totalMs: 0 };
+  let watchdog: ReturnType<typeof setTimeout>;
+  const armWatchdog = () => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(
+      () => controller.abort(new Error("120s OpenClaw activity budget exceeded")),
+      120_000,
+    );
+  };
+  armWatchdog();
+  const off = ai.onLlmRequestActivity(controller.signal, (progress) => {
+    armWatchdog();
+    const elapsed = Date.now() - t0;
+    tl.activityMs.push(elapsed);
+    if (progress) tl.progressMs.push(elapsed);
+  });
   const model = {
     id: "blockrun/auto",
     name: "auto",
@@ -133,6 +148,7 @@ async function runOpenClaw(baseUrl: string): Promise<Timeline> {
       apiKey: "unused-loopback",
       signal: controller.signal,
       onResponse: (response: { status: number; headers: Record<string, string> }) => {
+        armWatchdog();
         tl.acceptedAtMs ??= Date.now() - t0;
         tl.acceptedStatus = response.status;
         tl.receipt = response.headers["payment-receipt"];
@@ -154,6 +170,7 @@ async function runOpenClaw(baseUrl: string): Promise<Timeline> {
   } catch (err) {
     tl.error = String(err);
   } finally {
+    clearTimeout(watchdog!);
     off();
   }
   tl.totalMs = Date.now() - t0;
@@ -170,6 +187,81 @@ async function start(payFetch: PayFetch) {
     port: 0,
     allowExistingProxy: false,
   });
+}
+
+async function requestNativeStream(baseUrl: string) {
+  return fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "blockrun/auto",
+      messages: [{ role: "user", content: "hello" }],
+      stream: true,
+    }),
+  });
+}
+
+function nativeStreamingRail(delayMs: number) {
+  const requestBodies: Record<string, unknown>[] = [];
+  const fn = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    requestBodies.push(
+      JSON.parse(new TextDecoder().decode(init?.body as Uint8Array)) as Record<string, unknown>,
+    );
+    const encoder = new TextEncoder();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const send = (value: unknown) =>
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
+        const base = {
+          id: "chatcmpl-native-stream",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "test-model",
+        };
+        send({
+          ...base,
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        });
+        send({
+          ...base,
+          choices: [{ index: 0, delta: { content: "A".repeat(40) }, finish_reason: null }],
+        });
+        timer = setTimeout(() => {
+          send({
+            ...base,
+            choices: [{ index: 0, delta: { content: "B".repeat(40) }, finish_reason: null }],
+          });
+          timer = setTimeout(() => {
+            send({
+              ...base,
+              choices: [{ index: 0, delta: { content: "C".repeat(40) }, finish_reason: null }],
+            });
+            send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+            send({
+              ...base,
+              choices: [],
+              usage: { prompt_tokens: 3, completion_tokens: 120, total_tokens: 123 },
+            });
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          }, delayMs);
+        }, delayMs);
+      },
+      cancel() {
+        if (timer) clearTimeout(timer);
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream", "Payment-Receipt": FAKE_RECEIPT },
+    });
+  });
+  const payFetch = fn as unknown as PayFetch;
+  payFetch.enforcesSpend = true;
+  payFetch.deferStreamingHeaders = true;
+  payFetch.supportsNativeStreaming = true;
+  return { payFetch, fn, requestBodies };
 }
 
 describe("OpenClaw transport against deferred streaming headers", () => {
@@ -223,4 +315,102 @@ describe("OpenClaw transport against deferred streaming headers", () => {
     // early 200 buys OpenClaw no extra time over deferred mode: both wait on the paid call's first data.
     expect(tl.activityMs.filter((t) => t < PAY_DELAY_MS - 200)).toEqual([]);
   }, 30_000);
+
+  it("native upstream chunks keep OpenClaw alive and deliver the receipt past 120 seconds", async () => {
+    const { payFetch, fn, requestBodies } = nativeStreamingRail(65_000);
+    const proxy = await start(payFetch);
+    close = () => proxy.close();
+    const tl = await runOpenClaw(proxy.baseUrl);
+
+    expect(tl.error).toBeUndefined();
+    expect(tl.terminal).toBe("done");
+    expect(tl.text).toBe(`${"A".repeat(40)}${"B".repeat(40)}${"C".repeat(40)}`);
+    expect(tl.acceptedAtMs).toBeLessThan(3_000);
+    expect(tl.acceptedStatus).toBe(200);
+    expect(tl.receipt).toBe(FAKE_RECEIPT);
+    expect(tl.totalMs).toBeGreaterThanOrEqual(125_000);
+    expect(tl.progressMs.some((time) => time >= 120_000)).toBe(true);
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(requestBodies).toHaveLength(1);
+    expect(requestBodies[0]).toMatchObject({
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+  }, 180_000);
+
+  it("paid stream body failure is terminal, reports the original Response, and never retries", async () => {
+    const encoder = new TextEncoder();
+    const original = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "partial" } }] })}\n\n`,
+            ),
+          );
+          controller.error(new Error("fixture stream broke"));
+        },
+      }),
+      { headers: { "content-type": "text/event-stream", "Payment-Receipt": FAKE_RECEIPT } },
+    );
+    const payFetch = vi.fn(async () => original) as unknown as PayFetch;
+    payFetch.enforcesSpend = true;
+    payFetch.deferStreamingHeaders = true;
+    payFetch.supportsNativeStreaming = true;
+    payFetch.onNoCompletion = vi.fn((response, reason) => {
+      expect(response).toBe(original);
+      expect(reason).toContain("fixture stream broke");
+      throw Object.assign(new Error("paid stream produced no completion"), {
+        name: PAYMENT_SETTLED_NO_COMPLETION,
+      });
+    });
+    const proxy = await start(payFetch);
+    close = () => proxy.close();
+
+    const response = await requestNativeStream(proxy.baseUrl);
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("payment-receipt")).toBe(FAKE_RECEIPT);
+    expect(body).toContain("payment_settled_no_completion");
+    expect(body).toContain("[DONE]");
+    expect(payFetch).toHaveBeenCalledTimes(1);
+    expect(payFetch.onNoCompletion).toHaveBeenCalledTimes(1);
+  }, 20_000);
+
+  it("paid stream EOF without finish and [DONE] records a terminal failure", async () => {
+    const encoder = new TextEncoder();
+    const original = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "unfinished answer" } }] })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      }),
+      { headers: { "content-type": "text/event-stream", "Payment-Receipt": FAKE_RECEIPT } },
+    );
+    const payFetch = vi.fn(async () => original) as unknown as PayFetch;
+    payFetch.enforcesSpend = true;
+    payFetch.deferStreamingHeaders = true;
+    payFetch.supportsNativeStreaming = true;
+    payFetch.onNoCompletion = vi.fn((response, reason) => {
+      expect(response).toBe(original);
+      expect(reason).toContain("without the [DONE] marker");
+      throw Object.assign(new Error("paid stream ended early"), {
+        name: PAYMENT_SETTLED_NO_COMPLETION,
+      });
+    });
+    const proxy = await start(payFetch);
+    close = () => proxy.close();
+
+    const response = await requestNativeStream(proxy.baseUrl);
+    const body = await response.text();
+    expect(response.status).toBe(200);
+    expect(body).toContain("payment_settled_no_completion");
+    expect(payFetch).toHaveBeenCalledTimes(1);
+    expect(payFetch.onNoCompletion).toHaveBeenCalledTimes(1);
+  }, 20_000);
 });

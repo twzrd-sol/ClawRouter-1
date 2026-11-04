@@ -133,18 +133,31 @@ const { generatePrivateKey, privateKeyToAccount } = await import("viem/accounts"
 const streamResults = [];
 for (const rail of ["tempo", "solana"]) {
   let attempts = 0;
+  let finished = false;
   const memory = async () => {
     attempts++;
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    return new Response(
-      JSON.stringify({
-        id: "fixture",
-        choices: [
-          { message: { role: "assistant", content: "packed-stream-ok" }, finish_reason: "stop" },
-        ],
-      }),
-      { headers: { "content-type": "application/json", "payment-receipt": "fixture-receipt" } },
-    );
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'data: {"choices":[{"index":0,"delta":{"content":"packed-"},"finish_reason":null}]}\n\n',
+          ),
+        );
+        setTimeout(() => {
+          finished = true;
+          controller.enqueue(
+            encoder.encode(
+              'data: {"choices":[{"index":0,"delta":{"content":"stream-ok"},"finish_reason":null}]}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+            ),
+          );
+          controller.close();
+        }, 100);
+      },
+    });
+    return new Response(body, {
+      headers: { "content-type": "text/event-stream", "payment-receipt": "fixture-receipt" },
+    });
   };
   const payFetch =
     rail === "tempo"
@@ -156,6 +169,7 @@ for (const rail of ["tempo", "solana"]) {
           fetch: memory,
         });
   assert.equal(payFetch.deferStreamingHeaders, true);
+  assert.equal(payFetch.supportsNativeStreaming, true);
   const proxy = await startProxy({
     wallet: generatePrivateKey(),
     port: 0,
@@ -180,8 +194,27 @@ for (const rail of ["tempo", "solana"]) {
     assert.equal(response.status, 200);
     assert(response.headers.get("content-type").includes("text/event-stream"));
     assert.equal(response.headers.get("payment-receipt"), "fixture-receipt");
-    const body = await response.text();
-    assert(body.includes("packed-stream-ok"));
+    const reader = response.body.getReader();
+    let body = "";
+    while (!body.includes("packed-")) {
+      const next = await reader.read();
+      assert.equal(next.done, false);
+      body += new TextDecoder().decode(next.value);
+    }
+    assert.equal(finished, false);
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      body += new TextDecoder().decode(next.value);
+    }
+    const content = body
+      .split("\n")
+      .filter((line) => line.startsWith("data: {"))
+      .map((line) => JSON.parse(line.slice(6)))
+      .flatMap((chunk) => chunk.choices ?? [])
+      .map((choice) => choice.delta?.content ?? "")
+      .join("");
+    assert.equal(content, "packed-stream-ok");
     assert.equal(body.split("data: [DONE]").length - 1, 1);
     assert.equal(attempts, 1);
     streamResults.push(rail);
@@ -190,16 +223,22 @@ for (const rail of ["tempo", "solana"]) {
   }
 }
 let degradedPaidStops = 0;
-for (const stream of [false, true]) {
+for (const [stream, native] of [
+  [false, false],
+  [true, false],
+  [true, true],
+]) {
   let attempts = 0;
-  const id = `installed-paid-200-${stream}`;
+  const id = `installed-paid-200-${stream}-${native}`;
   const header = `Payment id="${id}", realm="fixture", method="solana", intent="charge", request="${Buffer.from(JSON.stringify(request)).toString("base64url")}"`;
   const base = async (input) => {
     attempts++;
     return input.headers.has("authorization")
       ? new Response(
-          JSON.stringify({ error: { message: "Provider overloaded, service unavailable" } }),
-          { headers: { "content-type": "application/json" } },
+          native
+            ? 'data: {"error":"Provider overloaded"}\n\n'
+            : JSON.stringify({ error: { message: "Provider overloaded, service unavailable" } }),
+          { headers: { "content-type": native ? "text/event-stream" : "application/json" } },
         )
       : new Response("", { status: 402, headers: { "www-authenticate": header } });
   };
@@ -233,8 +272,9 @@ for (const stream of [false, true]) {
         messages: [{ role: "user", content: id }],
       }),
     });
-    assert.equal(response.status, 502);
-    assert.equal((await response.json()).error.type, "payment_settled_no_completion");
+    assert.equal(response.status, native ? 200 : 502);
+    if (native) assert((await response.text()).includes('"type":"payment_settled_no_completion"'));
+    else assert.equal((await response.json()).error.type, "payment_settled_no_completion");
     assert.equal(attempts, 2); // probe + paid response; no fallback payment
     assert.deepEqual(
       readCredits().filter((row) => row.payer === payer.address && row.challengeId === id),

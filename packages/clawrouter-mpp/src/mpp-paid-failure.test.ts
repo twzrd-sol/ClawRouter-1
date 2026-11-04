@@ -70,6 +70,35 @@ describe("failure after an MPP payment was signed", () => {
     expect(history(c)[0].note).toContain("signed, no completion (HTTP 200)");
   });
 
+  it("turns a broken streaming body into one terminal paid failure and credit", async () => {
+    const c = control();
+    const before = readCredits().length;
+    const brokenBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[]}\n\n'));
+        controller.error(new Error("stream socket broke"));
+      },
+    });
+    const response = await paidCall(
+      c,
+      () => new Response(brokenBody, { headers: { "content-type": "text/event-stream" } }),
+      "paid-stream-body-error",
+    );
+    await expect(response.body!.getReader().read()).rejects.toThrow("stream socket broke");
+    const reject = () => rejectPaidNoCompletion(response, "stream socket broke");
+    expect(reject).toThrow(MppPaidNoCompletionError);
+    expect(readCredits().slice(before)).toEqual([
+      {
+        payer: TEST_PAYER,
+        amount: challenge.request.amount,
+        challengeId: "paid-stream-body-error",
+        reason: "HTTP 200",
+      },
+    ]);
+    expect(history(c)).toHaveLength(1);
+    expect(history(c)[0].note).toContain("signed, no completion (HTTP 200)");
+  });
+
   it("leaves an unsigned HTTP 200 error eligible for ordinary provider fallback", () => {
     expect(() =>
       rejectPaidNoCompletion(new Response('{"error":"overloaded"}'), "provider overloaded"),

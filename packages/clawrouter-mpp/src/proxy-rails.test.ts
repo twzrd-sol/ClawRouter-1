@@ -7,13 +7,17 @@ import { createMppFetch, createSolanaMppFetch } from "./index.js";
 import { readCredits } from "./mpp-paid-failure.js";
 
 describe("factory-produced rails through the streaming proxy", () => {
-  it.each([false, true])(
-    "does not pay a fallback after an HTTP 200 provider error, stream=%s",
-    async (stream) => {
+  it.each([
+    [false, false],
+    [true, false],
+    [true, true],
+  ])(
+    "does not pay a fallback after an HTTP 200 provider error, stream=%s native=%s",
+    async (stream, native) => {
       const signer = await generateKeyPairSigner();
       const recipient = await generateKeyPairSigner();
       const feePayer = await generateKeyPairSigner();
-      const id = `paid-200-error-${stream}`;
+      const id = `paid-200-error-${stream}-${native}`;
       const quote = {
         amount: "750",
         currency: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
@@ -31,8 +35,12 @@ describe("factory-produced rails through the streaming proxy", () => {
       const base = vi.fn(async (input: RequestInfo | URL) =>
         (input as Request).headers.has("authorization")
           ? new Response(
-              JSON.stringify({ error: { message: "Provider overloaded, service unavailable" } }),
-              { headers: { "content-type": "application/json" } },
+              native
+                ? 'data: {"error":"Provider overloaded"}\n\n'
+                : JSON.stringify({
+                    error: { message: "Provider overloaded, service unavailable" },
+                  }),
+              { headers: { "content-type": native ? "text/event-stream" : "application/json" } },
             )
           : new Response("", { status: 402, headers: { "www-authenticate": header } }),
       ) as unknown as typeof fetch;
@@ -65,9 +73,11 @@ describe("factory-produced rails through the streaming proxy", () => {
             messages: [{ role: "user", content: id }],
           }),
         });
-        expect(response.status).toBe(502);
+        expect(response.status).toBe(native ? 200 : 502);
         expect(response.headers.get("payment-receipt")).toBeNull();
-        expect((await response.json()).error.type).toBe("payment_settled_no_completion");
+        if (native)
+          expect(await response.text()).toContain('"type":"payment_settled_no_completion"');
+        else expect((await response.json()).error.type).toBe("payment_settled_no_completion");
         expect(base).toHaveBeenCalledTimes(2); // one probe and one paid response, no other model
         expect(spend.getSpending("daily")).toBeCloseTo(0.00075, 8);
         expect(

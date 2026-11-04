@@ -11,7 +11,8 @@
  *
  * "Signed" is not "settled": on Solana the seller submits the transaction, so a seller that dies
  * first costs nothing. The wording says "signed and sent" and the reference lets a human check.
- * A response that was streaming when it broke is not covered: only the status and thrown errors are.
+ * `guardPaid` returns when streaming response headers arrive. If the body later errors or ends without
+ * a completion, the host must call `rejectPaidNoCompletion` with that original Response object.
  */
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -91,7 +92,7 @@ export function readCredits(ledger: CreditLedger = credits): readonly CreditEntr
 const storage = new AsyncLocalStorage<PaidCall>();
 const paidResponses = new WeakMap<Response, { spend: SpendControl | undefined; call: PaidCall }>();
 
-/** Called by the host when an HTTP-success response contains no usable completion. */
+/** Called by the host when a successful response or its body contains no usable completion. */
 export function rejectPaidNoCompletion(response: Response, reason: string): void {
   const paid = paidResponses.get(response);
   if (paid) throw fail(paid.spend, paid.call, response.status, reason);

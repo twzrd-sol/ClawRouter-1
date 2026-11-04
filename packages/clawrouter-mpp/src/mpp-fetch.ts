@@ -203,6 +203,7 @@ export function createMppFetch(
   };
   payFetch.enforcesSpend = opts.spend !== undefined;
   payFetch.deferStreamingHeaders = true;
+  payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   return payFetch;
 }
@@ -334,6 +335,7 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
     );
   payFetch.enforcesSpend = opts.spend !== undefined;
   payFetch.deferStreamingHeaders = true;
+  payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   return payFetch;
 }

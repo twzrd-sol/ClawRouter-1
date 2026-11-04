@@ -39,13 +39,19 @@ before signing. `@solana/pay-kit` is used only by development tests as a fixture
 - **Streaming receipts.** Both factories set `deferStreamingHeaders`. The proxy holds final
   headers while paying, sends informational HTTP 102 responses, and forwards the seller's
   exact `Payment-Receipt` on the final streaming response. It does not fabricate a missing receipt.
-  OpenClaw's activity watchdog still has its normal deadline; HTTP 102 does not extend it.
+  Both also set `supportsNativeStreaming`: streaming chat requests retain `stream: true`
+  upstream and request usage chunks. Native SSE flows incrementally, including structured
+  tool calls, with reasoning filtered and token/cost accounting retained. JSON-only replies
+  use the existing simulated stream. In-flight coalesced callers receive live chunks from
+  one paid attempt; completed cache replays do not claim a new receipt.
+  HTTP 102 does not extend OpenClaw's deadline. Real content/tool deltas reset client activity
+  timers as the model streams. Payment/header wait and stalled output still have deadlines.
 - **Optional peers.** Importing this package does not load payment SDKs. Tempo loads `mppx` on
   first use; the asynchronous Solana factory loads `@solana/mpp`. Missing peers produce an
   install instruction.
 
-"Signed" is not "settled": on Solana the seller submits the transaction. Not covered: failures that happen
-mid-stream, and seller-side refunds.
+"Signed" is not "settled": on Solana the seller submits the transaction. Seller-side refunds
+remain outside this package.
 
 ## Replay protection at a seller
 
@@ -93,6 +99,12 @@ When the proxy detects a provider error hidden inside HTTP 200, it calls the rai
 throws the same terminal error before any fallback model is paid. Unsigned responses retain
 the ordinary provider fallback behavior. A custom host using these rails can invoke that
 hook after its own completion validation; the response must be the one returned by the rail.
+
+For a broken or unfinished native body the proxy invokes that same hook, records one credit,
+and ends the existing SSE response with `payment_settled_no_completion`. Its HTTP 200 and
+receipt have already been sent, so this is an in-stream error rather than a new HTTP 502.
+The proxy never retries a model or pays a fallback after committing that stream. Disconnects
+and request deadlines cancel the upstream reader and clean up coalesced callers.
 
 `CreditLedger` and `creditPaidNoCompletion(ledger, error, fields)` are also public for callers
 with their own ledger; `readCredits(ledger)` reads that ledger. Retrying the credit operation

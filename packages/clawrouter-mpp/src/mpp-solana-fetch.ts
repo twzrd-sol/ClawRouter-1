@@ -164,6 +164,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
     );
   payFetch.enforcesSpend = opts.spend !== undefined;
   payFetch.deferStreamingHeaders = true;
+  payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   return payFetch;
 }
@@ -323,6 +324,7 @@ export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFe
     );
   payFetch.enforcesSpend = opts.spend !== undefined;
   payFetch.deferStreamingHeaders = true;
+  payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   return payFetch;
 }

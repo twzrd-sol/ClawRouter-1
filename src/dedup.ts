@@ -18,6 +18,14 @@ export type CachedResponse = {
 
 type InflightEntry = {
   resolvers: Array<(result: CachedResponse) => void>;
+  subscribers: Set<StreamSubscriber>;
+  stream?: { status: number; headers: Record<string, string>; chunks: Buffer[] };
+};
+
+export type StreamSubscriber = {
+  start(status: number, headers: Record<string, string>): void;
+  chunk(data: Buffer): void;
+  end(): void;
 };
 
 const DEFAULT_TTL_MS = 30_000; // 30 seconds
@@ -125,18 +133,26 @@ export class RequestDeduplicator {
   markInflight(key: string): void {
     this.inflight.set(key, {
       resolvers: [],
+      subscribers: new Set(),
     });
   }
 
   /** Complete an in-flight request — cache result and notify waiters. */
-  complete(key: string, result: CachedResponse): void {
+  complete(key: string, result: CachedResponse, cache = true): void {
     // Only cache responses within size limit
-    if (result.body.length <= MAX_BODY_SIZE) {
+    if (cache && result.body.length <= MAX_BODY_SIZE) {
       this.completed.set(key, result);
     }
 
     const entry = this.inflight.get(key);
     if (entry) {
+      for (const subscriber of entry.subscribers) {
+        if (!entry.stream) {
+          subscriber.start(result.status, result.headers);
+          subscriber.chunk(result.body);
+        }
+        subscriber.end();
+      }
       for (const resolve of entry.resolvers) {
         resolve(result);
       }
@@ -144,6 +160,34 @@ export class RequestDeduplicator {
     }
 
     this.prune();
+  }
+
+  /** Join one paid stream, replaying already-delivered chunks before live ones. */
+  subscribeStream(key: string, subscriber: StreamSubscriber): (() => void) | undefined {
+    const entry = this.inflight.get(key);
+    if (!entry) return undefined;
+    entry.subscribers.add(subscriber);
+    if (entry.stream) {
+      subscriber.start(entry.stream.status, entry.stream.headers);
+      for (const chunk of entry.stream.chunks) subscriber.chunk(chunk);
+    }
+    return () => {
+      entry.subscribers.delete(subscriber);
+    };
+  }
+
+  startStream(key: string, status: number, headers: Record<string, string>): void {
+    const entry = this.inflight.get(key);
+    if (!entry || entry.stream) return;
+    entry.stream = { status, headers, chunks: [] };
+    for (const subscriber of entry.subscribers) subscriber.start(status, headers);
+  }
+
+  streamChunk(key: string, chunk: Buffer): void {
+    const entry = this.inflight.get(key);
+    if (!entry?.stream) return;
+    entry.stream.chunks.push(chunk);
+    for (const subscriber of entry.subscribers) subscriber.chunk(chunk);
   }
 
   /** Remove an in-flight entry on error (don't cache failures).
@@ -158,6 +202,19 @@ export class RequestDeduplicator {
           error: { message: "Original request failed, please retry", type: "dedup_origin_failed" },
         }),
       );
+      for (const subscriber of entry.subscribers) {
+        if (entry.stream) {
+          subscriber.chunk(
+            Buffer.from(
+              'data: {"error":{"type":"upstream_stream_error","message":"Original stream failed"}}\n\ndata: [DONE]\n\n',
+            ),
+          );
+        } else {
+          subscriber.start(503, { "content-type": "application/json" });
+          subscriber.chunk(errorBody);
+        }
+        subscriber.end();
+      }
       for (const resolve of entry.resolvers) {
         resolve({
           status: 503,

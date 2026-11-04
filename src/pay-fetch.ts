@@ -22,10 +22,14 @@ export type PayFetch = ((input: RequestInfo | URL, init?: RequestInit) => Promis
    * status. Unset keeps the early-SSE behavior. Independent of `enforcesSpend`.
    */
   deferStreamingHeaders?: boolean;
+  /** Request native upstream SSE for streaming callers; JSON replies still work. */
+  supportsNativeStreaming?: boolean;
   /**
-   * The host found a provider error hidden in a successful HTTP response. A rail
-   * that paid for this response must throw PaymentSettledNoCompletionError here
-   * so the host records the failure instead of paying a fallback model.
+   * The host found a provider error hidden in a successful HTTP response, or a
+   * paid response stream failed or ended without a completion. A rail that paid
+   * for this response must throw PaymentSettledNoCompletionError here so the
+   * host records the failure instead of paying a fallback model. The host must
+   * pass the original Response object returned by this fetch.
    * Leave unsigned responses alone so ordinary provider fallback still works.
    */
   onNoCompletion?: (response: Response, reason: string) => void;

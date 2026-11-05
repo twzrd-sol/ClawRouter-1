@@ -135,6 +135,7 @@ import {
 import {
   CostCapError,
   SessionSpend,
+  ZERO_CAP_REFUSAL,
   microsToUsd,
   parseMicros,
   usdToMicros,
@@ -295,9 +296,10 @@ const FREE_MODELS = new Set([
   "free/nemotron-3.5-lightning", // free-tier default — 1M ctx, thinking mode
   "free/laguna-xs-2.1", // coding, ~161 tok/s — on our NVIDIA key
   "free/north-mini-code", // coding, 607ms median — OpenRouter $0 pool
-  "free/nemotron-3-nano-omni-30b-a3b-reasoning", // vision (text/image/video/audio)
+  "free/nemotron-3.5-bolt", // about a second, reads images
+  "free/nemotron-3-nano-omni-30b-a3b-reasoning", // 256K ctx, reasoning
+  "free/nemotron-3-super-120b", // reasoning; rescued often when capacity is short
   "free/nemotron-3-ultra-550b", // largest free model, 1M ctx — but slow + flaky
-  "free/llama-3.2-11b-vision", // only free Llama left; slowest, so last
 ]);
 /**
  * Upstream ids the ACTIVE chain's gateway actually lists, or `undefined` while
@@ -381,7 +383,7 @@ const FREE_MODEL = "free/nemotron-3.5-lightning";
  * Free models whose upstream id is NOT `nvidia/<basename>`.
  *
  * The free tier stopped being NVIDIA-only on 2026-08-30 (blockrun #448): two of
- * the seven are hosted under their own maker's namespace upstream. The `free/`
+ * its models are hosted under their own maker's namespace upstream. The `free/`
  * prefix stays ClawRouter's picker convention for all of them — a picker row
  * reading `cohere/north-mini-code` gives a user no way to tell it is free — so
  * the exceptions are named here instead of leaking into the id.
@@ -1711,7 +1713,9 @@ export type ProxyOptions = {
   cacheConfig?: ResponseCacheConfig;
   /**
    * Maximum total spend (in USD) per session run.
-   * Default: undefined (no limit). Example: 0.5 = $0.50 per session.
+   * Default: undefined (no limit). Example: 0.5 = $0.50 per session. A positive cap
+   * covers /v1/chat/completions and /v1/messages; 0 refuses every paid call on every
+   * endpoint.
    */
   maxCostPerRunUsd?: number;
   /**
@@ -2226,8 +2230,6 @@ const VIDEO_PRICING: Record<
     pricePerSecond: 0.315,
     defaultDurationSeconds: 5,
   },
-  // Sora 2 via Azure AI Foundry — flat $0.10/s for both t2v and i2v.
-  "azure/sora-2": { pricePerSecond: 0.1, defaultDurationSeconds: 4 },
 };
 
 // Phone & Voice pricing (must match server's PHONE_PRICING/BLAND_PRICING in
@@ -2487,6 +2489,182 @@ function gatewaySettledCostUsd(response: Response | undefined): number | undefin
   return value;
 }
 
+/** The budget that a capped request with no session of its own is charged to. */
+const NO_SESSION_ID = "no-session";
+
+/** Gateway data and service routes, paid per call and carrying no model to price. */
+const PAID_API_PATH =
+  /^\/v1\/(?:partner|pm|exa|modal|stocks|usstock|crypto|fx|commodity|phone|voice)\//;
+
+/**
+ * Answer a cost-cap refusal on a route with its own error handler the way the
+ * chat path does: 429 cost_cap_exceeded, not a 502 that reads as a gateway fault.
+ */
+function refuseOverCostCap(res: ServerResponse, err: unknown): boolean {
+  if (!(err instanceof CostCapError) || res.headersSent) return false;
+  res.writeHead(429, {
+    "Content-Type": "application/json",
+    "X-ClawRouter-Cost-Cap-Exceeded": "1",
+    ...(err.budgetExhausted ? { "X-ClawRouter-Budget-Mode": "blocked" } : {}),
+  });
+  res.end(
+    JSON.stringify({
+      error: {
+        message: err.message,
+        type: "cost_cap_exceeded",
+        code: err.budgetExhausted ? "budget_exhausted" : "cost_cap_exceeded",
+      },
+    }),
+  );
+  return true;
+}
+
+/**
+ * A positive cap on /v1/messages. That route forwards the body as sent, so it can't
+ * downgrade: every paid call follows the chat path's rule for a pinned model, and a
+ * call the budget can't cover is refused. It shares the chat path's session budget.
+ *
+ * Strict mode holds the estimate, then the signing hook checks the real quote. On the
+ * key rail nothing is signed, so a successful call records the estimate instead.
+ * Throws CostCapError to refuse. Otherwise returns what to do if the call succeeds.
+ */
+function capMessagesRequest(
+  body: Buffer,
+  headers: IncomingMessage["headers"],
+  cap: {
+    usd: number;
+    mode: "graceful" | "strict";
+    authMode: AuthMode;
+    sessions: SessionStore;
+    models: ModelCatalogView["models"];
+    isFree: (model: string) => boolean;
+  },
+): { recordSuccess: () => void } {
+  let parsed: Record<string, unknown> = {};
+  try {
+    const value: unknown = JSON.parse(body.toString());
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      parsed = value as Record<string, unknown>;
+    }
+  } catch {
+    // The gateway answers a malformed body. Its price stays unknown here.
+  }
+  const messages = Array.isArray(parsed.messages)
+    ? parsed.messages.filter(
+        (m): m is { role: string; content: unknown } =>
+          typeof m?.role === "string" && m.content !== undefined,
+      )
+    : [];
+  const sessionId =
+    getSessionId(headers as Record<string, string | string[] | undefined>) ??
+    deriveSessionId(messages) ??
+    NO_SESSION_ID;
+
+  const store = paymentStore.getStore();
+  const track = () => {
+    const spend = SessionSpend.track(cap.sessions, sessionId);
+    if (store) store.sessionSpend = spend;
+    return spend;
+  };
+
+  const model = typeof parsed.model === "string" ? parsed.model : undefined;
+  if (model !== undefined && cap.isFree(model)) {
+    track();
+    return { recordSuccess: () => {} };
+  }
+
+  const estimate = parseMicros(
+    model === undefined
+      ? undefined
+      : estimateAmount(
+          resolveModelAlias(model),
+          body.length,
+          resolveMaxTokens(parsed),
+          new Map(cap.models.map((m) => [m.id, m])),
+        ),
+  );
+
+  let spend: SessionSpend;
+  if (cap.mode === "strict") {
+    const admission = SessionSpend.admit(
+      cap.sessions,
+      sessionId,
+      usdToMicros(cap.usd),
+      // As on the chat path: the key rail has no signing check behind this one, so
+      // one micro refuses a model it can't price once the session has nothing left.
+      estimate ?? (cap.authMode === "api-key" ? 1n : 0n),
+    );
+    if (!admission.admitted) {
+      const projected = admission.spentMicros + admission.heldMicros + admission.estimateMicros;
+      throw new CostCapError(
+        `ClawRouter cost cap exceeded: projected spend $${microsToUsd(projected).toFixed(4)} would exceed limit $${cap.usd}`,
+      );
+    }
+    spend = admission.spend;
+    if (store) store.sessionSpend = spend;
+  } else {
+    const remainingUsd = cap.usd - cap.sessions.getSessionCostUsd(sessionId);
+    const canAfford =
+      estimate !== undefined ? microsToUsd(estimate) <= remainingUsd : remainingUsd > 0;
+    if (!canAfford) {
+      throw new CostCapError(
+        `ClawRouter budget exhausted: $${Math.max(0, remainingUsd).toFixed(4)} remaining (limit: $${cap.usd}). Increase maxCostPerRun to continue.`,
+        true,
+      );
+    }
+    spend = track();
+  }
+  return {
+    recordSuccess: () => {
+      if (estimate !== undefined) spend.recordSuccess(estimate);
+    },
+  };
+}
+
+/** Reads that cannot bill: catalogs, health, and the account's own usage and balance. */
+const ZERO_CAP_FREE_READ =
+  /^\/v1\/(?:models|usage|balance|audio\/models|audio\/voices|images\/models|video\/models|health\/[^/]+)$/;
+
+/**
+ * The key rail's half of a $0 cap. Nothing is signed on this rail, so nothing
+ * shows what a call costs: the bearer token is billed server-side. Let through
+ * only what cannot bill: a free model on the chat routes, and the listed reads.
+ * A GET can bill too (a data route, or the poll that settles a finished video),
+ * so anything not listed is refused.
+ */
+function withZeroCapGuard(
+  inner: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
+  isFree: (model: string) => boolean,
+): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
+  return async (input, init) => {
+    const { pathname } = new URL(input instanceof Request ? input.url : String(input));
+    const path = pathname.slice(Math.max(pathname.indexOf("/v1/"), 0));
+    const method = (init?.method ?? "GET").toUpperCase();
+
+    let allowed: boolean;
+    if (/^\/v1\/(?:chat\/completions|messages)$/.test(path)) {
+      const body = init?.body;
+      let model: unknown;
+      try {
+        const text =
+          typeof body === "string"
+            ? body
+            : body instanceof Uint8Array
+              ? Buffer.from(body).toString()
+              : "";
+        model = (JSON.parse(text) as { model?: unknown }).model;
+      } catch {
+        model = undefined;
+      }
+      allowed = typeof model === "string" && isFree(model);
+    } else {
+      allowed = ZERO_CAP_FREE_READ.test(path) && (method === "GET" || method === "HEAD");
+    }
+    if (!allowed) throw new CostCapError(ZERO_CAP_REFUSAL);
+    return inner(input, init);
+  };
+}
+
 async function proxyPaidApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -2495,6 +2673,7 @@ async function proxyPaidApiRequest(
   getActualPaymentUsd: () => number,
   accountPassthrough = false,
   authMode: AuthMode = "wallet",
+  capRequest?: (body: Buffer) => { recordSuccess: () => void },
 ): Promise<void> {
   const startTime = Date.now();
   const upstreamUrl = `${apiBase}${req.url}`;
@@ -2516,6 +2695,7 @@ async function proxyPaidApiRequest(
     bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   const body = Buffer.concat(bodyChunks);
+  const capped = capRequest?.(body);
 
   // Forward headers (strip hop-by-hop + SDK/provider-specific)
   const headers: Record<string, string> = {};
@@ -2551,6 +2731,7 @@ async function proxyPaidApiRequest(
     body: body.length > 0 ? new Uint8Array(body) : undefined,
     signal: clientAbort.signal,
   });
+  if (upstream.ok) capped?.recordSuccess();
 
   // Forward response headers. content-length must be dropped along with
   // content-encoding: fetch transparently decompresses the body, so the
@@ -2823,6 +3004,15 @@ function assertExistingProxyBillsUs(
  * Returns a handle with the assigned port, base URL, and a close function.
  */
 export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
+  // A cap that is not a finite number is no cap. Left in, NaN would throw inside
+  // the strict admission check on every paid request and strand its dedup entry.
+  if (options.maxCostPerRunUsd !== undefined && !Number.isFinite(options.maxCostPerRunUsd)) {
+    console.warn(
+      `[ClawRouter] Ignoring maxCostPerRun: ${String(options.maxCostPerRunUsd)} is not a finite number`,
+    );
+    options = { ...options, maxCostPerRunUsd: undefined };
+  }
+
   // Apply upstream proxy (SOCKS5/HTTP) before any outgoing requests
   const upstreamProxy = await applyUpstreamProxy(options.upstreamProxy);
   if (upstreamProxy) {
@@ -2995,6 +3185,9 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   // client registers the same hook (see below).
   const registerCostCapHook = (client: PaymentHookClient) =>
     client.onBeforePaymentCreation(async (context) => {
+      // $0 refuses every signature, in either mode and on every route, including
+      // the ones that never reach the chat path's session accounting.
+      if (options.maxCostPerRunUsd === 0) throw new CostCapError(ZERO_CAP_REFUSAL);
       const spend = paymentStore.getStore()?.sessionSpend;
       if (!spend?.isStrict) return;
       // v2 `amount` or v1 `maxAmountRequired` — the v1 SVM schemes are registered too.
@@ -3207,11 +3400,18 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       );
     }
   }
-  const payFetch: PayFetch =
-    options.payFetch ??
+  const keyFetch = apiKey ? createApiKeyFetch(apiKey, fetch, apiBase) : undefined;
+  const isFreeForCap = (model: string) => {
+    const { freeIds } = catalog.current();
+    return (
+      freeIds.has(resolveModelAlias(model)) ||
+      [...freeIds].some((id) => toUpstreamModelId(id) === model)
+    );
+  };
+  const payFetch: PayFetch = options.payFetch ??
     (authMode === "api-key"
       ? withSpendPolicy(
-          createApiKeyFetch(apiKey!, fetch, apiBase),
+          options.maxCostPerRunUsd === 0 ? withZeroCapGuard(keyFetch!, isFreeForCap) : keyFetch!,
           options.spendControl ?? getSharedSpendControl(),
           () => {
             const store = paymentStore.getStore();
@@ -3909,6 +4109,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           res.end(JSON.stringify(result));
         } catch (err) {
           if (clientAbort.signal.aborted) return; // client gone — nothing to report
+          if (refuseOverCostCap(res, err)) return;
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] Image generation error: ${msg}`);
           if (!res.headersSent) {
@@ -4075,6 +4276,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           res.end(JSON.stringify(result));
         } catch (err) {
           if (clientAbort.signal.aborted) return; // client gone — nothing to report
+          if (refuseOverCostCap(res, err)) return;
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] Image editing error: ${msg}`);
           if (!res.headersSent) {
@@ -4183,6 +4385,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           res.end(JSON.stringify(result));
         } catch (err) {
           if (clientAbort.signal.aborted) return; // client gone — nothing to report
+          if (refuseOverCostCap(res, err)) return;
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] Audio generation error: ${msg}`);
           if (!res.headersSent) {
@@ -4392,6 +4595,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           res.end(JSON.stringify(finalResult));
         } catch (err) {
           if (clientAbort.signal.aborted) return; // client gone — nothing to report
+          if (refuseOverCostCap(res, err)) return;
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] Video generation error: ${msg}`);
           if (!res.headersSent) {
@@ -4425,20 +4629,16 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       //
       // Note the passthrough buffers the response before writing it, so an SSE
       // stream arrives complete rather than incrementally. That is correct but
-      // not incremental; smart routing, sessions and the response cache do not
-      // apply on these paths either.
+      // not incremental; smart routing and the response cache do not apply on these
+      // paths either. A positive cost cap does apply to /v1/messages.
+      const isMessagesPath =
+        req.url === "/v1/messages" || (req.url?.startsWith("/v1/messages?") ?? false);
       const isVerbatimGatewayPath =
-        req.url === "/v1/messages" ||
-        (req.url?.startsWith("/v1/messages?") ?? false) ||
+        isMessagesPath ||
         req.url === "/v1/audio/speech" ||
         (req.url?.startsWith("/v1/audio/speech?") ?? false);
 
-      if (
-        isVerbatimGatewayPath ||
-        req.url?.match(
-          /^\/v1\/(?:partner|pm|exa|modal|stocks|usstock|crypto|fx|commodity|phone|voice)\//,
-        )
-      ) {
+      if (isVerbatimGatewayPath || req.url?.match(PAID_API_PATH)) {
         try {
           await proxyPaidApiRequest(
             req,
@@ -4448,8 +4648,23 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
             () => paymentStore.getStore()?.amountUsd ?? 0,
             false,
             authMode,
+            // $0 is enforced below this, where calls are signed or fetched.
+            isMessagesPath &&
+              options.maxCostPerRunUsd !== undefined &&
+              options.maxCostPerRunUsd !== 0
+              ? (body) =>
+                  capMessagesRequest(body, req.headers, {
+                    usd: options.maxCostPerRunUsd!,
+                    mode: options.maxCostPerRunMode ?? "graceful",
+                    authMode,
+                    sessions: sessionStore,
+                    models: catalog.current().models,
+                    isFree: isFreeForCap,
+                  })
+              : undefined,
           );
         } catch (err) {
+          if (refuseOverCostCap(res, err)) return;
           const error = err instanceof Error ? err : new Error(String(err));
           options.onError?.(error);
           if (!res.headersSent) {
@@ -4464,6 +4679,8 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
             // response instead of leaving the client hanging until socket timeout.
             res.end();
           }
+        } finally {
+          paymentStore.getStore()?.sessionSpend?.release();
         }
         return;
       }
@@ -4500,6 +4717,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
             authMode,
           );
         } catch (err) {
+          if (refuseOverCostCap(res, err)) return;
           const error = err instanceof Error ? err : new Error(String(err));
           options.onError?.(error);
           if (!res.headersSent) {
@@ -5726,6 +5944,7 @@ async function proxyRequest(
           }
         } catch (err) {
           if (imagegenAbort.signal.aborted) return; // client gone — nothing to report
+          if (refuseOverCostCap(res, err)) return;
           const errMsg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] /imagegen error: ${errMsg}`);
           if (!res.headersSent) {
@@ -5959,6 +6178,7 @@ async function proxyRequest(
           sendImg2ImgText(responseText);
         } catch (err) {
           if (img2imgAbort.signal.aborted) return; // client gone — nothing to report
+          if (refuseOverCostCap(res, err)) return;
           const errMsg = err instanceof Error ? err.message : String(err);
           console.error(`[ClawRouter] /img2img error: ${errMsg}`);
           if (!res.headersSent) {
@@ -6649,8 +6869,13 @@ async function proxyRequest(
   // In 'graceful' mode (default), the cap is enforced via model downgrade below.
   // Must happen before streaming headers are sent.
   let sessionSpend: SessionSpend | undefined;
+  // Every gate below needs a session. A request that yields none (no header, no
+  // user message) shares one bucket rather than skipping the cap altogether.
+  if (options.maxCostPerRunUsd !== undefined && !effectiveSessionId) {
+    effectiveSessionId = NO_SESSION_ID;
+  }
   if (
-    options.maxCostPerRunUsd &&
+    options.maxCostPerRunUsd !== undefined &&
     effectiveSessionId &&
     !isFreeModel &&
     (options.maxCostPerRunMode ?? "graceful") === "strict"
@@ -6667,7 +6892,14 @@ async function proxyRequest(
       sessionStore,
       effectiveSessionId,
       usdToMicros(options.maxCostPerRunUsd),
-      parseMicros(thisReqEstStr) ?? 0n,
+      // No local price usually means zero here: on the wallet rail the signing
+      // check still reads the real quote, and eco's free rungs carry no estimate.
+      // The key rail has nothing behind this check, so count one micro, which
+      // refuses a model it cannot price once the session has nothing left.
+      parseMicros(thisReqEstStr) ??
+        (options.apiKey?.trim() && !catalog.freeIds.has(resolveModelAlias(modelId ?? ""))
+          ? 1n
+          : 0n),
     );
     if (!admission.admitted) {
       const spentUsd = microsToUsd(admission.spentMicros);
@@ -6695,7 +6927,7 @@ async function proxyRequest(
       return;
     }
     sessionSpend = admission.spend;
-  } else if (options.maxCostPerRunUsd && effectiveSessionId) {
+  } else if (options.maxCostPerRunUsd !== undefined && effectiveSessionId) {
     // Graceful mode (and a free model in strict mode) refuses nothing, but a
     // signed payment is still spend — including one whose response was lost —
     // so it is recorded the same way.
@@ -6712,7 +6944,7 @@ async function proxyRequest(
   //       silently substituting with free model would be deceptive regardless of task type
   // Simple routing profile requests are handled later via graceful downgrade.
   if (
-    options.maxCostPerRunUsd &&
+    options.maxCostPerRunUsd !== undefined &&
     effectiveSessionId &&
     !isFreeModel &&
     (options.maxCostPerRunMode ?? "graceful") === "graceful"
@@ -6756,7 +6988,7 @@ async function proxyRequest(
       // Case B: explicit model request (user chose a specific model, not a routing profile).
       // Silently substituting their choice with free model is deceptive — block instead.
       const est = estimate(modelId, body.length, maxTokens);
-      const canAfford = !est || Number(est) / 1_000_000 <= remainingUsd;
+      const canAfford = est ? Number(est) / 1_000_000 <= remainingUsd : remainingUsd > 0;
       if (!canAfford) {
         console.log(
           `[ClawRouter] Budget insufficient for explicit model ${modelId} in session ${effectiveSessionId.slice(0, 8)}...: $${Math.max(0, remainingUsd).toFixed(4)} remaining — blocking (user explicitly chose ${modelId})`,
@@ -7102,7 +7334,7 @@ async function proxyRequest(
     // Simple tasks (no tools, non-complex tier): downgrade with visible warning.
     // Complex/agentic tasks with no affordable model: already blocked above (before streaming headers).
     if (
-      options.maxCostPerRunUsd &&
+      options.maxCostPerRunUsd !== undefined &&
       effectiveSessionId &&
       !isFreeModel &&
       (options.maxCostPerRunMode ?? "graceful") === "graceful"
@@ -7112,9 +7344,11 @@ async function proxyRequest(
 
       const beforeFilter = [...modelsToTry];
       modelsToTry = modelsToTry.filter((m) => {
-        if (catalog.freeIds.has(m)) return true; // free models always fit (no cost)
+        // Router-core names free rungs by their upstream id (nvidia/...), which
+        // only the alias map ties to the free tier.
+        if (catalog.freeIds.has(resolveModelAlias(m))) return true; // free models always fit (no cost)
         const est = estimate(m, body.length, maxTokens);
-        if (!est) return true; // no pricing data → keep (permissive)
+        if (!est) return remainingUsd > 0; // no pricing data → keep only while budget remains
         return Number(est) / 1_000_000 <= remainingUsd;
       });
 
@@ -7168,7 +7402,9 @@ async function proxyRequest(
         return;
       }
 
-      if (excluded.length > 0) {
+      // Dropping fallbacks while the primary survives is not a downgrade: the
+      // request still runs on the model it was routed to, so say nothing.
+      if (excluded.length > 0 && modelsToTry[0] !== beforeFilter[0]) {
         const budgetSummary =
           remainingUsd > 0
             ? `$${remainingUsd.toFixed(4)} remaining`
@@ -7180,7 +7416,11 @@ async function proxyRequest(
         // A: Set visible warning notice — prepended to response so user sees the downgrade
         const fromModel = excluded[0];
         const usingFree = modelsToTry.length === 1 && catalog.freeIds.has(modelsToTry[0]);
-        if (usingFree) {
+        // A $0 cap is a deliberate free-only setup, not a budget that ran out: the
+        // header below still reports the downgrade, but the reply stays clean.
+        if (options.maxCostPerRunUsd === 0) {
+          budgetDowngradeNotice = undefined;
+        } else if (usingFree) {
           budgetDowngradeNotice = `> **⚠️ Budget cap reached** ($${runCostUsd.toFixed(4)}/$${options.maxCostPerRunUsd}) — downgraded to free model. Quality may be reduced. Increase \`maxCostPerRun\` to continue with ${fromModel}.\n\n`;
         } else {
           const toModel = modelsToTry[0] ?? FREE_MODEL; // last resort

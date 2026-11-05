@@ -1,7 +1,7 @@
 # 9 Free AI Models, Zero Cost: How BlockRun Gives Developers Top-Tier LLMs for Nothing
 
 > **The count in this title is a snapshot, and so is every model name below.**
-> It was 9 when this was written; the published free tier is <!-- br:models.free -->7<!-- /br:models.free --> today, and _none_ of the
+> It was 9 when this was written; the published free tier is <!-- br:models.free -->8<!-- /br:models.free --> today, and _none_ of the
 > nine originals is still in it. Free hosting is volatile — NVIDIA retired four
 > of the five visible free models in a single sweep on 2026-08-30 — so the tier
 > gets rebuilt rather than topped up. The URL keeps its original slug so existing
@@ -23,7 +23,7 @@ BlockRun's answer: just take them.
 
 ---
 
-## The Lineup: <!-- br:models.free -->7<!-- /br:models.free --> Models, $0.00
+## The Lineup: <!-- br:models.free -->8<!-- /br:models.free --> Models, $0.00
 
 Through [ClawRouter](https://github.com/BlockRunAI/ClawRouter) — BlockRun's local AI routing proxy — you get zero-cost access to the following (checked against the live catalog 2026-09-29):
 
@@ -32,7 +32,9 @@ Through [ClawRouter](https://github.com/BlockRunAI/ClawRouter) — BlockRun's lo
 | **Nemotron 3.5 Lightning**   | 1M      | ✅        | The free default — thinking-mode reasoning |
 | **Nemotron 3 Ultra 550B**    | 1M      | ✅        | Largest free model — 550B / 55B active MoE |
 | **Nemotron 3 Nano Omni 30B** | 256K    | ✅        | Strong generalist (text only in practice)  |
-| **Llama 3.2 11B Vision**     | 128K    | —         | Meta Llama (text only in practice)         |
+| **Nemotron 3 Super 120B**    | 131K    | ✅        | Reasoning                                  |
+| **Nemotron 3.5 Bolt**        | 131K    | —         | About a second to answer, reads images     |
+| **Muse Glimmer 30B**         | 131K    | ✅        | Meta's open model, text only               |
 | **Cohere North Mini Code**   | 256K    | ✅        | Coding, sub-second responses               |
 | **Poolside Laguna XS 2.1**   | 131K    | —         | Coding, ~161 tok/s                         |
 
@@ -110,11 +112,23 @@ A 30B-A3B mixture-of-experts model with a **1M-token context** and thinking-mode
 
 **Best for:** General reasoning at 256K context, for free.
 
-### Llama 3.2 11B Vision — The Free Llama
+### Nemotron 3.5 Bolt — The One That Reads Images
 
-Meta's Llama 3.2 11B with a 128K window. It is older than everything else here, and that is the point: a 12-model sweep of what NVIDIA still serves free found this was the only Llama that actually finishes a real completion. The name promises image input; the gateway does not deliver it (see below).
+Small and fast: about a second to answer, 131K context, no thinking pass. It's the only free model ClawRouter flags for vision, having got 8 of 8 right on solid-colour PNGs across Base and Solana.
 
-**Best for:** Anyone who needs a Llama specifically.
+**Best for:** Quick answers, and image turns you don't want to pay for.
+
+### Nemotron 3 Super 120B — The Other Reasoner
+
+12B active parameters with thinking mode and a 131K window. Under heavy load the gateway often answers from another free model instead, so check the response's `model` field if it matters which one replied.
+
+**Best for:** Reasoning when your prompt fits in 131K.
+
+### Muse Glimmer 30B — The Free Meta Model
+
+Meta's open line after Llama, 29.6B dense with a 131K window. It's a reasoning model, so give it a real token budget: at 300 `max_tokens` it can spend everything on reasoning and return an empty answer. Text only. NVIDIA retired the last free Llama on 2026-11-02, so this is the closest free option.
+
+**Best for:** Anyone who wants a free Meta model.
 
 ### Cohere North Mini Code — The Fast Coder
 
@@ -170,8 +184,10 @@ If you're using Claude Code, one command switches you to any free model:
 ```
 /model free              → Nemotron 3.5 Lightning (1M ctx, the default)
 /model ultra-550b        → Nemotron 3 Ultra 550B (largest)
-/model vision-free       → Nemotron 3 Nano Omni (text only, see below)
-/model llama-vision      → Llama 3.2 11B Vision (text only, see below)
+/model vision-free       → Nemotron 3.5 Bolt (reads images)
+/model nemotron-omni     → Nemotron 3 Nano Omni (text only, see below)
+/model super-120b        → Nemotron 3 Super 120B
+/model muse              → Muse Glimmer 30B
 /model north-mini        → Cohere North Mini Code
 /model laguna            → Poolside Laguna XS 2.1
 ```
@@ -190,13 +206,13 @@ The gateway will return structured tool calls from these models, but ClawRouter 
 
 ### 2. Reasoning Has a Ceiling
 
-Four of the six are reasoning-capable and handle most tasks well. On the hardest problems — competition-level math, formal proofs, deep multi-step planning — they don't match Claude Opus 5 or Sonnet 5. That's why ClawRouter's REASONING tier doesn't use free models.
+Six of the eight are reasoning-capable and handle most tasks well. On the hardest problems — competition-level math, formal proofs, deep multi-step planning — they don't match Claude Opus 5 or Sonnet 5. That's why ClawRouter's REASONING tier doesn't use free models.
 
-### 3. There Is No Working Free Vision
+### 3. Only One Free Model Reads Images Reliably
 
-Two of the six are catalogued as vision-capable, and neither survives a real probe. On a 64×64 solid-red PNG, `nemotron-3-nano-omni` answered correctly 1 time in 4 on Base and returned "white" on Solana — where the response's own `model` field revealed a silent fallback to a text model. `llama-3.2-11b-vision` replied "I'm unable to see the image" on 3 of 3 attempts while answering plain text fine. Every one of those failures is an **HTTP 200**: the image is dropped and a confident wrong answer comes back with no error to branch on.
+`nemotron-3.5-bolt` got 8 of 8 right on 64×64 solid-colour PNGs across Base and Solana on 2026-11-05. The others don't hold up the same way: `nemotron-3-nano-omni` answered correctly 1 time in 4 on Base in August, and only 2 of 8 probes of `nemotron-3-super-120b` were answered by that model.
 
-ClawRouter therefore ships no `vision` flag on any free model, so requests carrying an image route to a paid vision model instead. The general lesson is worth more than the specific finding: **a catalog's capability list is a claim, not a measurement** — and one passing sample is not a measurement either. The first probe here returned the right colour; it took four to see that was luck.
+ClawRouter therefore flags only Bolt for vision. Pin it with `/model vision-free`; otherwise requests carrying an image route to a paid vision model. The general lesson is worth more than the specific finding: **a catalog's capability list is a claim, not a measurement** — and one passing sample is not a measurement either. The first probe here returned the right colour; it took four to see that was luck.
 
 ### 4. Free Hosting Is Volatile
 
@@ -216,7 +232,8 @@ Code generation           → North Mini Code or Laguna XS 2.1
 Reasoning required        → Nemotron 3.5 Lightning (1M ctx)
 Hardest free reasoning    → Nemotron 3 Ultra 550B
 Long-context reasoning    → Nemotron 3.5 Lightning (1M)
-A Llama specifically      → Llama 3.2 11B Vision
+Free image turns          → Nemotron 3.5 Bolt
+A free Meta model         → Muse Glimmer 30B
 ```
 
 ### Strategy 2: Free for 80%, Paid for 20%
@@ -236,13 +253,13 @@ Look at the cost trajectory over the past three years:
 - **2023:** GPT-4 dominates alone at $30/$60 per M tokens
 - **2024:** Open-source models surge, prices halve repeatedly
 - **2025:** DeepSeek, Qwen push top-tier inference below $1/M
-- **2026:** BlockRun offers <!-- br:models.free -->7<!-- /br:models.free --> free models through a single API
+- **2026:** BlockRun offers <!-- br:models.free -->8<!-- /br:models.free --> free models through a single API
 
 **A free tier that gets rebuilt rather than retired isn't just a product feature — it's a signal.** Baseline AI capability is becoming infrastructure. Like internet bandwidth before it, the cost of "good enough" AI inference is converging toward zero.
 
 BlockRun and ClawRouter exist to be the **routing layer** in this transition: not locked to any single provider, not bound to any single model, always giving developers the lowest-cost path to the right capability.
 
-Today it's <!-- br:models.free -->7<!-- /br:models.free --> free models, and they are not the same seven as last month. Tomorrow it could be 50. Prices will only drop. Capabilities will only improve. The names will keep churning.
+Today it's <!-- br:models.free -->8<!-- /br:models.free --> free models, and they are not the same seven as last month. Tomorrow it could be 50. Prices will only drop. Capabilities will only improve. The names will keep churning.
 
 **The one constant: your code doesn't need to change.**
 
@@ -257,7 +274,7 @@ clawrouter start
 
 Point your `base_url` to `http://localhost:8402/v1`. That's the whole setup.
 
-<!-- br:models.free -->7<!-- /br:models.free --> free models. Up to 1M context. Unlimited calls. Zero cost.
+<!-- br:models.free -->8<!-- /br:models.free --> free models. Up to 1M context. Unlimited calls. Zero cost.
 
 Go build something.
 

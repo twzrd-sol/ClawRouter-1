@@ -16,11 +16,11 @@ Agents can only sign transactions.<br><br>
 <strong>ClawRouter is the only LLM router that lets agents operate independently.</strong><br><br>
 <em>Pay however you like: <strong>credit card</strong> — sign up at <a href="https://user.blockrun.ai"><strong>user.blockrun.ai</strong></a>, top up, mint an API key<br>
 or <strong>USDC</strong> on Solana or Base (x402 wallet, no account at all).<br>
-Or neither — <!-- br:models.free -->7<!-- /br:models.free --> models are free, with no signup, no key and no wallet.</em></p>
+Or neither — <!-- br:models.free -->8<!-- /br:models.free --> models are free, with no signup, no key and no wallet.</em></p>
 
 <br>
 
-<img src="https://img.shields.io/badge/🆓_7_Free_Models-success?style=for-the-badge" alt="7 free models">&nbsp;
+<img src="https://img.shields.io/badge/🆓_8_Free_Models-success?style=for-the-badge" alt="8 free models">&nbsp;
 <img src="https://img.shields.io/badge/🤖_Agent--Native-black?style=for-the-badge" alt="Agent native">&nbsp;
 <img src="https://img.shields.io/badge/💳_Card_or_USDC-blue?style=for-the-badge" alt="Card or USDC">&nbsp;
 <img src="https://img.shields.io/badge/⚡_Local_Routing-yellow?style=for-the-badge" alt="Local routing">&nbsp;
@@ -43,7 +43,7 @@ Or neither — <!-- br:models.free -->7<!-- /br:models.free --> models are free,
 
 </div>
 
-> **ClawRouter** is an open-source smart LLM router that reduces AI API costs by up to <!-- br:savings.autoVsBaselinePct -->84<!-- /br:savings.autoVsBaselinePct -->%. It analyzes each request across <!-- br:clawrouter.dimensions -->15<!-- /br:clawrouter.dimensions --> dimensions and routes to the cheapest capable model in under 1ms, entirely locally. It is the only LLM router that an autonomous agent can pay for by itself — a wallet signature is the account, and USDC micropayments over the x402 protocol are the billing — and it takes an ordinary credit card too: sign up at [user.blockrun.ai](https://user.blockrun.ai), top up, and run the same router on an API key. <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> models from OpenAI, Anthropic, Google, xAI, DeepSeek, and more. MIT licensed.
+> **ClawRouter** is an open-source smart LLM router that reduces AI API costs by up to <!-- br:savings.autoVsBaselinePct -->84<!-- /br:savings.autoVsBaselinePct -->%. It analyzes each request across <!-- br:clawrouter.dimensions -->15<!-- /br:clawrouter.dimensions --> dimensions and routes to the cheapest capable model in under 1ms, entirely locally. It is the only LLM router that an autonomous agent can pay for by itself — a wallet signature is the account, and USDC micropayments over the x402 protocol are the billing — and it takes an ordinary credit card too: sign up at [user.blockrun.ai](https://user.blockrun.ai), top up, and run the same router on an API key. <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> models from OpenAI, Anthropic, Google, xAI, DeepSeek, and more. MIT licensed.
 
 ---
 
@@ -55,8 +55,8 @@ Not a seat, not a subscription, not a monthly minimum you keep paying while the 
 
 |                           |                                                                                                                                                                                                                                                                                                                                                               |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Every LLM**             | <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> chat models across 9 providers, behind one endpoint and one balance                                                                                                                                                                                                                           |
-| **Every tool**            | <!-- br:models.image -->12<!-- /br:models.image --> image models, <!-- br:models.video -->8<!-- /br:models.video --> video models, music, <!-- br:models.speech -->5<!-- /br:models.speech --> voices, img2img editing, and outbound phone calls that come back as transcripts                                                                                |
+| **Every LLM**             | <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> chat models across 9 providers, behind one endpoint and one balance                                                                                                                                                                                                                           |
+| **Every tool**            | <!-- br:models.image -->12<!-- /br:models.image --> image models, <!-- br:models.video -->7<!-- /br:models.video --> video models, music, <!-- br:models.speech -->5<!-- /br:models.speech --> voices, img2img editing, and outbound phone calls that come back as transcripts                                                                                |
 | **Every data source**     | web, news and neural search; prediction markets; live crypto and equity quotes; on-chain SQL over 100M+ labeled wallets; DEX routing; RPC across <!-- br:chains.rpc -->40<!-- /br:chains.rpc --> chains                                                                                                                                                       |
 | **Best value per dollar** | <!-- br:clawrouter.dimensions -->15<!-- /br:clawrouter.dimensions -->-dimension local routing sends each request to the cheapest model that can actually do it — <!-- br:savings.autoVsBaselinePct -->84<!-- /br:savings.autoVsBaselinePct -->% below pinning Claude Opus 5 on the same traffic, computed from a published workload mix rather than estimated |
 
@@ -72,7 +72,7 @@ Every other LLM router was built for **human developers** — create an account,
 
 ClawRouter is built for the agent-first world:
 
-- **Starts at $0** — <!-- br:models.free -->7<!-- /br:models.free --> open-weight models are free forever (incl. a 1M-context reasoner and two sub-second coders). Image turns route to paid models — see the free-tier note below.
+- **Starts at $0** — <!-- br:models.free -->8<!-- /br:models.free --> open-weight models are free forever (incl. a 1M-context reasoner and two sub-second coders). Image turns route to paid models — see the free-tier note below.
 - **No accounts needed** — a wallet is generated locally, no signup
 - **No API keys needed** — your wallet signature IS authentication
 - **No model selection** — <!-- br:clawrouter.dimensions -->15<!-- /br:clawrouter.dimensions -->-dimension scoring + constraint-first ranking ([router-core](https://github.com/BlockRunAI/router-core)) picks the right model automatically
@@ -83,7 +83,7 @@ This is the stack that lets agents operate autonomously: **x402 + USDC + local r
 
 ### …and if you are a human, not an agent
 
-Every "no X needed" above is a capability, not a restriction. **ClawRouter takes a credit card too.** Sign up at **[user.blockrun.ai](https://user.blockrun.ai)**, top up, mint an API key, and run `clawrouter login brk_live_…`. Same router, same <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> models, same local routing — calls go to `api.blockrun.ai` on a bearer token and bill your account credit. No crypto, no gas, no seed phrase.
+Every "no X needed" above is a capability, not a restriction. **ClawRouter takes a credit card too.** Sign up at **[user.blockrun.ai](https://user.blockrun.ai)**, top up, mint an API key, and run `clawrouter login brk_live_…`. Same router, same <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> models, same local routing — calls go to `api.blockrun.ai` on a bearer token and bill your account credit. No crypto, no gas, no seed phrase.
 
 | You are             | Pay with                                | Setup                                                                                       |
 | ------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -99,8 +99,8 @@ Full walkthrough: [Paying with a credit card](#paying-with-a-credit-card-api-key
 
 |                  | OpenRouter        | LiteLLM          | Martian           | Portkey           | **ClawRouter**                                                         |
 | ---------------- | ----------------- | ---------------- | ----------------- | ----------------- | ---------------------------------------------------------------------- |
-| **Models**       | 200+              | 100+             | Smart routing     | Gateway           | **<!-- br:models.chatVisible -->90<!-- /br:models.chatVisible -->**    |
-| **Free tier**    | Rate-limited      | BYO keys         | No                | No                | **<!-- br:models.free -->7<!-- /br:models.free --> models, no signup** |
+| **Models**       | 200+              | 100+             | Smart routing     | Gateway           | **<!-- br:models.chatVisible -->91<!-- /br:models.chatVisible -->**    |
+| **Free tier**    | Rate-limited      | BYO keys         | No                | No                | **<!-- br:models.free -->8<!-- /br:models.free --> models, no signup** |
 | **Routing**      | Manual selection  | Manual selection | Smart (closed)    | Observability     | **Smart (open source)**                                                |
 | **Auth**         | Account + API key | Your API keys    | Account + API key | Account + API key | **Wallet signature _or_ API key**                                      |
 | **Payment**      | Credit card       | BYO keys         | Credit card       | $49-499/mo        | **USDC per-request _or_ card credit**                                  |
@@ -116,7 +116,7 @@ Full walkthrough: [Paying with a credit card](#paying-with-a-credit-card-api-key
 
 ## Quick Start
 
-> **No wallet? <!-- br:models.free -->7<!-- /br:models.free --> models work free out of the box.** Install, run, and pin `free/nemotron-3.5-lightning` (or any of the <!-- br:models.free -->7<!-- /br:models.free -->) — no crypto, no signup, no balance required. Add a credit card or USDC later when you want paid models.
+> **No wallet? <!-- br:models.free -->8<!-- /br:models.free --> models work free out of the box.** Install, run, and pin `free/nemotron-3.5-lightning` (or any of the <!-- br:models.free -->8<!-- /br:models.free -->) — no crypto, no signup, no balance required. Add a credit card or USDC later when you want paid models.
 
 **Two ways to pay for the paid ones — pick one, the rest of ClawRouter is identical:**
 
@@ -134,7 +134,7 @@ is all it takes to switch and `clawrouter logout` is all it takes to switch back
 
 > **Where do I sign up?** [**user.blockrun.ai**](https://user.blockrun.ai) — sign in with
 > Google, add credit with a card under **Credits**, mint a key under **API Keys**. That
-> one key covers all <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> chat models
+> one key covers all <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> chat models
 > plus images, video, speech and the live-data APIs. No wallet, no crypto, no seed phrase.
 
 ### Desktop control plane (macOS)
@@ -189,7 +189,7 @@ It backs up the wallet and OpenClaw integration state first and rolls back the p
 
 > **Using Claude Code?** Check out [BRCC](https://github.com/BlockRunAI/brcc) — it's purpose-built for Claude Code with the same smart routing and x402 payments.
 >
-> **Using NousResearch Hermes?** See [ClawRouter-Hermes](https://github.com/BlockRunAI/ClawRouter-Hermes) — a Python plugin that wires Hermes into the ClawRouter proxy. Same wallet, same <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> models, same x402 USDC settlement on Solana & Base.
+> **Using NousResearch Hermes?** See [ClawRouter-Hermes](https://github.com/BlockRunAI/ClawRouter-Hermes) — a Python plugin that wires Hermes into the ClawRouter proxy. Same wallet, same <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> models, same x402 USDC settlement on Solana & Base.
 
 No OpenClaw required. ClawRouter runs as a local proxy on port 8402.
 
@@ -200,7 +200,7 @@ npx @blockrun/clawrouter
 ```
 
 **2. Fund your wallet** — optional, skip for free tier
-Your wallet address is printed on first run. For paid models, send a few USDC on Solana (the default chain) or Base — $5 covers thousands of requests. Prefer a card? [Sign up at user.blockrun.ai](https://user.blockrun.ai) and run `clawrouter login brk_live_…` instead. To stay at $0, pin any of the <!-- br:models.free -->7<!-- /br:models.free --> free models (e.g. `free/nemotron-3.5-lightning`) or use `/model free` inside OpenClaw.
+Your wallet address is printed on first run. For paid models, send a few USDC on Solana (the default chain) or Base — $5 covers thousands of requests. Prefer a card? [Sign up at user.blockrun.ai](https://user.blockrun.ai) and run `clawrouter login brk_live_…` instead. To stay at $0, pin any of the <!-- br:models.free -->8<!-- /br:models.free --> free models (e.g. `free/nemotron-3.5-lightning`) or use `/model free` inside OpenClaw.
 
 **3. Point your client at `http://localhost:8402`**
 
@@ -373,15 +373,17 @@ curl -X POST http://localhost:8402/v1/videos/generations \
 
 Live per-model prices: [blockrun.ai/pricing](https://blockrun.ai/pricing) (agents: `GET https://blockrun.ai/api/v1/models`). Prices are not copied here, so this page never goes stale on a reprice.
 
-| Model                         | Provider            | Duration              |
-| ----------------------------- | ------------------- | --------------------- |
-| `bytedance/seedance-1.5-pro`  | ByteDance Seedance  | 5s default, up to 10s |
-| `bytedance/seedance-2.0-fast` | ByteDance Seedance  | 5s default, up to 10s |
-| `bytedance/seedance-2.0`      | ByteDance Seedance  | 5s default, up to 10s |
-| `azure/sora-2`                | OpenAI Sora (Azure) | 4s default; 4/8/12s   |
-| `xai/grok-imagine-video`      | xAI Grok Imagine    | 8s default            |
+| Model                         | Provider           | Duration              |
+| ----------------------------- | ------------------ | --------------------- |
+| `bytedance/seedance-1.5-pro`  | ByteDance Seedance | 5s default, up to 12s |
+| `bytedance/seedance-2.0-fast` | ByteDance Seedance | 5s default, up to 15s |
+| `bytedance/seedance-2.0-mini` | ByteDance Seedance | 5s default, up to 15s |
+| `bytedance/seedance-2.0`      | ByteDance Seedance | 5s default, up to 15s |
+| `bytedance/seedance-2.5`      | ByteDance Seedance | 5s default, up to 30s |
+| `xai/grok-imagine-video`      | xAI Grok Imagine   | 8s default, up to 15s |
+| `xai/grok-imagine-video-1.5`  | xAI Grok Imagine   | 8s default, up to 15s |
 
-Seedance is **token-priced upstream** at ~20,256 tokens/sec — the blockrun videos route now defaults Seedance to `resolution=720p` with `generate_audio=true` for text-to-video (2× the per-second token count of the older 480p baseline; audio is included in that rate). The quote is `duration × tokens/sec × $/1M tokens × 1.05 margin`. Image-to-video is priced the same as text-to-video (the earlier ~40% i2v discount was removed upstream on 2026-06-01; only video-to-video remains cheaper). Sora 2 is flat-priced at $0.10/sec for both t2v and i2v — note it rejects human faces in reference images (use Seedance + RealFace for real people). Calls block for 30–120s while the upstream polls the job. Seedance 2.0 Fast typically returns in 60–80s; 2.0 Pro trades latency for quality.
+Seedance is **token-priced upstream** at ~20,256 tokens/sec — the blockrun videos route now defaults Seedance to `resolution=720p` with `generate_audio=true` for text-to-video (2× the per-second token count of the older 480p baseline; audio is included in that rate). The quote is `duration × tokens/sec × $/1M tokens × 1.05 margin`. Image-to-video is priced the same as text-to-video (the earlier ~40% i2v discount was removed upstream on 2026-06-01; only video-to-video remains cheaper). For real people in reference images, use Seedance + RealFace. Calls block for 30–120s while the upstream polls the job. Seedance 2.0 Fast typically returns in 60–80s; 2.0 Pro trades latency for quality.
 
 ### BytePlus RealFace (Seedance 2.0 only)
 
@@ -465,7 +467,7 @@ LLM agents discover all eight operations as `blockrun_phone_*` / `blockrun_voice
 
 ## Models & Pricing
 
-<!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> models across 9 providers, one wallet. **<!-- br:models.free -->7<!-- /br:models.free --> models are $0 — paid models start at fractions of a cent.**
+<!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> models across 9 providers, one wallet. **<!-- br:models.free -->8<!-- /br:models.free --> models are $0 — paid models start at fractions of a cent.**
 
 > **💡** Models are grouped by typical cost of a chat message (~500 input + 500 output tokens). Paid requests also carry a flat **$0.001/tx settlement fee** (covers on-chain gas; already included in the price the gateway quotes). Free models never pay it.
 
@@ -480,7 +482,8 @@ Live per-model prices: [blockrun.ai/pricing](https://blockrun.ai/pricing) (agent
 | free/north-mini-code                        | 256K    | coding (Cohere, sub-second)                         |
 | free/nemotron-3-nano-omni-30b-a3b-reasoning | 256K    | reasoning (text only — see note)                    |
 | free/nemotron-3-ultra-550b                  | 1M      | largest free model (550B/55B MoE)                   |
-| free/llama-3.2-11b-vision                   | 128K    | Meta Llama (text only — see note)                   |
+| free/nemotron-3.5-bolt                      | 131K    | vision, about a second to answer                    |
+| free/nemotron-3-super-120b                  | 131K    | reasoning                                           |
 | free/muse-glimmer-30b                       | 131K    | reasoning (Meta Muse, text only)                    |
 | qwen/qwen3.7-flash                          | 1M      | reasoning, tools (fastest Qwen tier)                |
 | poolside/laguna-s-2.1                       | 1M      | coding (paid sibling of laguna-xs)                  |
@@ -568,9 +571,9 @@ Live per-model prices: [blockrun.ai/pricing](https://blockrun.ai/pricing) (agent
 | openai/gpt-5.4-pro          | 1M      | reasoning, tools                                       |
 | openai/gpt-5.5-pro          | 1M      | reasoning, vision, tools                               |
 
-> **Free tier:** <!-- br:models.free -->7<!-- /br:models.free --> open-weight models cost nothing — `/model free` pins the free default (`nemotron-3.5-lightning`, with the other five as fallbacks), `/model eco` opens on it, or pick one directly (e.g., `/model lightning` for 1M-context reasoning, `/model north-mini` or `/model laguna` for fast coding).
+> **Free tier:** <!-- br:models.free -->8<!-- /br:models.free --> open-weight models cost nothing — `/model free` pins the free default (`nemotron-3.5-lightning`, with the other five as fallbacks), `/model eco` opens on it, or pick one directly (e.g., `/model lightning` for 1M-context reasoning, `/model north-mini` or `/model laguna` for fast coding).
 >
-> **No free vision.** Two free models are catalogued as vision-capable and neither reliably is: on a 64×64 solid-colour probe `nemotron-3-nano-omni` was right 1 of 4 times on Base and answered "white" for red on Solana, and `llama-3.2-11b-vision` replied "I'm unable to see the image" 3 of 3 while answering text fine. Both return HTTP 200, so a wrong answer arrives with no error to branch on. ClawRouter therefore does not flag them for vision, and requests carrying an `image_url` route to a paid vision model instead.
+> **One free model reads images: `free/nemotron-3.5-bolt`.** It got 8 of 8 right on 64×64 solid-colour PNGs across Base and Solana on 2026-11-05, answered by Bolt itself. The rest of the free tier isn't flagged for vision: `nemotron-3-nano-omni` was right 1 of 4 times on Base in August, and only 2 of 8 probes of `nemotron-3-super-120b` reached that model. These failures can arrive as an HTTP 200 with a wrong answer and no error to branch on. Pin `/model vision-free` for free images; otherwise requests carrying an `image_url` route to a paid vision model.
 > **Best value:** `gpt-5-nano` and `gemini-2.5-flash-lite` deliver strong results at ~$0.0003/request.
 
 ---
@@ -716,7 +719,7 @@ chains, the response cache and the local spend controls.
 - **Balance lives server-side.** There is no local balance to check: a call that
   outruns your credit comes back as HTTP `402 insufficient_quota`, naming the
   top-up page. Free models stay free and need no credit at all — all
-  <!-- br:models.free -->7<!-- /br:models.free --> are served on the API-key gateway too.
+  <!-- br:models.free -->8<!-- /br:models.free --> are served on the API-key gateway too.
 - **One key covers nearly everything.** Verified live against `api.blockrun.ai`
   on 2026-09-05: chat completions (`/v1/chat/completions`), the Anthropic-shaped
   `/v1/messages`, `/v1/models`, image generation, speech, video, and the partner
@@ -868,7 +871,7 @@ npm test
 
 **The LLM router built for autonomous agents**
 
-You're here. <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> models, local smart routing, and two ways to pay — a credit-card-funded API key, or x402 USDC from a wallet, which is what lets an agent operate independently.
+You're here. <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> models, local smart routing, and two ways to pay — a credit-card-funded API key, or x402 USDC from a wallet, which is what lets an agent operate independently.
 
 `curl -fsSL https://blockrun.ai/ClawRouter-update | bash`
 
@@ -879,7 +882,7 @@ You're here. <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> mod
 
 **BlockRun for Claude Code**
 
-Run Claude Code with <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> models, no rate limits, no Anthropic account, no phone verification. Pay per request with USDC — your wallet is your identity.
+Run Claude Code with <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> models, no rate limits, no Anthropic account, no phone verification. Pay per request with USDC — your wallet is your identity.
 
 `curl -fsSL https://blockrun.ai/brcc-install | bash`
 
@@ -892,7 +895,7 @@ Run Claude Code with <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible
 
 **ClawRouter for NousResearch Hermes**
 
-Python plugin that wraps the ClawRouter proxy for `hermes-agent`. Same <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> models, same x402 USDC payments on Solana & Base, native Hermes ergonomics.
+Python plugin that wraps the ClawRouter proxy for `hermes-agent`. Same <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> models, same x402 USDC payments on Solana & Base, native Hermes ergonomics.
 
 `pip install hermes-plugin-clawrouter`
 
@@ -936,7 +939,7 @@ Python plugin that wraps the ClawRouter proxy for `hermes-agent`. Same <!-- br:m
 
 ### What is BlockRun?
 
-BlockRun lets agents pay for the outcome — every LLM, tool and data source, best value per dollar. One endpoint and one balance covering <!-- br:models.chatVisible -->90<!-- /br:models.chatVisible --> chat models plus image, video, music and speech generation, search, market data and multi-chain RPC, billed per call with USDC over [x402](https://x402.org) or a credit-card-funded API key — no seat, no subscription, no minimum. ClawRouter is the open-source local router agents use to reach it.
+BlockRun lets agents pay for the outcome — every LLM, tool and data source, best value per dollar. One endpoint and one balance covering <!-- br:models.chatVisible -->91<!-- /br:models.chatVisible --> chat models plus image, video, music and speech generation, search, market data and multi-chain RPC, billed per call with USDC over [x402](https://x402.org) or a credit-card-funded API key — no seat, no subscription, no minimum. ClawRouter is the open-source local router agents use to reach it.
 
 ### What is ClawRouter?
 
@@ -964,12 +967,12 @@ No. A wallet is the default because it is what lets an _agent_ pay for itself,
 but you can sign up at **[user.blockrun.ai](https://user.blockrun.ai)**, top up
 with a credit card, mint an API key and run `clawrouter login brk_live_…`. Calls
 then go to `api.blockrun.ai` on a bearer token and bill your account credit — no
-crypto, no gas, no seed phrase. And the <!-- br:models.free -->7<!-- /br:models.free --> free models need neither: no
+crypto, no gas, no seed phrase. And the <!-- br:models.free -->8<!-- /br:models.free --> free models need neither: no
 wallet, no key, no signup. See [Paying with a credit card](#paying-with-a-credit-card-api-key).
 
 ### Is ClawRouter free?
 
-ClawRouter itself is free and MIT licensed. You pay only for the LLM API calls routed through it — and several open-weight models (`nemotron-3.5-lightning`, `laguna-xs-2.1`, `north-mini-code`, `nemotron-3-nano-omni-30b-a3b-reasoning`, `nemotron-3-ultra-550b`, `llama-3.2-11b-vision`) are completely free (text only). Use `/model free` to smart-route across them, or pick any by name.
+ClawRouter itself is free and MIT licensed. You pay only for the LLM API calls routed through it — and several open-weight models (`nemotron-3.5-lightning`, `laguna-xs-2.1`, `north-mini-code`, `nemotron-3.5-bolt`, `nemotron-3-nano-omni-30b-a3b-reasoning`, `nemotron-3-super-120b`, `nemotron-3-ultra-550b`, `muse-glimmer-30b`) are completely free, and Bolt also reads images. Use `/model free` for the free default, or pick any by name.
 
 ---
 

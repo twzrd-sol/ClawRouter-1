@@ -1,7 +1,7 @@
 {
   "name": "@twzrd1111/clawrouter",
-  "version": "0.12.307",
-  "description": "Smart LLM router — save 84% on inference costs. 90 models (7 free). Pay by credit card (API key) or USDC (x402 wallet).",
+  "version": "0.12.309",
+  "description": "Smart LLM router — save 84% on inference costs. 91 models (8 free). Pay by credit card (API key) or USDC (x402 wallet).",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -86,7 +86,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BlockRunAI/ClawRouter.git"
+    "url": "git+https://github.com/twzrd-sol/ClawRouter-1.git"
   },
   "dependencies": {
     "@blockrun/llm": "^3.23.1",

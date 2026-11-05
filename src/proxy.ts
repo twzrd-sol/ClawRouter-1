@@ -3408,7 +3408,8 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       [...freeIds].some((id) => toUpstreamModelId(id) === model)
     );
   };
-  const payFetch: PayFetch = options.payFetch ??
+  const payFetch: PayFetch =
+    options.payFetch ??
     (authMode === "api-key"
       ? withSpendPolicy(
           options.maxCostPerRunUsd === 0 ? withZeroCapGuard(keyFetch!, isFreeForCap) : keyFetch!,

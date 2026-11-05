@@ -1,7 +1,8 @@
 name: Publish (npm)
 
-# Release is manual so merging code cannot publish packages without an operator
-# dispatch. Run this workflow against claude/twzrd-fork, the fork's release target.
+# Twzrd package release is manual: merging to the fork's release branch cannot
+# publish these packages without an operator dispatch. The main branch has its
+# separate @blockrun/clawrouter release workflow.
 
 on:
   workflow_dispatch:
@@ -39,23 +40,35 @@ jobs:
         run: |
           ROOT_NAME=$(node -p "require('./package.json').name")
           ROOT_VERSION=$(node -p "require('./package.json').version")
-          ROOT_NPM_VERSION=$(npm view "$ROOT_NAME" version 2>/dev/null || echo "none")
+          if ROOT_REGISTRY_RESULT=$(npm view "$ROOT_NAME@$ROOT_VERSION" version 2>&1); then
+            ROOT_PUBLISHED=true
+          elif grep -q 'E404' <<<"$ROOT_REGISTRY_RESULT"; then
+            ROOT_PUBLISHED=false
+          else
+            echo "$ROOT_REGISTRY_RESULT" >&2
+            exit 1
+          fi
           MPP_NAME=$(node -p "require('./packages/clawrouter-mpp/package.json').name")
           MPP_VERSION=$(node -p "require('./packages/clawrouter-mpp/package.json').version")
-          MPP_NPM_VERSION=$(npm view "$MPP_NAME" version 2>/dev/null || echo "none")
+          if MPP_REGISTRY_RESULT=$(npm view "$MPP_NAME@$MPP_VERSION" version 2>&1); then
+            MPP_PUBLISHED=true
+          elif grep -q 'E404' <<<"$MPP_REGISTRY_RESULT"; then
+            MPP_PUBLISHED=false
+          else
+            echo "$MPP_REGISTRY_RESULT" >&2
+            exit 1
+          fi
 
           {
             echo "root_name=$ROOT_NAME"
             echo "root_version=$ROOT_VERSION"
-            echo "root_npm_version=$ROOT_NPM_VERSION"
-            echo "publish_root=$([ "$ROOT_VERSION" != "$ROOT_NPM_VERSION" ] && echo true || echo false)"
+            echo "publish_root=$([ "$ROOT_PUBLISHED" = false ] && echo true || echo false)"
             echo "mpp_name=$MPP_NAME"
             echo "mpp_version=$MPP_VERSION"
-            echo "mpp_npm_version=$MPP_NPM_VERSION"
-            echo "publish_mpp=$([ "$MPP_VERSION" != "$MPP_NPM_VERSION" ] && echo true || echo false)"
+            echo "publish_mpp=$([ "$MPP_PUBLISHED" = false ] && echo true || echo false)"
           } >> "$GITHUB_OUTPUT"
-          echo "$ROOT_NAME: package=$ROOT_VERSION registry=$ROOT_NPM_VERSION"
-          echo "$MPP_NAME: package=$MPP_VERSION registry=$MPP_NPM_VERSION"
+          echo "$ROOT_NAME@$ROOT_VERSION: $( [ "$ROOT_PUBLISHED" = true ] && echo already-published || echo not-yet-published )"
+          echo "$MPP_NAME@$MPP_VERSION: $( [ "$MPP_PUBLISHED" = true ] && echo already-published || echo not-yet-published )"
 
       - name: Install core dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund

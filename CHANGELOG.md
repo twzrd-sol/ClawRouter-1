@@ -4,6 +4,114 @@ All notable changes to ClawRouter.
 
 ---
 
+## v0.12.309 — November 5, 2026
+
+### A positive `maxCostPerRun` now covers `/v1/messages`
+
+**Behaviour change:** a positive cap only covered `/v1/chat/completions`, so a client
+on `/v1/messages`, such as Claude Code, could spend past it without limit. If you set
+a cap and call that route, you now get a `429` once the budget can't cover the next
+paid call.
+
+- **Shared budget:** the route draws on the same session budget as chat, on the wallet
+  and API-key rails. Send `x-session-id` to keep both on one budget. Without it, the
+  session comes from the first user message, and clients that format that message
+  differently on each route get separate budgets.
+- **No downgrade:** the route forwards the model you asked for, so both modes refuse
+  rather than swap in a cheaper one. Strict mode answers `cost_cap_exceeded`. Graceful
+  mode answers `budget_exhausted`, with `X-ClawRouter-Budget-Mode: blocked`.
+- **Free models** still answer when the budget is gone.
+
+Image, video, music, speech and partner routes are still outside a positive cap.
+
+### Docs
+
+The routing docs, README and skill still listed Llama as free and left out Bolt and
+Super 120B, and the README and skill still mentioned Sora 2 after v0.12.308. These now
+match the live catalog.
+
+---
+
+## v0.12.308 — November 5, 2026
+
+### `maxCostPerRun: 0` now means nothing gets paid for
+
+**Behaviour change:** a cap of 0 used to switch the cap off, while startup logged
+`Cost cap: $0.00 per session`. It now refuses every paid call. If you set 0 to
+mean "no limit", remove the key.
+
+The refusal covers every route on both rails: chat, `/v1/messages`, image, video,
+music and speech generation, the partner and data APIs, and the `/imagegen` and
+`/img2img` chat commands. These answer `429 cost_cap_exceeded`, with the
+`X-ClawRouter-Cost-Cap-Exceeded: 1` header.
+
+Free models still answer, but routed profiles need care: pin a free model. Strict
+mode refuses `auto` and `premium`, and graceful mode refuses them on tool calls.
+Graceful mode no longer adds a budget warning to replies at a cap of 0; the
+`X-ClawRouter-Budget-Mode: downgraded` header still reports the downgrade.
+
+On the API-key rail nothing shows what a call costs, so a cap of 0 lets through
+only free models on the chat routes and reads that can't bill (catalogs, health,
+usage, balance). A free partner call is refused there too.
+
+A positive cap still covers `/v1/chat/completions` only.
+
+Thanks @0xcfloki, who found the bug and fixed the chat path (#553).
+
+### Cost caps are harder to slip past
+
+These apply at any cap:
+
+- A chat request with no `x-session-id` and no user message used to skip the cap.
+  It now counts against a shared budget.
+- In graceful mode, a model with no local price is refused once the budget has run
+  out. It used to be paid for. This also applies in strict mode on the API-key rail.
+- `startProxy` ignores a cap that isn't a finite number, and the plugin config does
+  too. A `NaN` cap could make every paid request fail and an identical retry hang.
+- A routed request whose free primary survives the budget filter no longer gets a
+  false "raise your cap" notice.
+
+### Free tier: Bolt and Super 120B in, Llama out
+
+- **Added:** `free/nemotron-3.5-bolt` (about a second to answer, reads images) and
+  `free/nemotron-3-super-120b` (reasoning). Try `/model bolt` or `/model super-120b`.
+- **Free vision works again, on one model.** Bolt got 8 of 8 right on 64x64
+  solid-colour images across Base and Solana, and is the only free model flagged
+  for vision. `/model vision-free` now pins it.
+- **Retired:** `free/llama-3.2-11b-vision`, which NVIDIA deprovisioned on
+  November 2. Pins still route and are answered by a live free model.
+  `llama-free` now points at `free/muse-glimmer-30b`, and `nemotron-super` at
+  `free/nemotron-3-super-120b`.
+
+### Video: Sora 2 removed
+
+`azure/sora-2` is gone from local pricing and the README: its provider shut it down
+on November 2, and the gateway refuses new requests with no substitute. The README
+video table now lists all seven live models.
+
+---
+
+## v0.12.307 — November 3, 2026
+
+### The SSRF guard reads every IPv6 form that embeds an IPv4 address
+
+Three more ways of writing an IPv4 address inside an IPv6 literal now resolve
+to the embedded address and are judged by the IPv4 rules: IPv4-translated
+(`::ffff:0:127.0.0.1`, `::ffff:0:7f00:1`), IPv4-compatible (`::127.0.0.1`,
+`::7f00:1`) and the hex spelling of each. Loopback, private, link-local and
+cloud-metadata targets written that way are refused, as literals and as DNS
+answers; public addresses in those forms still pass. Thanks @Tyagiquamar
+(#547).
+
+Landing it surfaced one regression, fixed before release: the translated
+prefix strip removed the leading `0:` from every `::ffff:` tail, so a
+two-hextet tail such as `::ffff:0:1` (IPv4-mapped 0.0.0.1, which is how the
+URL parser writes `[::ffff:0.0.0.1]`) lost its first hextet and fell through
+unblocked. The strip now fires only when an IPv4 still follows it. Six
+regression cases pin the mapped `0.0.x.y` forms.
+
+---
+
 ## v0.12.306 — November 2, 2026
 
 ### Dependency security sweep: 91 open Dependabot alerts → 0
@@ -1076,7 +1184,7 @@ Both now forward verbatim through the existing paid-passthrough, verified live a
 
 ### Fixed — the API-key docs described a gateway that no longer exists
 
-The 404 hint and the README both said `api.blockrun.ai` "currently carries chat and text completions" and that "image, video, audio and the partner APIs are still wallet-only". Probing the live gateway on 2026-09-05 disproved it: chat, `/v1/messages`, `/v1/models`, image generation, speech, video, Surf, Exa, prediction markets and phone lookup/fraud **all work on an API key**, and so do all <!-- br:models.free -->7<!-- /br:models.free --> free models. The genuine wallet-only exceptions are the routes that bind a lease or a position to a payer address — buying/renewing/releasing phone numbers, and Polymarket trading — and those are now what the hint names.
+The 404 hint and the README both said `api.blockrun.ai` "currently carries chat and text completions" and that "image, video, audio and the partner APIs are still wallet-only". Probing the live gateway on 2026-09-05 disproved it: chat, `/v1/messages`, `/v1/models`, image generation, speech, video, Surf, Exa, prediction markets and phone lookup/fraud **all work on an API key**, and so do all <!-- br:models.free -->8<!-- /br:models.free --> free models. The genuine wallet-only exceptions are the routes that bind a lease or a position to a payer address — buying/renewing/releasing phone numbers, and Polymarket trading — and those are now what the hint names.
 
 ### Changed — Solana is the stated preference, without stranding Base wallets
 

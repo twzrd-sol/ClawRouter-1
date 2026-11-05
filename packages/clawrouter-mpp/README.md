@@ -17,7 +17,7 @@ const payFetch = createMppFetch(account, fetch, { spend });
 await startProxy({ spendControl: spend, payFetch /* ... */ });
 ```
 
-This candidate requires `@twzrd1111/clawrouter >=0.12.307`, including deferred streaming headers.
+This candidate requires `@twzrd1111/clawrouter >=0.12.309`, including deferred streaming headers.
 The fork is the release target. Upstream PRs #545 and #546 are independent of this release.
 
 For Tempo install the optional peer `mppx@~0.17.0`. For Solana install `@solana/mpp@~0.7.0`,

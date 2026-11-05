@@ -218,8 +218,15 @@ export class SessionSpend {
  * does the same here: no second signature, no walk down the paid chain.
  */
 export class CostCapError extends SpendPolicyError {
-  constructor(reason: string) {
+  /** A graceful-mode refusal: the budget ran out, and nothing cheaper may be swapped in. */
+  readonly budgetExhausted: boolean;
+
+  constructor(reason: string, budgetExhausted = false) {
     super(reason);
     this.name = "CostCapError";
+    this.budgetExhausted = budgetExhausted;
   }
 }
+
+/** Why a $0 cap refused a call. */
+export const ZERO_CAP_REFUSAL = "ClawRouter cost cap: maxCostPerRun is 0, so no paid call is made";

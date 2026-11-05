@@ -3305,6 +3305,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     // Wrap in paymentStore.run() so x402 hook can write actual payment amount per-request
+    // prettier-ignore
     const handled: Promise<void> = paymentStore.run({ amountUsd: 0, attemptPaid: false }, async () => {
       // Add stream error handlers to prevent server crashes
       req.on("error", (err) => {
@@ -7332,8 +7333,7 @@ async function proxyRequest(
           bodyChunks = await readBodyWithTimeout(result.response.body);
         } catch (err) {
           const responseWasPaid =
-            result.responseWasPaid === true ||
-            result.response.headers.has(PAYMENT_RECEIPT_HEADER);
+            result.responseWasPaid === true || result.response.headers.has(PAYMENT_RECEIPT_HEADER);
           if (!responseWasPaid) throw err;
 
           let reason = "paid response body failed before completion";
@@ -7362,8 +7362,7 @@ async function proxyRequest(
         const bodyBuf = Buffer.concat(bodyChunks);
 
         const responseWasPaid =
-          result.responseWasPaid === true ||
-          result.response.headers.has(PAYMENT_RECEIPT_HEADER);
+          result.responseWasPaid === true || result.response.headers.has(PAYMENT_RECEIPT_HEADER);
         if (isDegenerateCompletion(bodyBuf) && !isLastAttempt && !responseWasPaid) {
           console.warn(
             `[ClawRouter] ⚠️  Degenerate output from ${tryModel} (finish_reason=length + repetition loop) — retrying with next fallback`,

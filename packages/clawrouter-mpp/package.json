@@ -30,7 +30,7 @@
     "test": "vitest run"
   },
   "peerDependencies": {
-    "@twzrd1111/clawrouter": ">=0.12.307",
+    "@twzrd1111/clawrouter": ">=0.12.309",
     "@solana/kit": "~6.10.0",
     "@solana/mpp": "~0.7.0",
     "mppx": "~0.17.0",

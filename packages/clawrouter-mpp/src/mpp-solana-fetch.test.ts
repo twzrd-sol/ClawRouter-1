@@ -15,6 +15,7 @@ import {
 } from "./mpp-solana-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
 import { MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
+import { MppGateError } from "./mpp-gate.js";
 
 // A real pay-kit server emits real Solana MPP 402s without touching a chain. The payer's RPC points at a
 // closed port, so a veto that fails to hold would surface as a connection error, not SpendPolicyError.
@@ -147,6 +148,29 @@ describe("Solana MPP spend controls", () => {
       spend,
     });
     await expect(call(f, s.url)).rejects.toThrow(/not in the configured allowlist/);
+    expect(watched.calls()).toBe(0);
+  });
+
+  it("blocks the Solana charge challenge before signer invocation", async () => {
+    const s = await seller();
+    const watched = await watchedPayer();
+    const seen: unknown[] = [];
+    const f = await createSolanaMppFetch({
+      signer: watched.signer,
+      rpcUrl: DEAD_RPC,
+      network: "localnet",
+      gate: async (challenge) => {
+        seen.push(challenge);
+        return { disposition: "block", decisionId: "solana-block" };
+      },
+    });
+    await expect(call(f, s.url)).rejects.toMatchObject({
+      name: "MppGateError",
+      code: "MPP_GATE_BLOCKED",
+      decisionId: "solana-block",
+    } satisfies Partial<MppGateError>);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ method: "solana", intent: "charge" });
     expect(watched.calls()).toBe(0);
   });
 
@@ -299,19 +323,30 @@ describe("createSolanaMppFetch paid failures", () => {
     }) as unknown as typeof fetch;
     const before = readCredits().length;
     const spend = control((c) => c.setLimit("daily", 1));
+    const gate = vi.fn(async () => ({ disposition: "allow" as const, decisionId: "fixture-gate" }));
+    const budget1 = { assertPaymentAllowed: vi.fn(), recordSigned: vi.fn() };
+    const budget2 = { assertPaymentAllowed: vi.fn(), recordSigned: vi.fn() };
     const pay = await createSolanaMppFetch({
       signer: watched.signer,
       rpcUrl: DEAD_RPC,
       network: "devnet",
       spend,
+      gate,
       fetch: base,
     });
-    const send = () => pay(FIXTURE_URL, { method: "POST", body: "{}" });
-    const results = await Promise.allSettled([send(), send()]);
+    const send = (budget: { assertPaymentAllowed: () => void; recordSigned: () => void }) => {
+      const init = { method: "POST", body: "{}" } as RequestInit & { [key: symbol]: unknown };
+      init[Symbol.for("twzrd.clawrouter.pay-fetch-budget.v1")] = budget;
+      return pay(FIXTURE_URL, init);
+    };
+    const results = await Promise.allSettled([send(budget1), send(budget2)]);
     expect(
       results.every((r) => r.status === "rejected" && r.reason instanceof MppPaidNoCompletionError),
     ).toBe(true);
     expect(watched.calls()).toBe(1);
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(budget1.recordSigned).toHaveBeenCalledTimes(1);
+    expect(budget2.recordSigned).not.toHaveBeenCalled();
     expect(credentials).toHaveLength(2);
     expect(credentials[0]).toBe(credentials[1]);
     const proof = Credential.deserialize<{ type: string; transaction: string }>(credentials[0]);

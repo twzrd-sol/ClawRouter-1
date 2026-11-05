@@ -18,11 +18,23 @@ export {
 export type { MppFetchOptions, PayFetch } from "./mpp-fetch.js";
 export { createSolanaMppFetch, DEFAULT_SOLANA_USD_MINTS } from "./mpp-solana-fetch.js";
 export type { SolanaMppFetchOptions } from "./mpp-solana-fetch.js";
+export { MppGateError } from "./mpp-gate.js";
+export type { MppGateChallenge, MppGateDecision, MppGateEvaluator } from "./mpp-gate.js";
+export {
+  MPP_FULFILLMENT_MAX_BODY_BYTES,
+  MPP_FULFILLMENT_RECORD_SCHEMA,
+} from "./mpp-fulfillment-record.js";
+export type {
+  MppFulfillmentRecord,
+  MppFulfillmentSink,
+  MppPaymentFacts,
+} from "./mpp-fulfillment-record.js";
 export {
   MppPaidNoCompletionError,
   creditPaidNoCompletion,
   readCredits,
 } from "./mpp-paid-failure.js";
+export { readPaidCallEvidence } from "./mpp-paid-failure.js";
 export { CreditLedger } from "./credit-record.js";
 export type { CreditEntry } from "./credit-record.js";
 export { SpentProofLedger, ReplayRejectedError, fulfillPaidProof } from "./spent-proof.js";

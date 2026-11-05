@@ -17,6 +17,37 @@ const payFetch = createMppFetch(account, fetch, { spend });
 await startProxy({ spendControl: spend, payFetch /* ... */ });
 ```
 
+Both rails accept an optional `gate` callback. It receives the full MPP charge challenge before
+credential creation. Return `{ disposition: "allow" | "warn" | "block" }`; `block` and callback
+errors abort before signing, while `warn` proceeds. The callback can adapt TWZRD's evaluator without
+making this package depend on the gate package:
+
+```ts
+import { evaluateTwzrdMppChallenge } from "twzrd-x402-gate";
+
+const gate = async (challenge) => {
+  const result = await evaluateTwzrdMppChallenge(challenge, gateOptions);
+  return {
+    disposition: result.disposition,
+    decisionId: result.decision.decisionId,
+    intentHash: result.decision.intentHash,
+    reasonCodes: result.decision.reasonCodes,
+  };
+};
+const payFetch = createMppFetch(account, fetch, { spend, gate });
+```
+
+Without `gate`, the rail does not perform TWZRD reputation evaluation. Receipt-safe payment metadata
+is available through `readPaidCallEvidence(response)` for a paid response from this rail. Set
+`onFulfillment(record)` to receive a local record built from the request, seller response, gate result,
+and MPP `Payment-Receipt`. The record stores the decoded receipt reference, never the raw base64
+receipt or payment credential. Tempo session receipts emitted in an SSE `payment-receipt` event are
+captured when the response stream completes; the stream bytes are forwarded unchanged, including the
+seller-reported model label from its first JSON data event. A `valid_format` receipt means its structure,
+method, and intent match the challenge; it is not an on-chain verification. `seller_reported_model_matches_request`
+compares labels only and does not verify model identity. The callback is optional; recording and async
+sink latency or failures do not hold up the response stream.
+
 This candidate requires `@twzrd1111/clawrouter >=0.12.309`, including deferred streaming headers.
 The fork is the release target. Upstream PRs #545 and #546 are independent of this release.
 

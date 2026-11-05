@@ -5,6 +5,7 @@ import { generatePrivateKey } from "viem/accounts";
 
 import { startProxy, type ProxyHandle } from "./proxy.js";
 import { CAIP2_BASE, InMemorySpendControlStorage, SpendControl } from "./spend-control.js";
+import type { PayFetch } from "./pay-fetch.js";
 
 /**
  * `maxCostPerRun: 0` is a $0 cap, not "no cap". The cap checks used to test
@@ -115,6 +116,38 @@ function send(proxy: ProxyHandle): Promise<Response> {
 }
 
 describe("maxCostPerRun of 0", () => {
+  it("refuses a custom payFetch on paid endpoints before the rail runs", async () => {
+    const payFetch = Object.assign(
+      async () => {
+        paidHits++;
+        return new Response("paid", { status: 200 });
+      },
+      { enforcesSpend: true },
+    ) as PayFetch;
+    const proxy = await startProxy({
+      apiBase: `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`,
+      port: 0,
+      skipBalanceCheck: true,
+      maxCostPerRunUsd: 0,
+      maxCostPerRunMode: "strict",
+      wallet: generatePrivateKey(),
+      spendControl: new SpendControl({ storage: new InMemorySpendControlStorage() }),
+      payFetch,
+    });
+    try {
+      const response = await fetch(`${proxy.baseUrl}/v1/partner/lookup`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-session-id": `zero-cap-${seq}` },
+        body: JSON.stringify({ query: "paid lookup" }),
+      });
+      expect(response.status).toBe(429);
+      expect(response.headers.get("x-clawrouter-cost-cap-exceeded")).toBe("1");
+      expect(paidHits).toBe(0);
+    } finally {
+      await proxy.close();
+    }
+  });
+
   describe("in strict mode", () => {
     it("refuses a paid model before signing", async () => {
       const res = await send(strictProxy);

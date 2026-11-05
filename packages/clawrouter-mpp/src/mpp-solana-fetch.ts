@@ -15,12 +15,32 @@ import {
   creditFromChallenge,
   guardPaid,
   isPaidResponse,
+  currentPaidCall,
   markSigned,
+  markGateEvaluated,
+  markPaymentChallenge,
   MppPaidNoCompletionError,
   paymentReference,
   rejectPaidNoCompletion,
 } from "./mpp-paid-failure.js";
 import { loadOptional, SOLANA_MPP_RANGE } from "./mpp-optional.js";
+import {
+  evaluateMppGate,
+  paymentFactsFromMppChallenge,
+  type MppGateDecision,
+  type MppGateEvaluator,
+} from "./mpp-gate.js";
+import {
+  recordMppFulfillment,
+  type MppFulfillmentSink,
+  type MppPaymentFacts,
+} from "./mpp-fulfillment-record.js";
+import {
+  currentMppPaymentBudget,
+  paymentBudgetFromInit,
+  runWithMppPaymentBudget,
+  stripPaymentBudgetFromInit,
+} from "./mpp-payment-budget.js";
 
 export const DEFAULT_SOLANA_USD_MINTS: ReadonlySet<string> = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -41,6 +61,10 @@ export type SolanaMppFetchOptions = {
   network: SolanaNetwork;
   spend?: SpendControl;
   usdMints?: Iterable<string>;
+  /** Optional TWZRD pre-payment gate; block or evaluator errors abort before Solana signs. */
+  gate?: MppGateEvaluator;
+  /** Optional local receipt/fulfillment record sink. Sink failures are ignored. */
+  onFulfillment?: MppFulfillmentSink;
   /** Injectable transport; defaults to fetch. The SDK's RPC transport is separate. */
   fetch?: typeof fetch;
 };
@@ -56,113 +80,183 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
   const base = opts.fetch ?? fetch;
   const usd = new Set([...DEFAULT_SOLANA_USD_MINTS, ...(opts.usdMints ?? [])]);
   const network = opts.network === "mainnet" ? "mainnet-beta" : opts.network;
-  type Signed = { credential: string; payload: string; record?: SpendRecord };
+  type Signed = {
+    credential: string;
+    payload: string;
+    record?: SpendRecord;
+    gate?: MppGateDecision;
+    payment?: MppPaymentFacts;
+  };
   // Share construction of the same credential, including overlapping requests.
   const signedOnce = new Map<string, Promise<Signed>>();
+  // One policy evaluation for concurrent retries of the same complete challenge.
+  const gateOnce = new Map<string, Promise<MppGateDecision | undefined>>();
 
-  const payFetch: PayFetch = async (input, init) =>
-    guardPaid(
-      opts.spend,
-      async () => {
-        const request = new Request(input, init);
-        const probe = await base(request.clone());
-        if (probe.status !== 402) return probe;
-        if (probe.redirected)
-          throw new SpendPolicyError("Refusing a payment challenge reached through a redirect");
-        const challenge = selectSolanaChargeChallengeFromResponse(probe);
-        if (!challenge) return probe;
-        const challengeNetwork = challenge.request.methodDetails.network ?? "mainnet";
-        if (solanaNetworkId(challengeNetwork) !== CAIP2[opts.network]) {
-          throw new SpendPolicyError(
-            "Solana challenge network does not match the configured network",
-          );
-        }
-        const credit = creditFromChallenge(challenge, opts.signer.address);
-        if (!credit) throw new Error("challenge is missing amount or id");
-        const quote = quoteFromSolanaChallenge(
-          {
-            request: {
-              ...challenge.request,
-              methodDetails: { ...challenge.request.methodDetails, network: challengeNetwork },
-              currency:
-                resolveStablecoinMint(challenge.request.currency, network) ??
-                challenge.request.currency,
+  const payFetch: PayFetch = async (input, init) => {
+    const budget = paymentBudgetFromInit(init);
+    const cleanInit = stripPaymentBudgetFromInit(init);
+    return runWithMppPaymentBudget(budget, () =>
+      guardPaid(
+        opts.spend,
+        async () => {
+          const request = new Request(input, cleanInit);
+          const requestForRecord = request.clone();
+          const probe = await base(request.clone());
+          if (probe.status !== 402) return probe;
+          if (probe.redirected)
+            throw new SpendPolicyError("Refusing a payment challenge reached through a redirect");
+          const challenge = selectSolanaChargeChallengeFromResponse(probe);
+          if (!challenge) return probe;
+          const challengeNetwork = challenge.request.methodDetails.network ?? "mainnet";
+          if (solanaNetworkId(challengeNetwork) !== CAIP2[opts.network]) {
+            throw new SpendPolicyError(
+              "Solana challenge network does not match the configured network",
+            );
+          }
+          const credit = creditFromChallenge(challenge, opts.signer.address);
+          if (!credit) throw new Error("challenge is missing amount or id");
+          const quote = quoteFromSolanaChallenge(
+            {
+              request: {
+                ...challenge.request,
+                methodDetails: { ...challenge.request.methodDetails, network: challengeNetwork },
+                currency:
+                  resolveStablecoinMint(challenge.request.currency, network) ??
+                  challenge.request.currency,
+              },
             },
-          },
-          usd,
-        );
-        const key = JSON.stringify([challenge.id, challenge.request]);
-        let pending = signedOnce.get(key);
-        if (!pending) {
-          pending = (async (): Promise<Signed> => {
-            const spend = opts.spend;
-            if (spend && !quote.priceable && spend.hasAmountLimits()) {
-              throw new SpendPolicyError(
-                "MPP quote is in a mint ClawRouter cannot price; refusing to pay against a configured spend limit",
-              );
-            }
-            const reservationId = spend ? assertSpendPolicyAllows(spend, quote) : undefined;
-            let signed = false;
-            let record: SpendRecord | undefined;
-            let payload = "";
-            try {
-              const method = charge({
-                signer: opts.signer,
-                rpcUrl: opts.rpcUrl,
-                expectedNetwork: challengeNetwork,
-                broadcast: false,
-                onProgress(event) {
-                  if (event.type !== "signed") return;
-                  signed = true;
-                  payload = event.transaction;
+            usd,
+          );
+          const payment = paymentFactsFromMppChallenge(challenge);
+          markPaymentChallenge(payment);
+          const key = JSON.stringify([
+            challenge.id,
+            challenge.realm,
+            challenge.method,
+            challenge.intent,
+            challenge.expires,
+            challenge.request,
+          ]);
+          let gatePending = gateOnce.get(key);
+          if (!gatePending) {
+            gatePending = evaluateMppGate(opts.gate, challenge);
+            gateOnce.set(key, gatePending);
+          }
+          let gateDecision: MppGateDecision | undefined;
+          try {
+            gateDecision = await gatePending;
+          } catch (err) {
+            if (gateOnce.get(key) === gatePending) gateOnce.delete(key);
+            throw err;
+          }
+          if (gateOnce.get(key) === gatePending) gateOnce.delete(key);
+          markGateEvaluated(gateDecision);
+          const budgetContext = currentMppPaymentBudget();
+          const budgetQuoteMicros =
+            quote.priceable && quote.amount && /^\d+$/.test(quote.amount)
+              ? BigInt(quote.amount)
+              : undefined;
+          budgetContext?.assertPaymentAllowed(budgetQuoteMicros);
+          let pending = signedOnce.get(key);
+          if (!pending) {
+            pending = (async (): Promise<Signed> => {
+              const spend = opts.spend;
+              if (spend && !quote.priceable && spend.hasAmountLimits()) {
+                throw new SpendPolicyError(
+                  "MPP quote is in a mint ClawRouter cannot price; refusing to pay against a configured spend limit",
+                );
+              }
+              const reservationId = spend ? assertSpendPolicyAllows(spend, quote) : undefined;
+              let signed = false;
+              let sessionSpendRecorded = false;
+              let record: SpendRecord | undefined;
+              let payload = "";
+              try {
+                const method = charge({
+                  signer: opts.signer,
+                  rpcUrl: opts.rpcUrl,
+                  expectedNetwork: challengeNetwork,
+                  broadcast: false,
+                  onProgress(event) {
+                    if (event.type !== "signed") return;
+                    signed = true;
+                    payload = event.transaction;
+                    if (!sessionSpendRecorded) {
+                      budgetContext?.recordSigned(budgetQuoteMicros);
+                      sessionSpendRecorded = true;
+                    }
+                    if (spend && reservationId !== undefined) {
+                      record = spend.settleReservation(reservationId, {
+                        action: "mpp solana charge",
+                      });
+                    }
+                    markSigned(payload, credit, record);
+                  },
+                });
+                const credential = await method.createCredential({ challenge });
+                // Account for a compatible method which returns a credential without progress.
+                if (!signed) {
+                  payload = credential;
+                  if (!sessionSpendRecorded) {
+                    budgetContext?.recordSigned(budgetQuoteMicros);
+                    sessionSpendRecorded = true;
+                  }
                   if (spend && reservationId !== undefined) {
                     record = spend.settleReservation(reservationId, {
                       action: "mpp solana charge",
                     });
                   }
-                  markSigned(payload, credit, record);
-                },
-              });
-              const credential = await method.createCredential({ challenge });
-              // Account for a compatible method which returns a credential without progress.
-              if (!signed) {
-                payload = credential;
-                if (spend && reservationId !== undefined) {
-                  record = spend.settleReservation(reservationId, { action: "mpp solana charge" });
                 }
+                return {
+                  credential,
+                  payload,
+                  record,
+                  gate: gateDecision,
+                  payment,
+                };
+              } catch (err) {
+                if (signed) {
+                  throw new MppPaidNoCompletionError(
+                    "Solana payment was signed but credential construction failed; refusing to sign again",
+                    paymentReference(payload),
+                    undefined,
+                    { cause: err },
+                  );
+                }
+                if (!signed && spend && reservationId !== undefined)
+                  spend.releaseReservation(reservationId);
+                throw err;
               }
-              return { credential, payload, record };
-            } catch (err) {
-              if (signed) {
-                throw new MppPaidNoCompletionError(
-                  "Solana payment was signed but credential construction failed; refusing to sign again",
-                  paymentReference(payload),
-                  undefined,
-                  { cause: err },
-                );
-              }
-              if (!signed && spend && reservationId !== undefined)
-                spend.releaseReservation(reservationId);
-              throw err;
-            }
-          })();
-          signedOnce.set(key, pending);
-        }
-        let result: Signed;
-        try {
-          result = await pending;
-        } catch (err) {
-          if (!(err instanceof MppPaidNoCompletionError) && signedOnce.get(key) === pending)
-            signedOnce.delete(key);
-          throw err;
-        }
-        markSigned(result.payload, credit, result.record);
-        const headers = new Headers(request.headers);
-        headers.set("authorization", result.credential);
-        return base(new Request(request, { headers }));
-      },
-      opts.signer.address,
+            })();
+            signedOnce.set(key, pending);
+          }
+          let result: Signed;
+          try {
+            result = await pending;
+          } catch (err) {
+            if (!(err instanceof MppPaidNoCompletionError) && signedOnce.get(key) === pending)
+              signedOnce.delete(key);
+            throw err;
+          }
+          markGateEvaluated(result.gate);
+          if (result.payment) markPaymentChallenge(result.payment);
+          markSigned(result.payload, credit, result.record);
+          const headers = new Headers(request.headers);
+          headers.set("authorization", result.credential);
+          const response = await base(new Request(request, { headers }));
+          const paid = currentPaidCall();
+          if (response.status !== 402 && paid?.signed && paid.payment && opts.onFulfillment) {
+            return recordMppFulfillment(
+              { input: requestForRecord, response, payment: paid.payment, gate: paid.gate },
+              opts.onFulfillment,
+            );
+          }
+          return response;
+        },
+        opts.signer.address,
+      ),
     );
+  };
   payFetch.enforcesSpend = opts.spend !== undefined;
   payFetch.deferStreamingHeaders = true;
   payFetch.supportsNativeStreaming = true;

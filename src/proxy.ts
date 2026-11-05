@@ -2625,6 +2625,12 @@ function capMessagesRequest(
 const ZERO_CAP_FREE_READ =
   /^\/v1\/(?:models|usage|balance|audio\/models|audio\/voices|images\/models|video\/models|health\/[^/]+)$/;
 
+const PAY_FETCH_BUDGET_CONTEXT_KEY = Symbol.for("twzrd.clawrouter.pay-fetch-budget.v1");
+type PayFetchBudgetContext = {
+  assertPaymentAllowed: (quoteMicros: bigint | undefined) => void;
+  recordSigned: (quoteMicros: bigint | undefined) => void;
+};
+
 /**
  * The key rail's half of a $0 cap. Nothing is signed on this rail, so nothing
  * shows what a call costs: the bearer token is billed server-side. Let through
@@ -2663,6 +2669,68 @@ function withZeroCapGuard(
     if (!allowed) throw new CostCapError(ZERO_CAP_REFUSAL);
     return inner(input, init);
   };
+}
+
+/** Pass the current session's atomic cap check through an isolated payFetch context. */
+function withSessionSpendBudget(
+  inner: PayFetch,
+  maxCostPerRunUsd: number | undefined,
+  isFree: (model: string) => boolean,
+): PayFetch {
+  const wrapped: PayFetch = async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const path = url.pathname;
+    const method = (
+      init?.method ?? (input instanceof Request ? input.method : "GET")
+    ).toUpperCase();
+    if (maxCostPerRunUsd === 0) {
+      let allowed = ZERO_CAP_FREE_READ.test(path) && (method === "GET" || method === "HEAD");
+      if (/^\/v1\/(?:chat\/completions|messages)$/.test(path)) {
+        const body = init?.body;
+        let model: unknown;
+        try {
+          const text =
+            typeof body === "string"
+              ? body
+              : body instanceof Uint8Array
+                ? Buffer.from(body).toString()
+                : "";
+          model = (JSON.parse(text) as { model?: unknown }).model;
+        } catch {
+          model = undefined;
+        }
+        allowed = typeof model === "string" && isFree(model);
+      }
+      if (!allowed) throw new CostCapError(ZERO_CAP_REFUSAL);
+    }
+
+    const spend = paymentStore.getStore()?.sessionSpend;
+    if (!spend) return inner(input, init);
+    const context: PayFetchBudgetContext = {
+      assertPaymentAllowed(quoteMicros) {
+        if (quoteMicros === undefined) {
+          if (spend.isStrict)
+            throw new CostCapError("ClawRouter cost cap: MPP quote cannot be normalized to USD");
+          return;
+        }
+        if (!spend.coverPayment(quoteMicros)) {
+          throw new CostCapError("ClawRouter cost cap: MPP quote exceeds remaining session budget");
+        }
+      },
+      recordSigned(quoteMicros) {
+        if (quoteMicros !== undefined) spend.recordSigned(quoteMicros);
+      },
+    };
+    const budgetInit = { ...init } as RequestInit & { [key: symbol]: unknown };
+    Object.defineProperty(budgetInit, PAY_FETCH_BUDGET_CONTEXT_KEY, { value: context });
+    return inner(input, budgetInit);
+  };
+  wrapped.enforcesSpend = inner.enforcesSpend;
+  wrapped.deferStreamingHeaders = inner.deferStreamingHeaders;
+  wrapped.supportsNativeStreaming = inner.supportsNativeStreaming;
+  wrapped.isPaidResponse = inner.isPaidResponse;
+  wrapped.onNoCompletion = inner.onNoCompletion;
+  return wrapped;
 }
 
 async function proxyPaidApiRequest(
@@ -3408,7 +3476,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       [...freeIds].some((id) => toUpstreamModelId(id) === model)
     );
   };
-  const payFetch: PayFetch =
+  const selectedPayFetch: PayFetch =
     options.payFetch ??
     (authMode === "api-key"
       ? withSpendPolicy(
@@ -3440,6 +3508,8 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           },
           solanaBatch,
         }));
+
+  const payFetch = withSessionSpendBudget(selectedPayFetch, options.maxCostPerRunUsd, isFreeForCap);
 
   // Create balance monitor for pre-request checks (lazy import to avoid loading @solana/kit on Base chain)
   let balanceMonitor: AnyBalanceMonitor;

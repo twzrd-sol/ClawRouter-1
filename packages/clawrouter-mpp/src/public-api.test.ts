@@ -16,6 +16,7 @@ describe("public replay and credit APIs", () => {
     const run = () =>
       fulfillPaidProof({
         ledger,
+        networkId: "eip155:4217",
         txSignature: "verified-tx",
         challengeId: "challenge",
         upstream: model,
@@ -36,6 +37,7 @@ describe("public replay and credit APIs", () => {
     const run = () =>
       fulfillPaidProof({
         ledger,
+        networkId: "eip155:4217",
         txSignature: "verified-tx",
         challengeId: "challenge",
         upstream: model,

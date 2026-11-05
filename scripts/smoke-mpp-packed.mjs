@@ -97,6 +97,7 @@ let modelCalls = 0;
 const fulfill = () =>
   fulfillPaidProof({
     ledger: proofs,
+    networkId: "solana:mainnet-beta",
     txSignature: "verified-fixture-tx",
     challengeId,
     upstream: async () => {

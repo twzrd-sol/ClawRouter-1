@@ -423,6 +423,7 @@ describe("Solana devnet fixture, no network", () => {
 
     const res = await once();
     expect(res.status).toBe(200);
+    expect(pay.isPaidResponse?.(res)).toBe(true);
     expect(await res.json()).toEqual(COMPLETION_BODY);
     expect(res.headers.get("payment-receipt")).toBe(FIXTURE_RECEIPT);
     expect(seenPending[0]).toBeCloseTo(0.00075, 8);

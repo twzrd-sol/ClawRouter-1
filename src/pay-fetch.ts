@@ -24,6 +24,8 @@ export type PayFetch = ((input: RequestInfo | URL, init?: RequestInit) => Promis
   deferStreamingHeaders?: boolean;
   /** Request native upstream SSE for streaming callers; JSON replies still work. */
   supportsNativeStreaming?: boolean;
+  /** True when this exact successful Response was produced after a payment was signed. */
+  isPaidResponse?: (response: Response) => boolean;
   /**
    * The host found a provider error hidden in a successful HTTP response, or a
    * paid response stream failed or ended without a completion. A rail that paid

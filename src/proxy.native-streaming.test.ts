@@ -173,6 +173,25 @@ describe("native upstream delivery", () => {
     expect(rail.fn).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the shared paid stream alive when the producer disconnects but a joiner remains", async () => {
+    const rail = fixture();
+    const proxy = await start(rail.payFetch);
+    const payload = body();
+    const abort = new AbortController();
+    const original = await firstContent(await post(proxy.baseUrl, payload, abort.signal));
+    const joiner = await firstContent(await post(proxy.baseUrl, payload));
+
+    abort.abort();
+    await original.reader.read().catch(() => {});
+    const joinerWire = await rest(joiner);
+
+    expect(joinerWire).toContain('"content":"two"');
+    expect(joinerWire).toContain("data: [DONE]");
+    expect(rail.cancelled).not.toHaveBeenCalled();
+    expect(rail.payFetch.onNoCompletion).not.toHaveBeenCalled();
+    expect(rail.fn).toHaveBeenCalledTimes(1);
+  });
+
   it("retains the global deadline throughout a stalled response body", async () => {
     const rail = fixture("stall");
     const proxy = await start(rail.payFetch, 200);

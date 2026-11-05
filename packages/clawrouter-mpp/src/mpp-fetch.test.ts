@@ -310,6 +310,7 @@ describe("OpenRouter Tempo fixture, no network", () => {
 
     const res = await once();
     expect(res.status).toBe(200);
+    expect(payFetch.isPaidResponse?.(res)).toBe(true);
     expect(await res.json()).toEqual(COMPLETION_BODY);
     expect(res.headers.get("payment-receipt")).toBe(FIXTURE_RECEIPT);
     expect(signed).toEqual(["fixture-challenge-id"]);

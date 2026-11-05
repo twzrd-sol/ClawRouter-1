@@ -35,6 +35,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 // hooks check and record against it (see session-spend.ts).
 const paymentStore = new AsyncLocalStorage<{
   amountUsd: number;
+  attemptPaid: boolean;
   estimatedUsd?: number;
   sessionSpend?: SessionSpend;
   /** Signature mark of the Solana batch pay() in progress (see solanaBatch.begin). */
@@ -3089,7 +3090,10 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       const amountUsd = amountMicros / 1_000_000;
       // Write to request-scoped store (if available)
       const store = paymentStore.getStore();
-      if (store) store.amountUsd = amountUsd;
+      if (store) {
+        store.amountUsd = amountUsd;
+        store.attemptPaid = true;
+      }
       console.log(
         `[ClawRouter] Payment signed on ${chain} (${network}) — $${amountUsd.toFixed(6)}`,
       );
@@ -3158,16 +3162,21 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           if (store && outcome.chargedMicros !== undefined) {
             store.amountUsd = microsToUsd(outcome.chargedMicros);
           }
+          if (store) store.attemptPaid = true;
           if (spend && mark !== undefined && spend.signatureMark() > mark) {
             spend.voidSignedSince(mark, true);
             // No receipt, no proof of the charge: the signed ceiling stays.
             if (outcome.chargedMicros !== undefined) spend.settleLastSigned(outcome.chargedMicros);
           }
         } else if (outcome.kind === "not_charged") {
-          if (store) store.amountUsd = 0;
+          if (store) {
+            store.amountUsd = 0;
+            store.attemptPaid = false;
+          }
           if (spend && mark !== undefined) spend.voidSignedSince(mark, false);
-        } else if (spend && mark !== undefined) {
-          spend.voidSignedSince(mark, true);
+        } else {
+          if (store) store.attemptPaid = true;
+          if (spend && mark !== undefined) spend.voidSignedSince(mark, true);
         }
       },
     };
@@ -3223,7 +3232,11 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
           onPayment: options.onPayment,
           // A 402 answer to a signed payment means the gateway declined it and
           // nothing settled — take it back off the session's budget.
-          onPaymentDeclined: () => paymentStore.getStore()?.sessionSpend?.voidLastSigned(),
+          onPaymentDeclined: () => {
+            const store = paymentStore.getStore();
+            if (store) store.attemptPaid = false;
+            store?.sessionSpend?.voidLastSigned();
+          },
           solanaBatch,
         }));
 
@@ -3292,7 +3305,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     // Wrap in paymentStore.run() so x402 hook can write actual payment amount per-request
-    const handled: Promise<void> = paymentStore.run({ amountUsd: 0 }, async () => {
+    const handled: Promise<void> = paymentStore.run({ amountUsd: 0, attemptPaid: false }, async () => {
       // Add stream error handlers to prevent server crashes
       req.on("error", (err) => {
         console.error(`[ClawRouter] Request stream error: ${err.message}`);
@@ -4801,6 +4814,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
 type ModelRequestResult = {
   success: boolean;
   response?: Response;
+  responseWasPaid?: boolean;
   errorBody?: string;
   errorStatus?: number;
   isProviderError?: boolean;
@@ -4873,6 +4887,25 @@ async function tryModelRequest(
   signal: AbortSignal,
   catalogReasoning = false,
 ): Promise<ModelRequestResult> {
+  // Payment identity is attempt-scoped. A prior paid attempt must not make a
+  // later unpaid/free fallback look paid when deciding whether it can retry.
+  const requestPayment = paymentStore.getStore();
+  if (requestPayment) requestPayment.attemptPaid = false;
+  const paidNoCompletion = (message: string): ModelRequestResult => ({
+    success: false,
+    errorBody: JSON.stringify({
+      error: {
+        message,
+        type: "payment_settled_no_completion",
+        code: "payment_settled_no_completion",
+      },
+    }),
+    errorStatus: 502,
+    isProviderError: false,
+    errorCategory: "payment_error",
+    paymentInDoubt: true,
+  });
+
   // Update model in body and normalize messages
   let requestBody = body;
   try {
@@ -4931,8 +4964,18 @@ async function tryModelRequest(
       signal,
     });
 
+    const responseWasPaid =
+      payFetch.isPaidResponse?.(response) === true ||
+      response.headers.has(PAYMENT_RECEIPT_HEADER) ||
+      paymentStore.getStore()?.attemptPaid === true;
+
     // Check for provider errors
     if (response.status !== 200) {
+      if (responseWasPaid) {
+        const reason = `paid upstream response returned HTTP ${response.status}`;
+        payFetch.onNoCompletion?.(response, reason);
+        return paidNoCompletion(reason);
+      }
       // Clone response to read body without consuming it
       const errorBodyChunks = await readBodyWithTimeout(response.body, ERROR_BODY_READ_TIMEOUT_MS);
       const errorBody = Buffer.concat(errorBodyChunks).toString();
@@ -4963,11 +5006,20 @@ async function tryModelRequest(
         const responseBody = Buffer.concat(clonedChunks).toString();
         degradedReason = detectDegradedSuccessResponse(responseBody);
       } catch {
-        // Ignore body inspection failures and pass through response.
+        if (responseWasPaid) {
+          const reason = "paid response body could not be read to completion";
+          payFetch.onNoCompletion?.(response, reason);
+          return paidNoCompletion(reason);
+        }
+        // Ignore unpaid body inspection failures and pass through response.
       }
       if (degradedReason) {
         // Deliberately outside the inspection catch: a paid rail's terminal
         // error must reach the payment-in-doubt handler, never be swallowed.
+        if (responseWasPaid) {
+          payFetch.onNoCompletion?.(response, degradedReason);
+          return paidNoCompletion(degradedReason);
+        }
         payFetch.onNoCompletion?.(response, degradedReason);
         return {
           success: false,
@@ -4978,7 +5030,7 @@ async function tryModelRequest(
       }
     }
 
-    return { success: true, response };
+    return { success: true, response, responseWasPaid };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     if (err instanceof Error && err.name === PAYMENT_SETTLED_NO_COMPLETION) {
@@ -5017,6 +5069,9 @@ async function tryModelRequest(
         errorCategory: "payment_error",
         paymentInDoubt: true,
       };
+    }
+    if (paymentStore.getStore()?.attemptPaid === true) {
+      return paidNoCompletion(errorMsg);
     }
     if (err instanceof CostCapError) {
       // The strict session cap refused to sign this attempt (a retry or
@@ -6373,6 +6428,16 @@ async function proxyRequest(
   // Check in-flight — wait for the original request to complete
   const inflight = deduplicator.getInflight(dedupKey);
   if (inflight) {
+    const releaseConsumer = deduplicator.acquireInflightConsumer(dedupKey);
+    const onConsumerDone = () => releaseConsumer?.();
+    const cleanupConsumer = () => {
+      releaseConsumer?.();
+      res.removeListener("close", onConsumerDone);
+      res.removeListener("finish", onConsumerDone);
+    };
+    res.once("close", onConsumerDone);
+    res.once("finish", onConsumerDone);
+    if (res.destroyed) onConsumerDone();
     if (isStreaming && payFetch.supportsNativeStreaming) {
       const processing = startProcessingKeepalive(res);
       await new Promise<void>((resolve) => {
@@ -6380,6 +6445,7 @@ async function proxyRequest(
           clearInterval(processing);
           unsubscribe?.();
           res.removeListener("close", finish);
+          cleanupConsumer();
           resolve();
         };
         const unsubscribe = deduplicator.subscribeStream(dedupKey, {
@@ -6413,6 +6479,7 @@ async function proxyRequest(
         }
       } finally {
         clearInterval(waiterProcessing);
+        cleanupConsumer();
       }
       return;
     }
@@ -6449,17 +6516,28 @@ async function proxyRequest(
         res.end();
       } finally {
         clearInterval(waiterHeartbeat);
+        cleanupConsumer();
       }
       return;
     }
-    const result = await inflight;
-    res.writeHead(result.status, result.headers);
-    res.end(result.body);
+    try {
+      const result = await inflight;
+      if (canWrite(res)) {
+        res.writeHead(result.status, result.headers);
+        res.end(result.body);
+      }
+    } finally {
+      cleanupConsumer();
+    }
     return;
   }
 
   // Register this request as in-flight
-  deduplicator.markInflight(dedupKey);
+  const globalController = deduplicator.markInflight(dedupKey);
+  const releaseProducer = deduplicator.acquireInflightConsumer(dedupKey);
+  const releaseProducerConsumer = () => releaseProducer?.();
+  res.once("finish", releaseProducerConsumer);
+  res.once("close", releaseProducerConsumer);
 
   // --- Pre-request balance check ---
   // Estimate cost and check if wallet has sufficient balance
@@ -6784,29 +6862,27 @@ async function proxyRequest(
   // If a model times out individually, we fall back to the next model instead of failing.
   // Only the global timeout causes an immediate error.
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  const globalController = new AbortController();
   const timeoutId = setTimeout(() => globalController.abort(), timeoutMs);
 
-  // Abort in-flight upstream requests when the client disconnects.
-  // OpenClaw 2026.4.7+ aborts gateway requests on client disconnect;
-  // without this, ClawRouter would leave orphan upstream fetches running.
+  // Releasing this response's lease leaves shared work running for any other
+  // coalesced callers. RequestDeduplicator aborts upstream only when the last
+  // consumer disconnects.
   // Must hang off `res` "close", not `req`: on Node (verified on v24.15.0) an
   // IncomingMessage emits "close" when the request-body readable finishes, not
   // when the client hangs up. The body is fully drained above, so a `req`
   // listener would fire at body-end (or never, having missed the event) rather
   // than on disconnect. The media handlers all use `res.on("close")` for this.
-  // True once the client is gone: the response socket is destroyed without us
-  // having finished it. Used to tell a client disconnect apart from the global
-  // timeout — both surface as `globalController.signal.aborted`.
-  const clientDisconnected = () => res.destroyed && !res.writableEnded;
+  // A producer socket can disappear while a coalesced caller still needs the
+  // result. Treat the request as abandoned only when every lease is released.
+  const clientDisconnected = () => !deduplicator.hasInflightConsumers(dedupKey);
   const abortError = () =>
     clientDisconnected()
       ? new ClientDisconnectedError()
       : new Error(`Request timed out after ${timeoutMs}ms`);
   const onClientClose = () => {
     if (!res.writableEnded && !globalController.signal.aborted) {
-      console.log(`[ClawRouter] Client disconnected — aborting upstream request`);
-      globalController.abort();
+      console.log(`[ClawRouter] Client disconnected — releasing shared upstream lease`);
+      releaseProducerConsumer();
     }
   };
   res.on("close", onClientClose);
@@ -7197,7 +7273,7 @@ async function proxyRequest(
       // deadline, which would report a generic timeout and drop the dedup
       // entry so an identical retry could pay again. A client that left still
       // gets the disconnect cleanup below.
-      if (result.paymentInDoubt && !clientDisconnected()) {
+      if (result.paymentInDoubt) {
         lastError = {
           body: result.errorBody || "payment outcome unknown",
           status: result.errorStatus || 502,
@@ -7251,10 +7327,44 @@ async function proxyRequest(
 
         // Buffer the body so we can peek for degenerate output before committing
         // to this model. Non-streaming JSON responses are small; this is cheap.
-        const bodyChunks = await readBodyWithTimeout(result.response.body);
+        let bodyChunks: Uint8Array[];
+        try {
+          bodyChunks = await readBodyWithTimeout(result.response.body);
+        } catch (err) {
+          const responseWasPaid =
+            result.responseWasPaid === true ||
+            result.response.headers.has(PAYMENT_RECEIPT_HEADER);
+          if (!responseWasPaid) throw err;
+
+          let reason = "paid response body failed before completion";
+          let paymentReference: string | undefined;
+          try {
+            payFetch.onNoCompletion?.(result.response, reason);
+          } catch (paidError) {
+            if (paidError instanceof Error) reason = paidError.message;
+            paymentReference = (paidError as { reference?: string }).reference;
+          }
+          lastError = {
+            body: JSON.stringify({
+              error: {
+                message: reason,
+                type: "payment_settled_no_completion",
+                code: "payment_settled_no_completion",
+                ...(paymentReference ? { payment_reference: paymentReference } : {}),
+              },
+            }),
+            status: 502,
+            requestId: result.upstreamRequestId,
+          };
+          failedAttempts.push({ model: tryModel, reason: "payment_in_doubt", status: 502 });
+          break;
+        }
         const bodyBuf = Buffer.concat(bodyChunks);
 
-        if (isDegenerateCompletion(bodyBuf) && !isLastAttempt) {
+        const responseWasPaid =
+          result.responseWasPaid === true ||
+          result.response.headers.has(PAYMENT_RECEIPT_HEADER);
+        if (isDegenerateCompletion(bodyBuf) && !isLastAttempt && !responseWasPaid) {
           console.warn(
             `[ClawRouter] ⚠️  Degenerate output from ${tryModel} (finish_reason=length + repetition loop) — retrying with next fallback`,
           );
@@ -7266,6 +7376,11 @@ async function proxyRequest(
             status: 200,
           });
           continue;
+        }
+        if (isDegenerateCompletion(bodyBuf) && responseWasPaid) {
+          console.warn(
+            `[ClawRouter] Degenerate output from ${tryModel} after payment — returning it without a second paid attempt`,
+          );
         }
 
         // Re-wrap the buffered body so downstream code can read upstream.body normally
@@ -7671,7 +7786,7 @@ async function proxyRequest(
         const errEvent = `data: ${errPayload}\n\n`;
         safeWrite(res, errEvent);
         safeWrite(res, "data: [DONE]\n\n");
-        res.end();
+        if (canWrite(res)) res.end();
 
         const errBuf = Buffer.from(errEvent + "data: [DONE]\n\n");
         deduplicator.complete(dedupKey, {
@@ -7685,14 +7800,16 @@ async function proxyRequest(
         // The gateway's request id rides along so a failing paid call can be
         // traced upstream — the reporter of ClawRouter-Hermes#38 had a paid 500
         // on Solana and no id to hand anyone, on either side.
-        res.writeHead(errStatus, {
-          "Content-Type": "application/json",
-          "x-context-used-kb": String(originalContextSizeKB),
-          "x-context-limit-kb": String(CONTEXT_LIMIT_KB),
-          ...(lastError?.requestId ? { "x-blockrun-request-id": lastError.requestId } : {}),
-          ...(costCapRefusal ? { "X-ClawRouter-Cost-Cap-Exceeded": "1" } : {}),
-        });
-        res.end(transformedErr);
+        if (canWrite(res)) {
+          res.writeHead(errStatus, {
+            "Content-Type": "application/json",
+            "x-context-used-kb": String(originalContextSizeKB),
+            "x-context-limit-kb": String(CONTEXT_LIMIT_KB),
+            ...(lastError?.requestId ? { "x-blockrun-request-id": lastError.requestId } : {}),
+            ...(costCapRefusal ? { "X-ClawRouter-Cost-Cap-Exceeded": "1" } : {}),
+          });
+          res.end(transformedErr);
+        }
 
         deduplicator.complete(dedupKey, {
           status: errStatus,
@@ -8396,6 +8513,10 @@ async function proxyRequest(
       heartbeatInterval = undefined;
     }
 
+    // Snapshot this before removeInflight marks the entry terminal and deletes
+    // its consumer count; afterward a live timeout would look like abandonment.
+    const noConsumersAtFailure = clientDisconnected();
+
     // Remove in-flight entry so retries aren't blocked
     deduplicator.removeInflight(dedupKey);
 
@@ -8404,7 +8525,7 @@ async function proxyRequest(
     // reporting this as a 300s timeout to onError would be a lie.
     if (
       err instanceof ClientDisconnectedError ||
-      (err instanceof Error && err.name === "AbortError" && clientDisconnected())
+      (err instanceof Error && err.name === "AbortError" && noConsumersAtFailure)
     ) {
       console.log(`[ClawRouter] Request cancelled — client disconnected`);
       return;

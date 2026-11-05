@@ -139,6 +139,86 @@ describe("proxy: custom payFetch, Payment-Receipt on a paid completion", () => {
   });
 });
 
+describe("proxy: do not pay a fallback after a degenerate paid completion", () => {
+  const paidResponses = new WeakSet<Response>();
+  const paidCalls = vi.fn(async () => {
+    const response = new Response(
+      JSON.stringify({
+        id: "chatcmpl-degenerate",
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "!".repeat(80) },
+            finish_reason: "length",
+          },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+    paidResponses.add(response);
+    return response;
+  }) as unknown as PayFetch;
+  paidCalls.enforcesSpend = true;
+  paidCalls.isPaidResponse = (response) => paidResponses.has(response);
+  let proxy: Awaited<ReturnType<typeof startProxy>>;
+
+  beforeAll(async () => {
+    proxy = await startProxy(baseOptions(newControl(), paidCalls));
+  });
+  afterAll(async () => {
+    await proxy?.close();
+  });
+
+  it("returns the paid result instead of signing against a fallback model", async () => {
+    const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: chatBody,
+    });
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).toContain("!".repeat(80));
+    expect(paidCalls).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("proxy: preserve the global timeout for a connected caller", () => {
+  it("returns a timeout error instead of treating the removed in-flight entry as a disconnect", async () => {
+    const payFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init?.signal?.addEventListener("abort", () => {
+            controller.error(Object.assign(new Error("aborted"), { name: "AbortError" }));
+          });
+        },
+      });
+      return new Response(body, { headers: { "content-type": "application/json" } });
+    }) as unknown as PayFetch;
+    payFetch.enforcesSpend = true;
+    const proxy = await startProxy({
+      ...baseOptions(newControl(), payFetch),
+      requestTimeoutMs: 300,
+    });
+
+    try {
+      const res = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: chatBody,
+      });
+      const text = await res.text();
+
+      expect(res.status).toBe(502);
+      expect(text).toContain("Request timed out after 300ms");
+      expect(payFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      await proxy.close();
+    }
+  });
+});
+
 // Paid, no completion: typed 502, no receipt header invented, exactly one paid call.
 describe("proxy: custom payFetch, paid-no-completion error shape", () => {
   const payFetch = vi.fn(async () => {

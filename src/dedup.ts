@@ -19,6 +19,9 @@ export type CachedResponse = {
 type InflightEntry = {
   resolvers: Array<(result: CachedResponse) => void>;
   subscribers: Set<StreamSubscriber>;
+  controller: AbortController;
+  consumers: number;
+  terminal: boolean;
   stream?: { status: number; headers: Record<string, string>; chunks: Buffer[] };
 };
 
@@ -129,12 +132,43 @@ export class RequestDeduplicator {
     });
   }
 
-  /** Mark a request as in-flight. */
-  markInflight(key: string): void {
+  /** Mark a request as in-flight and return its shared upstream abort controller. */
+  markInflight(key: string): AbortController {
+    const controller = new AbortController();
     this.inflight.set(key, {
       resolvers: [],
       subscribers: new Set(),
+      controller,
+      consumers: 0,
+      terminal: false,
     });
+    return controller;
+  }
+
+  /**
+   * Keep shared upstream work alive while a producer or coalesced caller is
+   * still connected. Each release is idempotent; a late release after terminal
+   * completion cannot abort a finished request.
+   */
+  acquireInflightConsumer(key: string): (() => void) | undefined {
+    const entry = this.inflight.get(key);
+    if (!entry || entry.terminal) return undefined;
+    entry.consumers += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      entry.consumers = Math.max(0, entry.consumers - 1);
+      if (entry.consumers === 0 && !entry.terminal && !entry.controller.signal.aborted) {
+        entry.controller.abort();
+      }
+    };
+  }
+
+  /** True when the keyed request still has at least one connected consumer. */
+  hasInflightConsumers(key: string): boolean {
+    const entry = this.inflight.get(key);
+    return !!entry && !entry.terminal && entry.consumers > 0;
   }
 
   /** Complete an in-flight request — cache result and notify waiters. */
@@ -146,6 +180,7 @@ export class RequestDeduplicator {
 
     const entry = this.inflight.get(key);
     if (entry) {
+      entry.terminal = true;
       for (const subscriber of entry.subscribers) {
         if (!entry.stream) {
           subscriber.start(result.status, result.headers);
@@ -195,6 +230,7 @@ export class RequestDeduplicator {
   removeInflight(key: string): void {
     const entry = this.inflight.get(key);
     if (entry) {
+      entry.terminal = true;
       // Resolve waiters with a sentinel error response so they don't hang forever.
       // Waiters will see a 503 and can retry on their own.
       const errorBody = Buffer.from(

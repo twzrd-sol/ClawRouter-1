@@ -98,6 +98,11 @@ export function rejectPaidNoCompletion(response: Response, reason: string): void
   if (paid) throw fail(paid.spend, paid.call, response.status, reason);
 }
 
+/** Whether this exact successful response belongs to a signed MPP payment. */
+export function isPaidResponse(response: Response): boolean {
+  return paidResponses.has(response);
+}
+
 /** The current call's payment state; undefined outside `guardPaid`. */
 export function currentPaidCall(): PaidCall | undefined {
   return storage.getStore();

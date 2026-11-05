@@ -11,6 +11,7 @@ import {
   SpendPolicyError,
   type QuotedRequirements,
   type SpendControl,
+  type SpendRecord,
 } from "@twzrd1111/clawrouter";
 import type { PayFetch } from "./mpp-fetch.js";
 import { boundedSnippet, MppPaidNoCompletionError, paymentReference } from "./mpp-paid-failure.js";
@@ -113,6 +114,7 @@ export function createStripePayFetch(opts: StripePayFetchOptions): PayFetch {
   // One stub call per invocation. A paid failure is remembered so a repeat of this
   // fetch does not send the same charge again.
   let paidWithoutCompletion: string | undefined;
+  const paidResponses = new WeakMap<Response, { reference: string; record?: SpendRecord }>();
 
   const payFetch: PayFetch = async (input, init) => {
     const signaled = alreadyPaidReference(input, init);
@@ -156,9 +158,20 @@ export function createStripePayFetch(opts: StripePayFetchOptions): PayFetch {
       }
       throw paidNoCompletion(reference, response.status, detail);
     }
+    paidResponses.set(response, { reference, record });
     return response;
   };
 
   payFetch.enforcesSpend = spend !== undefined;
+  payFetch.isPaidResponse = (response) => paidResponses.has(response);
+  payFetch.onNoCompletion = (response, reason) => {
+    const paid = paidResponses.get(response);
+    if (!paid) return;
+    paidWithoutCompletion = paid.reference;
+    if (spend && paid.record) {
+      spend.annotateRecord(paid.record, `signed, no completion (${reason}) ref ${paid.reference}`);
+    }
+    throw paidNoCompletion(paid.reference, response.status, reason);
+  };
   return payFetch;
 }

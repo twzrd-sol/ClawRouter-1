@@ -63,18 +63,22 @@ import { SpentProofLedger, fulfillPaidProof, ReplayRejectedError } from "@twzrd1
 const proofs = new SpentProofLedger(); // share across requests in this process
 
 // First authenticate the challenge and independently verify its payment on chain.
-// Pass the verified transaction signature and challenge ID, never untrusted body fields.
+// Pass a canonical network ID plus verified transaction and challenge IDs,
+// never untrusted body fields. Example IDs: "solana:mainnet-beta", "eip155:4217".
 const completion = await fulfillPaidProof({
   ledger: proofs,
+  networkId: verifiedNetworkId,
   txSignature: verifiedSignature,
   challengeId: verifiedChallengeId,
   upstream: () => runModel(),
 });
 ```
 
-A reused pair throws `ReplayRejectedError` with `status: 409` and `code: "proof_replayed"`
-before invoking `upstream`. The synchronous claim gives concurrent duplicates one winner.
-The claim remains spent if the model fails. This helper does not verify a payment itself,
+A reused transaction or challenge on the same network throws `ReplayRejectedError` with
+`status: 409` and `code: "proof_replayed"` before invoking `upstream`. Network scope allows
+the same signature text or challenge ID to exist independently on another chain. The
+synchronous claim gives concurrent duplicates one winner. The claim remains spent if the
+model fails. This helper does not verify a payment itself,
 and installing a buyer rail cannot add replay protection to a remote seller.
 
 ## Credits for signed calls with no completion

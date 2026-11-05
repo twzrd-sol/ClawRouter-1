@@ -14,6 +14,7 @@ import {
 import {
   creditFromChallenge,
   guardPaid,
+  isPaidResponse,
   markSigned,
   MppPaidNoCompletionError,
   paymentReference,
@@ -166,6 +167,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
   payFetch.deferStreamingHeaders = true;
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
+  payFetch.isPaidResponse = isPaidResponse;
   return payFetch;
 }
 
@@ -326,5 +328,6 @@ export function createSolanaFixtureFetch(opts: SolanaFixtureFetchOptions): PayFe
   payFetch.deferStreamingHeaders = true;
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
+  payFetch.isPaidResponse = isPaidResponse;
   return payFetch;
 }

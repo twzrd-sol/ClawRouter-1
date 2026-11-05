@@ -39,6 +39,21 @@ describe("createStripePayFetch", () => {
     expect(spend.getStatus().spending.daily).toBeCloseTo(0.00075, 8);
   });
 
+  it("marks successful charges and treats a paid response without completion as terminal", async () => {
+    const http = vi.fn(async () => new Response("paid", { status: 200 }));
+    const spend = control((c) => c.setLimit("daily", 1));
+    const pay = createStripePayFetch({ quote, spend, http });
+    const response = await pay(url);
+
+    expect(pay.isPaidResponse?.(response)).toBe(true);
+    expect(() => pay.onNoCompletion?.(response, "degenerate completion")).toThrow(
+      MppPaidNoCompletionError,
+    );
+    await expect(pay(url)).rejects.toBeInstanceOf(MppPaidNoCompletionError);
+    expect(http).toHaveBeenCalledTimes(1);
+    expect(spend.getHistory()[0]?.note).toContain("degenerate completion");
+  });
+
   it("refuses an over-limit amount before the stub", async () => {
     const http = vi.fn(async () => new Response("nope", { status: 200 }));
     const spend = control((c) => c.setLimit("perRequest", 0.0005));

@@ -27,6 +27,7 @@ import {
   creditFromChallenge,
   currentPaidCall,
   guardPaid,
+  isPaidResponse,
   markSigned,
   rejectPaidNoCompletion,
 } from "./mpp-paid-failure.js";
@@ -205,6 +206,7 @@ export function createMppFetch(
   payFetch.deferStreamingHeaders = true;
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
+  payFetch.isPaidResponse = isPaidResponse;
   return payFetch;
 }
 
@@ -337,5 +339,6 @@ export function createTempoFixtureFetch(opts: TempoFixtureFetchOptions): PayFetc
   payFetch.deferStreamingHeaders = true;
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
+  payFetch.isPaidResponse = isPaidResponse;
   return payFetch;
 }

@@ -62,7 +62,7 @@ fulfillment row omits prompts, responses, credentials, and raw receipt headers; 
 field is explicitly a seller claim. Network contribution remains a separate opt-in.
 
 This integration requires `twzrd-x402-gate@0.17.0`, which is not published yet. npm's current
-`0.16.1` does not include Tempo charge evaluation or this shared-ledger adapter.
+`0.16.2` does not include Tempo charge evaluation or the shared-ledger adapter.
 
 Receipt-safe payment metadata is available through `readPaidCallEvidence(response)` for a paid
 response from this rail. The

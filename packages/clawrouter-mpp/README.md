@@ -63,6 +63,12 @@ intent match the challenge; it is not an on-chain verification. `seller_reported
 compares labels only and does not verify model identity. A failed local write does not change an
 already-paid response; `payFetch.flush()` surfaces persistence failures to the shutdown caller.
 
+Rows use schema `twzrd.mpp.fulfillment.v2`. `response_bytes` and `body_sha256` (lowercase hex
+SHA-256) describe the complete response body as the recorder read it: a JSON body read through its
+clone, or an SSE body tapped to its end. Both are `null` when the recorder did not read the body,
+it exceeded 1 MiB, or the stream was cancelled or errored before its end; a partial body is never
+hashed. The digest is of bytes the seller sent and is not a seller attestation.
+
 This candidate requires `@twzrd1111/clawrouter >=0.12.309`, including deferred streaming headers.
 The fork is the release target. Upstream PRs #545 and #546 are independent of this release.
 

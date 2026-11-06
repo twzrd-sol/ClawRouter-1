@@ -155,6 +155,8 @@ and request deadlines cancel the upstream reader and clean up coalesced callers.
 `CreditLedger` and `creditPaidNoCompletion(ledger, error, fields)` are also public for callers
 with their own ledger; `readCredits(ledger)` reads that ledger. Retrying the credit operation
 returns the same immutable row and invokes no signer. It does not retry a model request.
+Each row carries the payment `reference` from the error (or from `fields.reference`) when one
+is known, so a credit can be joined to the payment; an unknown reference is left off the row.
 
 Both ledgers are in memory, scoped to one process, and reset on restart. Credits record
 signed attempts, not confirmed settlement or redeemable balances. There is no refund, chain

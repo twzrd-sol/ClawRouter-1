@@ -93,6 +93,7 @@ describe("failure after an MPP payment was signed", () => {
         amount: challenge.request.amount,
         challengeId: "paid-stream-body-error",
         reason: "HTTP 200",
+        reference: expect.stringMatching(/^mpp-[0-9a-f]{16}$/),
       },
     ]);
     expect(history(c)).toHaveLength(1);
@@ -120,7 +121,11 @@ describe("failure after an MPP payment was signed", () => {
     expect(history(c)).toHaveLength(1); // the spend stays
     expect(history(c)[0].note).toContain("signed, no completion (HTTP 500)");
     expect(history(c)[0].note).toContain(err.reference);
-    await paidCall(c, () => new Response("model crashed", { status: 500 })).catch(() => {});
+    const firstRow = readCredits().slice(before)[0];
+    const retryErr = await paidCall(c, () => new Response("model crashed", { status: 500 })).catch(
+      (e) => e,
+    );
+    expect(retryErr).toBeInstanceOf(MppPaidNoCompletionError);
     const added = readCredits().slice(before);
     expect(added).toEqual([
       {
@@ -128,8 +133,13 @@ describe("failure after an MPP payment was signed", () => {
         amount: challenge.request.amount,
         challengeId: challenge.id,
         reason: "HTTP 500",
+        reference: err.reference,
       },
     ]);
+    // The paid-no-completion credit row joins to the same payment reference as the error,
+    // and a retry of the same payer and challenge returns the first row unchanged.
+    expect(added[0].reference).toBe(err.reference);
+    expect(added[0]).toBe(firstRow);
   });
 
   it("a never-ending error body cannot stall the failure report", async () => {

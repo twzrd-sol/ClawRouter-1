@@ -5,6 +5,8 @@ export type CreditEntry = Readonly<{
   amount: string;
   challengeId: string;
   reason: string;
+  /** Payment reference from MppPaidNoCompletionError, when one is known. Joins the row to a chain tx. */
+  reference?: string;
 }>;
 
 export class CreditLedger {

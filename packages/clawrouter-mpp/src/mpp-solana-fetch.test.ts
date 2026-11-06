@@ -321,6 +321,7 @@ describe("createSolanaMppFetch paid failures", () => {
           amount: "750",
           challengeId: "fixture-challenge-id",
           reason: "request failed",
+          reference: expect.stringMatching(/^mpp-[0-9a-f]{16}$/),
         },
       ]);
     } finally {
@@ -388,7 +389,13 @@ describe("createSolanaMppFetch paid failures", () => {
     expect(proof.payload.transaction.length).toBeGreaterThan(100);
     expect(spend.getSpending("daily")).toBeCloseTo(0.00075, 8);
     expect(readCredits().slice(before)).toEqual([
-      { payer: watched.signer.address, amount: "750", challengeId: id, reason: "HTTP 502" },
+      {
+        payer: watched.signer.address,
+        amount: "750",
+        challengeId: id,
+        reason: "HTTP 502",
+        reference: expect.stringMatching(/^mpp-[0-9a-f]{16}$/),
+      },
     ]);
   });
 
@@ -435,6 +442,7 @@ describe("createSolanaMppFetch paid failures", () => {
             amount: "750",
             challengeId: "fixture-challenge-id",
             reason: "HTTP 502",
+            reference: expect.stringMatching(/^mpp-[0-9a-f]{16}$/),
           },
         ]);
         expect(signed).toHaveBeenCalledTimes(1);
@@ -542,6 +550,7 @@ describe("Solana devnet fixture, no network", () => {
         amount: "750",
         challengeId: "fixture-challenge-id",
         reason: "HTTP 502",
+        reference: (err as MppPaidNoCompletionError).reference,
       },
     ]);
     expect(signed).toEqual(["fixture-challenge-id"]);

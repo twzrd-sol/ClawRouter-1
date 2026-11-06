@@ -92,7 +92,15 @@ describe("factory-produced rails through the streaming proxy", () => {
         expect(spend.getSpending("daily")).toBeCloseTo(0.00075, 8);
         expect(
           readCredits().filter((r) => r.payer === signer.address && r.challengeId === id),
-        ).toEqual([{ payer: signer.address, amount: "750", challengeId: id, reason: "HTTP 200" }]);
+        ).toEqual([
+          {
+            payer: signer.address,
+            amount: "750",
+            challengeId: id,
+            reason: "HTTP 200",
+            reference: expect.stringMatching(/^mpp-[0-9a-f]{16}$/),
+          },
+        ]);
       } finally {
         await proxy.close();
       }

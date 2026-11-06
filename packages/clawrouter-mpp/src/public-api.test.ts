@@ -65,10 +65,26 @@ describe("public replay and credit APIs", () => {
     const first = creditPaidNoCompletion(ledger, error, fields, { sign });
     const second = creditPaidNoCompletion(ledger, error, { ...fields, reason: "retry" }, { sign });
     expect(second).toBe(first);
-    expect(readCredits(ledger)).toEqual([fields]);
+    expect(readCredits(ledger)).toEqual([{ ...fields, reference: "fixture-ref" }]);
+    expect(first.reference).toBe(error.reference);
     expect(Object.isFrozen(first)).toBe(true);
     expect(Object.isFrozen(readCredits(ledger))).toBe(true);
     expect(sign).not.toHaveBeenCalled();
+  });
+
+  it("keeps a caller reference and never writes the unknown placeholder", () => {
+    const ledger = new CreditLedger();
+    const fields = { payer: "p", amount: "1", challengeId: "c", reason: "HTTP 502" };
+    const unknown = new MppPaidNoCompletionError("no completion", "mpp-unknown", 502);
+    expect(creditPaidNoCompletion(ledger, unknown, fields)).toEqual(fields);
+    expect("reference" in readCredits(ledger)[0]).toBe(false);
+    const known = new MppPaidNoCompletionError("no completion", "err-ref", 502);
+    const row = creditPaidNoCompletion(ledger, known, {
+      ...fields,
+      challengeId: "c2",
+      reference: "caller-ref",
+    });
+    expect(row.reference).toBe("caller-ref");
   });
 
   it("separates payers and refuses invalid credit errors", () => {

@@ -42,6 +42,28 @@ function deadlineOf(options: MppFlushOptions | undefined): number | undefined {
   return value;
 }
 
+/**
+ * Late-error ownership shared by every flush of one rail (keyed by its shared failures array).
+ * `waiters` counts flushes still waiting on each ledger promise; `claimed` holds errors a waiting
+ * flush has already taken. A flush that returned at its deadline queues a late ledger error only
+ * when no flush is still waiting on that promise and no waiter claimed the error, so an error is
+ * reported by the flush that was waiting on it, or else once by the next flush to drain.
+ */
+type LedgerOwnership = { waiters: Map<Promise<void>, number>; claimed: WeakSet<object> };
+const ownership = new WeakMap<unknown[], LedgerOwnership>();
+
+function ownershipFor(failures: unknown[]): LedgerOwnership {
+  let entry = ownership.get(failures);
+  if (!entry) {
+    entry = { waiters: new Map(), claimed: new WeakSet() };
+    ownership.set(failures, entry);
+  }
+  return entry;
+}
+
+const isObject = (value: unknown): value is object =>
+  (typeof value === "object" && value !== null) || typeof value === "function";
+
 /** Share one deadline across both stages, leaving timed-out work running with observed errors. */
 export async function flushFulfillments(
   pending: ReadonlySet<Promise<void>>,
@@ -64,32 +86,58 @@ export async function flushFulfillments(
   const wait = (task: Promise<void>) => (deadline ? Promise.race([task, deadline]) : task);
   try {
     await wait(Promise.all([...pending]).then(() => undefined));
-    let ledgerPending = true;
-    // Invoke even after expiration. A ledger error that settles while this flush is still waiting
-    // belongs to this flush alone; it never enters the shared array, so an overlapping flush
-    // cannot drain it. Only an error that settles after this flush returned at its deadline is
-    // queued in `failures` for the next explicit flush (and observed, so it cannot go unhandled).
-    let returned = false;
+    // Invoke even after expiration. An error that settles while this flush is still waiting is
+    // this flush's own and is reported here. One that settles after this flush returned at its
+    // deadline is queued in `failures` for the next explicit flush, unless another flush is still
+    // waiting on the same ledger promise or has claimed the error. Every rejection is observed,
+    // so background persistence cannot cause an unhandled rejection.
+    const owners = ownershipFor(failures);
     const ownErrors: unknown[] = [];
-    let ledger: Promise<void>;
+    let ledgerPending = true;
+    let waiting = true;
+    let source: Promise<void> | undefined;
     try {
-      ledger = Promise.resolve(integrationFlush())
-        .catch((error) => {
-          if (returned) failures.push(error);
-          else ownErrors.push(error);
+      source = Promise.resolve(integrationFlush());
+    } catch (error) {
+      ownErrors.push(error);
+      ledgerPending = false;
+    }
+    const release = () => {
+      if (!waiting) return;
+      waiting = false;
+      if (!source) return;
+      const left = (owners.waiters.get(source) ?? 1) - 1;
+      if (left > 0) owners.waiters.set(source, left);
+      else owners.waiters.delete(source);
+    };
+    let ledger: Promise<void> = Promise.resolve();
+    if (source) {
+      const observed = source;
+      owners.waiters.set(observed, (owners.waiters.get(observed) ?? 0) + 1);
+      ledger = observed
+        .catch((error: unknown) => {
+          if (waiting) {
+            ownErrors.push(error);
+            if (isObject(error)) owners.claimed.add(error);
+            const queued = failures.indexOf(error);
+            if (queued >= 0) failures.splice(queued, 1);
+          } else if (
+            !owners.waiters.get(observed) &&
+            !(isObject(error) && owners.claimed.has(error)) &&
+            !failures.includes(error)
+          ) {
+            failures.push(error);
+          }
         })
         .finally(() => {
           ledgerPending = false;
         });
-    } catch (error) {
-      ownErrors.push(error);
-      ledgerPending = false;
-      ledger = Promise.resolve();
     }
-    await wait(ledger);
-    returned = true;
-    // Dedupe by identity: an overlapping flush that already returned may have queued the same
-    // late ledger error in `failures`; report it once, here.
+    try {
+      await wait(ledger);
+    } finally {
+      release();
+    }
     const errors = [...new Set([...failures.splice(0), ...ownErrors])];
     if (expired) errors.push(new MppFlushTimeoutError(pending.size, timeoutMs!, ledgerPending));
     if (errors.length) throw new AggregateError(errors, "MPP fulfillment records did not flush");

@@ -271,4 +271,47 @@ describe("total flush deadline", () => {
     await expect(flushFulfillments(new Set(), failures, async () => {})).resolves.toBe(undefined);
     expect((await a).errors).toEqual([aError]);
   });
+
+  it("three overlapping flushes report a late shared-ledger failure once, from the waiter", async () => {
+    // Codex reproduction: A waits on shared ledger P with no deadline; B observes P and times out;
+    // C's hook rejects P and returns a resolved promise, then C drains the shared array.
+    let rejectP!: (error: unknown) => void;
+    const p = new Promise<void>((_, reject) => (rejectP = reject));
+    const failures: unknown[] = [];
+    const ledgerError = new Error("shared fsync failed");
+    let aSettled = false;
+    const a = rejection(flushFulfillments(new Set(), failures, () => p)).finally(
+      () => (aSettled = true),
+    );
+    const b = await rejection(flushFulfillments(new Set(), failures, () => p, { timeoutMs: 10 }));
+    expect(b.errors).toHaveLength(1);
+    expect(b.errors[0]).toBeInstanceOf(MppFlushTimeoutError);
+    rejectP(ledgerError);
+    await Promise.resolve(); // P's handlers (A's, then B's) have run; A has not resumed yet.
+    expect(aSettled).toBe(false);
+    // Invariant: while A still waits on P, no copy is queued, so no drain can report it twice.
+    expect(failures).toHaveLength(0);
+    await expect(
+      flushFulfillments(new Set(), failures, async () => {}, { timeoutMs: 100 }),
+    ).resolves.toBe(undefined);
+    expect((await a).errors).toEqual([ledgerError]);
+    expect(failures).toHaveLength(0);
+    await expect(flushFulfillments(new Set(), failures, async () => {})).resolves.toBe(undefined);
+  });
+
+  it("a late failure with no remaining waiter is queued once for the next flush", async () => {
+    let rejectP!: (error: unknown) => void;
+    const p = new Promise<void>((_, reject) => (rejectP = reject));
+    const failures: unknown[] = [];
+    const late = new Error("late");
+    await rejection(flushFulfillments(new Set(), failures, () => p, { timeoutMs: 10 }));
+    await rejection(flushFulfillments(new Set(), failures, () => p, { timeoutMs: 10 }));
+    rejectP(late);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(failures).toEqual([late]);
+    expect(
+      (await rejection(flushFulfillments(new Set(), failures, async () => {}))).errors,
+    ).toEqual([late]);
+    await expect(flushFulfillments(new Set(), failures, async () => {})).resolves.toBe(undefined);
+  });
 });

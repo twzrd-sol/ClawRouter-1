@@ -40,7 +40,7 @@ pending. `payFetch.flush({ timeoutMs })` bounds the entire wait for records and 
 (0 through 2,147,483,647 ms). At the deadline it still attempts the ledger flush in the background,
 then rejects with an `AggregateError` holding an `MppFlushTimeoutError`. Its `pending` field counts
 unfinished records; `ledgerPending` indicates whether ledger flushing is still in progress.
-Late ledger failures are retained for the next explicit flush. A timeout does not confirm durability.
+A late ledger failure is reported once: by a flush still waiting on that ledger, otherwise by the next explicit flush. (Ownership is tracked per ledger promise; an integration that returns a fresh wrapper promise for the same failure to each caller can still see it twice.) A timeout does not confirm durability.
 It never cancels or reads a response body, so a late reader still gets the whole paid response,
 and its record lands when that body is drained. Network contribution remains off unless separately enabled. It blocks unscored
 networks by default, including Tempo mainnet and Moderato, until TWZRD has a reputation corpus for

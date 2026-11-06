@@ -24,6 +24,7 @@ export {
   MPP_FULFILLMENT_RECORD_SCHEMA,
 } from "./mpp-fulfillment-record.js";
 export type {
+  MppBodyDigest,
   MppFulfillmentRecord,
   MppFulfillmentSink,
   MppPaymentFacts,

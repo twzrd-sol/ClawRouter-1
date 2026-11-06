@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  MPP_FULFILLMENT_MAX_BODY_BYTES,
   MPP_FULFILLMENT_RECORD_SCHEMA,
   recordMppFulfillment,
   type MppFulfillmentRecord,
@@ -281,5 +283,173 @@ describe("MPP fulfillment records", () => {
       );
       expect((await pending.result).receipt_state).toBe("invalid_format");
     }
+  });
+
+  describe("response body digest", () => {
+    const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+    function sseOf(chunks: Uint8Array[], keepOpen = false): Response {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const chunk of chunks) controller.enqueue(chunk);
+            if (!keepOpen) controller.close();
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }
+
+    it("uses the v2 schema string", () => {
+      expect(MPP_FULFILLMENT_RECORD_SCHEMA).toBe("twzrd.mpp.fulfillment.v2");
+    });
+
+    it("records byte count and sha256 of a known JSON body without consuming it", async () => {
+      const pending = nextRecord();
+      const text = '{"model":"m","note":"café"}';
+      const bytes = new TextEncoder().encode(text);
+      const response = new Response(bytes, {
+        status: 200,
+        headers: { "content-type": "application/json", "Payment-Receipt": receipt("0xabc") },
+      });
+      recordMppFulfillment(
+        { input: "https://seller.example/x", response, payment },
+        pending.resolve,
+      );
+      const [row, body] = await Promise.all([pending.result, response.text()]);
+      expect(body).toBe(text);
+      expect(row.response_bytes).toBe(28);
+      expect(row.response_bytes).toBe(bytes.byteLength);
+      expect(row.body_sha256).toBe(sha256(bytes));
+      expect(row.body_sha256).toBe(
+        "e39ff4f2dfd03d8f54a767ae4d769b5fdda2c422a589ecdc9ea49c91906f8f8d",
+      );
+    });
+
+    it("hashes a JSON body that does not parse, since every byte was read", async () => {
+      const pending = nextRecord();
+      const bytes = new TextEncoder().encode("not json");
+      recordMppFulfillment(
+        {
+          input: "https://seller.example/x",
+          response: new Response(bytes, { headers: { "content-type": "application/json" } }),
+          payment,
+        },
+        pending.resolve,
+      );
+      const row = await pending.result;
+      expect(row).toMatchObject({ response_bytes: 8, body_sha256: sha256(bytes) });
+      expect(row.seller_reported_model).toBeNull();
+    });
+
+    it("records null for a JSON body over the cap", async () => {
+      const pending = nextRecord();
+      const big = new Uint8Array(MPP_FULFILLMENT_MAX_BODY_BYTES + 1).fill(0x20);
+      const response = new Response(big, { headers: { "content-type": "application/json" } });
+      recordMppFulfillment(
+        { input: "https://seller.example/x", response, payment },
+        pending.resolve,
+      );
+      const [row, body] = await Promise.all([pending.result, response.arrayBuffer()]);
+      expect(body.byteLength).toBe(big.byteLength);
+      expect(row).toMatchObject({ response_bytes: null, body_sha256: null });
+    });
+
+    it("records null for a body the recorder does not read", async () => {
+      const pending = nextRecord();
+      recordMppFulfillment(
+        {
+          input: "https://seller.example/x",
+          response: new Response("plain", { headers: { "content-type": "text/plain" } }),
+          payment,
+        },
+        pending.resolve,
+      );
+      expect(await pending.result).toMatchObject({ response_bytes: null, body_sha256: null });
+    });
+
+    it("hashes every byte of an SSE body read to the end", async () => {
+      const pending = nextRecord();
+      const bytes = new TextEncoder().encode(
+        `event: payment-receipt\ndata: ${JSON.stringify(sessionReceipt(payment.challengeId))}\n\ndata: [DONE]\n\n`,
+      );
+      const response = recordMppFulfillment(
+        {
+          input: "https://seller.example/stream",
+          response: sseOf([bytes.slice(0, 7), bytes.slice(7, 40), bytes.slice(40)]),
+          payment: { ...payment, intent: "session" },
+        },
+        pending.resolve,
+      );
+      const [row, stream] = await Promise.all([pending.result, response.arrayBuffer()]);
+      expect(new Uint8Array(stream)).toEqual(bytes);
+      expect(row).toMatchObject({
+        receipt_state: "valid_format",
+        response_bytes: bytes.byteLength,
+        body_sha256: sha256(bytes),
+      });
+    });
+
+    it("records null for an SSE body over the cap and still forwards every byte", async () => {
+      const pending = nextRecord();
+      const chunk = new Uint8Array(512 * 1024).fill(0x0a);
+      const response = recordMppFulfillment(
+        {
+          input: "https://seller.example/stream",
+          response: sseOf([chunk, chunk, new Uint8Array([0x0a])]),
+          payment: { ...payment, intent: "session" },
+        },
+        pending.resolve,
+      );
+      const [row, stream] = await Promise.all([pending.result, response.arrayBuffer()]);
+      expect(stream.byteLength).toBe(MPP_FULFILLMENT_MAX_BODY_BYTES + 1);
+      expect(row).toMatchObject({ response_bytes: null, body_sha256: null });
+    });
+
+    it("records null for an SSE body cancelled after partial bytes", async () => {
+      const pending = nextRecord();
+      let recording: Promise<void> | undefined;
+      const response = recordMppFulfillment(
+        {
+          input: "https://seller.example/stream",
+          response: sseOf([new TextEncoder().encode("data: partial\n\n")], true),
+          payment: { ...payment, intent: "session" },
+        },
+        pending.resolve,
+        (task) => {
+          recording = task;
+        },
+      );
+      const reader = response.body!.getReader();
+      expect((await reader.read()).done).toBe(false);
+      await reader.cancel("client disconnected");
+      await recording;
+      expect(await pending.result).toMatchObject({ response_bytes: null, body_sha256: null });
+    });
+
+    it("records null for an SSE body that errors mid-stream", async () => {
+      const pending = nextRecord();
+      let sent = false;
+      const response = recordMppFulfillment(
+        {
+          input: "https://seller.example/stream",
+          response: new Response(
+            new ReadableStream<Uint8Array>({
+              pull(controller) {
+                if (!sent) {
+                  sent = true;
+                  controller.enqueue(new TextEncoder().encode("data: x\n\n"));
+                } else controller.error(new Error("upstream reset"));
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+          payment: { ...payment, intent: "session" },
+        },
+        pending.resolve,
+      );
+      await expect(response.text()).rejects.toThrow("upstream reset");
+      expect(await pending.result).toMatchObject({ response_bytes: null, body_sha256: null });
+    });
   });
 });

@@ -36,7 +36,13 @@ run asynchronously so they do not hold the response stream. `payFetch.flush?.()`
 records and fsyncs the local ledger during orderly shutdown. `startProxy` calls the rail's flush hook
 after closing its listener, and direct rail users must call `payFetch.flush()` themselves. It waits for
 active SSE responses too, so drain or cancel them before flushing; an open stream can keep the flush
-pending. Network contribution remains off unless separately enabled. It blocks unscored
+pending. `payFetch.flush({ timeoutMs })` bounds the entire wait for records and ledger persistence
+(0 through 2,147,483,647 ms). At the deadline it still attempts the ledger flush in the background,
+then rejects with an `AggregateError` holding an `MppFlushTimeoutError`. Its `pending` field counts
+unfinished records; `ledgerPending` indicates whether ledger flushing is still in progress.
+A late ledger failure is reported once: by a flush still waiting on that ledger, otherwise by the next explicit flush. (Ownership is tracked per ledger promise; an integration that returns a fresh wrapper promise for the same failure to each caller can still see it twice.) A timeout does not confirm durability.
+It never cancels or reads a response body, so a late reader still gets the whole paid response,
+and its record lands when that body is drained. Network contribution remains off unless separately enabled. It blocks unscored
 networks by default, including Tempo mainnet and Moderato, until TWZRD has a reputation corpus for
 them. The default provider also fails closed on outages; the ledger sink itself makes no network
 call. An explicit `allowUnscoredNetwork: true` requires `policy.maxAmountUsd` and returns
@@ -56,6 +62,12 @@ model label from its first JSON data event. A `valid_format` receipt means its s
 intent match the challenge; it is not an on-chain verification. `seller_reported_model_matches_request`
 compares labels only and does not verify model identity. A failed local write does not change an
 already-paid response; `payFetch.flush()` surfaces persistence failures to the shutdown caller.
+
+Rows use schema `twzrd.mpp.fulfillment.v2`. `response_bytes` and `body_sha256` (lowercase hex
+SHA-256) describe the complete response body as the recorder read it: a JSON body read through its
+clone, or an SSE body tapped to its end. Both are `null` when the recorder did not read the body,
+it exceeded 1 MiB, or the stream was cancelled or errored before its end; a partial body is never
+hashed. The digest is of bytes the seller sent and is not a seller attestation.
 
 This candidate requires `@twzrd1111/clawrouter >=0.12.309`, including deferred streaming headers.
 The fork is the release target. Upstream PRs #545 and #546 are independent of this release.
@@ -162,6 +174,9 @@ and request deadlines cancel the upstream reader and clean up coalesced callers.
 `CreditLedger` and `creditPaidNoCompletion(ledger, error, fields)` are also public for callers
 with their own ledger; `readCredits(ledger)` reads that ledger. Retrying the credit operation
 returns the same immutable row and invokes no signer. It does not retry a model request.
+Each row carries the payment `reference` from the error (or from `fields.reference`) when one
+is known, so a credit can be joined to the error and the spend record. The reference is a hash
+of the signed payload, not a chain signature; an unknown reference is left off the row.
 
 Both ledgers are in memory, scoped to one process, and reset on restart. Credits record
 signed attempts, not confirmed settlement or redeemable balances. There is no refund, chain

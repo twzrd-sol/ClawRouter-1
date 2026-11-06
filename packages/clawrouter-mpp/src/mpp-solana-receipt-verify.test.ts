@@ -33,7 +33,7 @@ const DEAD_RPC = "http://127.0.0.1:1";
 const URL_ = "https://devnet.fixture.invalid/v1/chat/completions";
 type Party = Awaited<ReturnType<typeof generateKeyPairSigner>>;
 
-async function fixture(opts: { finalizeAfter?: number } = {}) {
+async function fixture(opts: { finalizeAfter?: number; rpcTimeoutMs?: number } = {}) {
   const buyer = await generateKeyPairSigner();
   const payee = await generateKeyPairSigner();
   const sponsor = await generateKeyPairSigner();
@@ -89,23 +89,29 @@ async function fixture(opts: { finalizeAfter?: number } = {}) {
 
   let lookups = 0;
   let hold: Promise<void> | undefined;
-  const getTransaction = vi.fn(async (signature: string): Promise<RpcTransaction | null> => {
-    lookups += 1;
-    if (hold) await hold;
-    if (opts.finalizeAfter !== undefined && lookups <= opts.finalizeAfter) return null;
-    const wire = broadcast.get(signature);
-    if (!wire) return null;
-    return {
-      slot: 777,
-      blockTime: Math.floor(Date.now() / 1000),
-      meta: { err: null, innerInstructions: [] },
-      transaction: [wire, "base64"],
-    };
-  });
+  const getTransaction = vi.fn(
+    async (
+      signature: string,
+      _options?: { signal?: AbortSignal },
+    ): Promise<RpcTransaction | null> => {
+      lookups += 1;
+      if (hold) await hold;
+      if (opts.finalizeAfter !== undefined && lookups <= opts.finalizeAfter) return null;
+      const wire = broadcast.get(signature);
+      if (!wire) return null;
+      return {
+        slot: 777,
+        blockTime: Math.floor(Date.now() / 1000),
+        meta: { err: null, innerInstructions: [] },
+        transaction: [wire, "base64"],
+      };
+    },
+  );
   const real = createReceiptChainVerifier({
     cluster: "devnet",
     getTransaction,
     index: new InMemoryReceiptReferenceIndex(),
+    ...(opts.rpcTimeoutMs === undefined ? {} : { rpcTimeoutMs: opts.rpcTimeoutMs }),
   });
   const inputs: ReceiptChainVerifyInput[] = [];
   const verify: ReceiptChainVerify = Object.assign(
@@ -282,6 +288,29 @@ describe("Solana rail: receipt reference chain verification (fulfillment v3)", (
     release();
     await flushed;
     expect(f.rows[0].receipt_reference_chain_verified).toBe(true);
+  });
+
+  it("a lookup that never answers still lands the row as rpc_unavailable; the response is untouched", async () => {
+    const f = await fixture({ rpcTimeoutMs: 25 });
+    f.holdLookups(); // never released: the RPC hangs
+    const pay = await f.rail({
+      receiptVerification: { verify: f.verify, finalityWaitMs: 1000, finalityPollMs: 5 },
+    });
+    const res = await send(pay);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ model: "m", choices: [] });
+    await pay.flush();
+    expect(f.getTransaction).toHaveBeenCalledTimes(1);
+    expect(f.getTransaction.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(f.rows).toHaveLength(1);
+    expect(f.rows[0]).toMatchObject({
+      receipt_reference_chain_verified: null,
+      receipt_reference_finalized_slot: null,
+      receipt_reference_mismatch: null,
+      receipt_reference_unverified_reason: "rpc_unavailable",
+      receipt_reference_purchase_bound_reason: "chain_unverified",
+      receipt_reference_local_acceptance: null,
+    });
   });
 
   it("refuses a verifier built for another cluster, or bad finality settings, at construction", async () => {

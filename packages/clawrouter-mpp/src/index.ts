@@ -47,6 +47,7 @@ export type { CreditEntry } from "./credit-record.js";
 export { SpentProofLedger, ReplayRejectedError, fulfillPaidProof } from "./spent-proof.js";
 export {
   createReceiptChainVerifier,
+  DEFAULT_RPC_TIMEOUT_MS,
   DEFAULT_TRUSTED_USD_MINTS,
   InMemoryReceiptReferenceIndex,
   LANDING_WINDOW_SECONDS,

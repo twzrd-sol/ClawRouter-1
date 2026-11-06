@@ -11,6 +11,9 @@ pay an MPP seller over **Tempo** or **Solana** instead of x402, under ClawRouter
   unconfigured Solana rows carry them as null ("not evaluated", never "clean").
 - `createSolanaMppFetch({ receiptVerification: { verify } })` retains the transaction the buyer
   signed and chain-verifies the seller's receipt reference before writing the row.
+- Each `getTransaction` call made by the verifier has a deadline: `rpcTimeoutMs`, default 10000.
+  When it passes, the row records `null/rpc_unavailable` and the `signal` passed to the fetcher
+  aborts, so a hung RPC cannot hold the row. Pass that `signal` to `fetch()`.
 
 ## Upgrading from 0.2.0
 
@@ -98,6 +101,7 @@ const verify = createReceiptChainVerifier({
   cluster: "mainnet", // must match the rail's network; a mismatch throws at construction
   getTransaction, // your finalized getTransaction (base64, maxSupportedTransactionVersion 0)
   index, // a durable ReceiptReferenceIndex with an atomic bind
+  rpcTimeoutMs: 10_000, // per getTransaction call (the default); pass the given signal to fetch()
 });
 const payFetch = await createSolanaMppFetch({
   signer,
@@ -126,6 +130,11 @@ the verifier and writes its result into the row:
 Verification never delays or changes the response. It delays only the row and `flush()`.
 `finalityWaitMs` (default 0) re-checks a reference that is not finalized yet every `finalityPollMs`
 (default 2000); with the default, an unfinalized reference is recorded as `null/not_finalized`.
+`finalityWaitMs` is not an RPC timeout: each `getTransaction` call has its own deadline,
+`rpcTimeoutMs` on the verifier (default 10000). When it passes, the fetcher's `signal` aborts and
+the reference is recorded as `null/rpc_unavailable`. A row therefore waits at most about
+`finalityWaitMs + rpcTimeoutMs` on the chain. The reference index has no deadline, so a durable
+index must bound its own calls; `flush({ timeoutMs })` bounds only how long the caller waits.
 No RPC URL ships with the package. `InMemoryReceiptReferenceIndex` forgets on restart and is for
 tests. See `docs/receipt-chain-verify.md` for each check.
 

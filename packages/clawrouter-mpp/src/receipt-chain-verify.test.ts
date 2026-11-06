@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AccountRole,
   address,
@@ -23,11 +23,14 @@ import {
 } from "@solana/kit";
 import {
   createReceiptChainVerifier,
+  DEFAULT_RPC_TIMEOUT_MS,
   InMemoryReceiptReferenceIndex,
   LANDING_WINDOW_SECONDS,
   type ReceiptChainVerifyInput,
   type RpcTransaction,
 } from "./receipt-chain-verify.js";
+
+afterEach(() => vi.useRealTimers());
 
 const TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022 = "TokenzQdBNbLqP7VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -422,6 +425,78 @@ describe("receipt chain verification", () => {
     const { verify } = verifier(rpc(p.onChain));
     const r = await verify(input(buyer, payTo, p, { payer: stranger.address }));
     expect(r.receipt_reference_mismatch).toBe("buyer_signature_missing");
+  });
+
+  it("a getTransaction that never settles is rpc_unavailable once rpcTimeoutMs passes; its signal aborts", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo);
+    const signals: (AbortSignal | undefined)[] = [];
+    const index = new InMemoryReceiptReferenceIndex();
+    const verify = createReceiptChainVerifier({
+      cluster: "mainnet",
+      index,
+      rpcTimeoutMs: 20,
+      getTransaction: (_signature, options) => {
+        signals.push(options?.signal);
+        return new Promise<never>(() => {});
+      },
+    });
+    const r = await verify(input(buyer, payTo, p));
+    expect(r).toMatchObject({
+      receipt_reference_chain_verified: null,
+      receipt_reference_unverified_reason: "rpc_unavailable",
+      receipt_reference_mismatch: null,
+      receipt_reference_local_acceptance: null,
+    });
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(await index.owner(p.reference)).toBeUndefined();
+  });
+
+  it("a fetcher that rejects when its signal aborts is also rpc_unavailable", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo);
+    const verify = createReceiptChainVerifier({
+      cluster: "mainnet",
+      index: new InMemoryReceiptReferenceIndex(),
+      rpcTimeoutMs: 20,
+      getTransaction: (_signature, options) =>
+        new Promise((_, reject) =>
+          options?.signal?.addEventListener("abort", () => reject(options.signal?.reason)),
+        ),
+    });
+    expect((await verify(input(buyer, payTo, p))).receipt_reference_unverified_reason).toBe(
+      "rpc_unavailable",
+    );
+  });
+
+  it("an answer inside the deadline is used and leaves no timer behind", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const { verify } = verifier(rpc(p.onChain));
+    const r = await verify(input(buyer, payTo, p));
+    expect(r.receipt_reference_chain_verified).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("refuses an rpcTimeoutMs that is not a usable timer at construction", () => {
+    const index = new InMemoryReceiptReferenceIndex();
+    for (const rpcTimeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, "50"]) {
+      expect(
+        () =>
+          createReceiptChainVerifier({
+            cluster: "mainnet",
+            index,
+            rpcTimeoutMs: rpcTimeoutMs as number,
+          }),
+        String(rpcTimeoutMs),
+      ).toThrow(TypeError);
+    }
+    expect(() =>
+      createReceiptChainVerifier({ cluster: "mainnet", index, rpcTimeoutMs: 1 }),
+    ).not.toThrow();
+    expect(DEFAULT_RPC_TIMEOUT_MS).toBe(10_000);
   });
 
   it("rejects an age policy that cannot hold an honest payment at construction", () => {

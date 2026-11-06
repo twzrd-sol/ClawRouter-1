@@ -675,6 +675,7 @@ describe("OpenRouter Tempo fixture, no network", () => {
         amount: "750",
         challengeId: "fixture-challenge-id",
         reason: "HTTP 502",
+        reference: (err as MppPaidNoCompletionError).reference,
       },
     ]);
     expect(calls.length).toBeGreaterThanOrEqual(2);

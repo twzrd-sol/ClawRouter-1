@@ -38,9 +38,13 @@ export class MppPaidNoCompletionError extends Error {
   }
 }
 
+/** Placeholder reference used when no payment reference was captured. Never written to a credit row. */
+const UNKNOWN_REFERENCE = "mpp-unknown";
+
 /**
  * Record one credit for a paid call that returned no completion.
  * A retry of the same payer and challenge returns the first row.
+ * The row carries `fields.reference`, else the error's reference when one is known.
  * `sign`, when passed, is never called.
  */
 export function creditPaidNoCompletion(
@@ -53,7 +57,15 @@ export function creditPaidNoCompletion(
     throw new TypeError("credit requires MppPaidNoCompletionError");
   }
   void hooks;
-  return ledger.recordOnce(fields);
+  // The placeholder filter applies to the caller's reference too: a caller placeholder falls back
+  // to the error's reference, and the placeholder itself is never written.
+  const reference = [fields.reference, err.reference].find(
+    (value): value is string =>
+      typeof value === "string" && value !== "" && value !== UNKNOWN_REFERENCE,
+  );
+  const { reference: _dropped, ...rest } = fields;
+  void _dropped;
+  return ledger.recordOnce(reference ? { ...rest, reference } : rest);
 }
 
 export type PaidCall = {
@@ -245,7 +257,7 @@ function fail(
   detail: string,
   cause?: unknown,
 ): MppPaidNoCompletionError {
-  const reference = call.reference ?? "mpp-unknown";
+  const reference = call.reference ?? UNKNOWN_REFERENCE;
   const why = status !== undefined ? `HTTP ${status}` : "request failed";
   if (spend && call.record) {
     spend.annotateRecord(call.record, `signed, no completion (${why}) ref ${reference}`);

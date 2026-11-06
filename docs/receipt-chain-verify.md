@@ -3,19 +3,23 @@
 Sources read: ClawRouter-1 `origin/claude/twzrd-fork` = `44faf073` (CR, `packages/clawrouter-mpp/src/`), wzrd-final `origin/main` = `659476ec` (WF, `packages/twzrd-agent-intel/src/twzrd_agent_intel/`). Money path; design only, no code.
 
 ## Goal
+
 `receipt_reference` is copied from the seller's `Payment-Receipt` (CR `mpp-fulfillment-record.ts:309`) and documented as "not chain-verified here" (`:31`). `decodeReceiptObject` checks only shape: method, non-empty reference, `status == "success"`, timestamp (`:92-98`). When TWZRD sells, the reference is the settled Solana signature: `_settle_payment` sets `payment.settled_reference = sig` (WF `server_http.py:5781-5782`) and `_MppReceiptMiddleware` stamps it on 2xx (`:2219-2236`). Goal: an optional, fail-closed field saying whether that signature is a finalized USDC payment of the quoted amount to the quoted payee.
 
 ## Where the check runs
+
 - **Buyer-side optional verifier hook (primary).** It is the only independent check. Asking TWZRD to confirm its own receipt is seller self-attestation.
 - **TWZRD endpoint (secondary, labelled).** `GET /v1/receipts/by-tx/{sig}` (WF `server_http.py:8785`) and `/witness` (`:8639`) serve only TWZRD-ledger settlements, not a general RPC proxy (`:8645-8646`). A buyer may record its answer as `seller_attested`, never as `chain_verified`.
 - Recommendation: both, with separate fields. Only the buyer's own fetch can set `receipt_reference_chain_verified`.
 
 ## Inputs
+
 From the record and challenge (CR `mpp-gate.ts:22-43`, `mpp-fulfillment-record.ts:301-309`): `reference`, `network` (CAIP-2), `asset` (mint), `payTo` (owner wallet), `amountAtomic`, `challengeId`. Also `payer` (the buyer's own address, from `CreditFacts`, CR `mpp-paid-failure.ts:149`), and **the signed transaction the buyer produced for this challenge**: the `onProgress` `signed` event carries it as `event.transaction` (CR `mpp-solana-fetch.ts:192-195`, signed with `broadcast: false`). The hook must retain it per call, together with `signed_at_unix` (the buyer's own clock when that event fired) and a buyer-generated `purchase_id` for the logical purchase. The signed transaction ties a chain transaction to this buyer's signature; it does not by itself tie it to one purchase (see below).
 
 Normalization: challenge terms are seller strings. `mpp-gate.ts:28-40` copies `network` and the currency as given (for example `mainnet` and `USDC`), and `mpp-solana-fetch.ts:130-142` resolves the currency only for pricing. The verifier must normalize with the same rules the rail used to sign: network aliases to one cluster id, and a stablecoin symbol to its cluster-specific mint (the SDK resolves `USDC` at `client/Charge.js:111`). It keeps the raw terms beside the normalized ones and compares the normalized mint against the configured allowlist for that cluster.
 
 ## Binding to the buyer's signed payment (required for `chain_verified: true`)
+
 Matching payer, payee, mint and amount is not enough: a seller could return an earlier, unrecorded payment by the same buyer for the same amount, and it would pass every field check.
 
 - B1. The finalized transaction must carry the buyer's signature from the retained signed transaction, at the buyer's signer index, and its message must equal the retained message byte for byte. The SDK fixes fee payer, blockhash, instructions and the buyer signature before it serializes, and emits those bytes in the signed event (`@solana/mpp` 0.7.0 `client/Charge.js:91-94`, `:249-269`). The TWZRD seller decodes them, replaces only the sponsor signature, and broadcasts them (WF `server_http.py:5252-5256`, `:5382-5390`, `:5641-5645`); the SDK co-sign helper also preserves the message (`utils/transactions.js:27-31`). So an honest payment keeps the message.
@@ -28,29 +32,34 @@ Matching payer, payee, mint and amount is not enough: a seller could return an e
 `receipt_reference_chain_verified: true` therefore means only: the reference is a finalized, successful transaction carrying this buyer's signature over the exact message it signed for this call, with the expected transfer under trusted terms. It does not mean the payment belongs to this purchase alone (see `receipt_reference_purchase_bound`), and it does not mean the seller delivered anything. The field checks below stay as consistency checks: necessary, not sufficient.
 
 ## Checks (all must pass for `chain_verified: true`, together with B1)
+
 1. `reference` is base58 and decodes to 64 bytes.
 2. `network` is Solana mainnet or devnet; the fetcher is for that cluster.
 3. `getTransaction(reference, {commitment: "finalized", encoding: "base64", maxSupportedTransactionVersion: 0})` returns non-null (same rule as WF `settlement_witness.py:278-279`; version support as at `:268`; the SDK always builds v0, `client/Charge.js:256`). One request: B1 compares the wire message bytes, and checks 6-7 decode the token instructions locally from the same bytes, so jsonParsed is not used.
 4. `meta.err` is null (`settlement_witness.py:285-286`).
 5. The transaction's first signature equals `reference` (same idea as `build_witness_ref`, `settlement_witness.py:115-117`). In pull mode that is the sponsor's signature, which is why B1 checks the buyer's signature separately.
 6. Splits: when the challenge carries split recipients, v1 returns `null/splits_unsupported`. The SDK subtracts splits from the primary amount and pays them separately (`client/Charge.js:125-127`, `:218`, `:224-226`), so a primary-amount check would fail an honest split payment. A later version can verify the full allocation from the retained split terms. Without splits: exactly one `transferChecked` instruction (outer and inner) with `mint == asset`, `destination == ATA(payTo, asset)`, and `tokenAmount.amount == amountAtomic`. Bare `transfer` is a mismatch. WF parsers accept both (`server_http.py:4488`, `aop_bind_settlement.py:174`), so this rule is stricter on purpose. ATA derivation has a WF precedent (`aop_bind_settlement.py:122`).
-6a. Trusted configuration, not the transaction, decides what counts: the instruction's program ID must be SPL Token or Token-2022 from a configured allowlist; `asset` must be in the configured USD mint set (CR `DEFAULT_SOLANA_USD_MINTS`, `mpp-solana-fetch.ts:42`) as well as equal to the challenge's asset; and `tokenAmount.decimals` must equal the configured decimals for that mint (6 for USDC). The ATA is derived with the allowlisted program, not one read from the transaction.
+   6a. Trusted configuration, not the transaction, decides what counts: the instruction's program ID must be SPL Token or Token-2022 from a configured allowlist; `asset` must be in the configured USD mint set (CR `DEFAULT_SOLANA_USD_MINTS`, `mpp-solana-fetch.ts:42`) as well as equal to the challenge's asset; and `tokenAmount.decimals` must equal the configured decimals for that mint (6 for USDC). The ATA is derived with the allowlisted program, not one read from the transaction.
 7. Payer binding: the matching transfer's `authority` equals the buyer's `payer`. Without it a seller can return any finalized payment of the same amount to itself.
 
 ## Output fields
+
 Three independent results, each with its own reason field. No result is derived by overwriting another.
 
 Chain facts (on-chain evidence only):
+
 - `receipt_reference_chain_verified`: `true | false | null` (payment-level, as defined above)
 - `receipt_reference_finalized_slot`: number or null (`slot` from getTransaction)
 - `receipt_reference_mismatch`: null, or one of `bad_reference_format`, `wrong_network`, `signature_mismatch`, `message_mismatch`, `buyer_signature_missing`, `untrusted_token_program`, `untrusted_mint`, `decimals_mismatch`, `tx_failed`, `no_matching_transfer`, `multiple_matching_transfers`, `amount_mismatch`, `mint_mismatch`, `payee_mismatch`, `payer_mismatch` (qualifies `chain_verified: false`)
 - `receipt_reference_unverified_reason`: null, or `rpc_unavailable`, `not_finalized`, `no_fetcher`, `non_solana`, `no_signed_transaction`, `splits_unsupported`, `unnormalized_terms` (qualifies `chain_verified: null`)
 
 Purchase binding:
+
 - `receipt_reference_purchase_bound`: `true | false | null`. `true` only when the signed message carries a buyer nonce (open question 1) and the on-chain nonce equals this purchase's nonce.
 - `receipt_reference_purchase_bound_reason`: null when `true`; `nonce_mismatch` with `false`; `no_buyer_nonce` (always, today) or `chain_unverified` with `null`.
 
 Local acceptance (this sink's policy, not chain evidence):
+
 - `receipt_reference_local_acceptance`: `accepted | refused | null`.
 - `receipt_reference_refusal_reason`: null, or `reference_reused`, `stale_by_local_clock`.
 
@@ -59,6 +68,7 @@ Precedence: `chain_verified` and `purchase_bound` are computed from chain bytes 
 Rule: an RPC failure, a timeout, a null result, no configured fetcher, or a non-Solana method gives `null` with a reason. It is never `true`. `chain_verified: false` comes from exactly two sources: a definitive input-validation failure that no chain answer could fix (`bad_reference_format`, `wrong_network`), or a definitive on-chain answer that contradicts the inputs (every other `mismatch` code). Local refusals (age, reuse) live only in `local_acceptance` and never become a `mismatch`. This matches the WF split between "unavailable" and a definitive answer (`settlement_witness.py:189-210`). A `receipt_state` other than `valid_format` (CR `mpp-fulfillment-record.ts:28`) is never verified.
 
 ## Failure modes and replay
+
 - **Same reference across records.** The seller dedupes by signature (`x402_payment_receipts` keyed by tx signature, WF `server_http.py:4137-4139`). The buyer has no equivalent today. The sink should keep a reference -> `purchase_id` index, keyed by the buyer-generated purchase id, not the seller's challenge id (a seller can repeat a challenge id, and `mpp-solana-fetch.ts:87-88` deliberately shares one credential across identical challenges). A second purchase that reports an already-bound reference gets `local_acceptance: refused/reference_reused`; its chain fields are unchanged. Retries of the same purchase are idempotent. The bind must be atomic (one winner under concurrency), and the index must persist and be retained at least as long as receipts are verified; an in-memory index forgets on restart.
 - **Borrowed payment.** Without check 7, another buyer's payment that matches on payee and amount would pass.
 - **Historical payment by the same buyer.** Checks 6-7 and the reuse index all pass for an earlier payment this buyer made for the same amount to the same payee, if this sink never recorded it. B1 rejects it when its message differs. When the seller replays an identical message (same request, `externalId` and blockhash), B1 passes; B4 refuses only clearly old transactions, and only as local policy; and the reuse index catches only references this sink already bound. That case is why `purchase_bound` stays null without a buyer nonce. (Reviews, codex 2026-11-06.)
@@ -66,18 +76,21 @@ Rule: an RPC failure, a timeout, a null result, no configured fetcher, or a non-
 - **Late finality.** The receipt can arrive before the transaction is finalized. The hook records `null/not_finalized` and leaves any retry to the caller. It must not block or delay the response (the record path is non-blocking, `mpp-fulfillment-record.ts:328-333`).
 
 ## Privacy and RPC cost
+
 - The package ships no RPC URL and no key. The caller passes `verifyReference?: (facts) => Promise<Result>` or a `getTransaction` fetcher, matching the injectable-transport pattern (`mpp-solana-fetch.ts:4`, `:63-64`).
 - Cost is one `getTransaction` per paid record, and only when the hook is configured.
 - The fetch reveals interest in the signature to the buyer's RPC provider.
 - WF's witness RPC selection (`settlement_witness.py:156-187`) is server-side and must not move into the package.
 
 ## Test plan
+
 - Fixture verifier with a stub fetcher (no network). Use the mainnet x402 example in `~/ops-history/manual-checks/2026-11-06-trust-dogfood/trust.json`: tx `5Aetec1b...`, `proof.as_of_slot` 465968062, `proof.net_amount.raw` 50000, mint `EPjFWdd5...`. Capture its base64 getTransaction (`maxSupportedTransactionVersion: 0`) once as a fixture. It is x402, so it exercises checks 3-7 and decoding; B1 also needs an MPP pair: the retained partial wire bytes from a signed event and the finalized co-signed wire bytes of the same payment.
 - Cases: pass (on-chain message equals the retained signed message); historical payment by the same buyer, same amount and payee, different message -> `false/message_mismatch`; same message re-signed under a different challenge id, earlier finalized reference older than `max_age_seconds` -> `chain_verified: true`, `local_acceptance: refused/stale_by_local_clock`; the same replay inside `max_age_seconds` -> `chain_verified: true`, `purchase_bound: null/no_buyer_nonce`, `local_acceptance: accepted` (asserts the narrowed meaning); two overlapping purchases with one shared transaction -> second bind `chain_verified: true`, `local_acceptance: refused/reference_reused`; same challenge id, distinct purchase ids -> second `refused/reference_reused`; concurrent duplicate binds -> exactly one `accepted`; B4 fixtures are expressed as `age = signed_at_unix - blockTime`: `age` = `max_age_seconds` -> `accepted`; `age` = `max_age_seconds` + 1 -> `chain_verified: true`, `refused/stale_by_local_clock`, never a `mismatch`; negative `age` (buyer clock behind) -> `accepted`. Clock offset and landing delay are tested separately and combined: offset 0, +/-30 s and +/-`max_clock_skew_seconds` with landing delays of 0, 2 and 90 s -> `accepted`; offset +601 s with a 2 s delay (`age` 599) -> `accepted`; offset +605 s with a 2 s delay (`age` 603) -> `refused/stale_by_local_clock` (documented heuristic false refusal); `bad_reference_format` and `wrong_network` -> `chain_verified: false` with no RPC call; `blockTime` null -> B4 silent; config with `max_age_seconds` not above skew plus landing window -> rejected at startup; no case sets `mismatch` from B4 or the reuse index; honest `mainnet` + `USDC` alias challenge -> normalizes and passes; honest split payment -> `null/splits_unsupported`; buyer signature absent -> `false/buyer_signature_missing`; no retained signed transaction -> `null/no_signed_transaction`; program ID outside the allowlist; mint outside the USD set; decimals differ; `meta.err` set; null result -> `null/not_finalized`; fetcher throws -> `null/rpc_unavailable`; amount off by one; wrong mint; destination is the ATA of another owner; bare `transfer`; two matching transfers; first signature differs; authority is not the payer; same reference on two records -> `refused/reference_reused`; no fetcher -> `null/no_fetcher`.
 - Property: no input path gives `true` when the fetcher rejected or returned null.
 - No live MPP check: it needs an operator-authorized payment.
 
 ## Open questions
+
 1. Can the buyer put its own nonce inside the signed message (for example its own memo derived from its `purchase_id` or fresh buyer entropy)? A nonce derived only from `challenge.id` is insufficient, because the seller controls that id and can repeat it. `@solana/mpp` 0.7.0 takes the memo `externalId` from the seller (`client/Charge.js:140-151`), so this needs SDK support. With it, `purchase_bound` can be `true`; without it, it cannot. TWZRD's seller already issues a fresh `externalId` per challenge (WF `server_http.py:4239`; flow comment `:4130-4133`).
 2. Resolved by B1: the buyer's signature is required, and the message must equal the one it signed.
 3. Should `transferChecked`-only be relaxed for sellers whose WF parsers accept bare `transfer`?

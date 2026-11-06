@@ -100,8 +100,17 @@ assert.equal(signerCalls, 1);
 assert.equal(credentials.length, 2);
 assert.equal(credentials[0], credentials[1]);
 assert.equal(Credential.deserialize(credentials[0]).challenge.id, challengeId);
+// Credit rows carry the payment reference: `mpp-` plus a short hash of the signed payload. It is
+// not a chain signature and is never the `mpp-unknown` placeholder.
+const PAYMENT_REFERENCE = /^mpp-[0-9a-f]{16}$/;
+const withoutReference = ({ reference, ...row }) => {
+  assert.match(reference, PAYMENT_REFERENCE);
+  return row;
+};
 const rows = readCredits();
-assert.deepEqual(rows, [{ payer: payer.address, amount: "750", challengeId, reason: "HTTP 502" }]);
+assert.deepEqual(rows.map(withoutReference), [
+  { payer: payer.address, amount: "750", challengeId, reason: "HTTP 502" },
+]);
 
 const proofs = new SpentProofLedger();
 let modelCalls = 0;
@@ -291,7 +300,9 @@ for (const [stream, native] of [
     else assert.equal((await response.json()).error.type, "payment_settled_no_completion");
     assert.equal(attempts, 2); // probe + paid response; no fallback payment
     assert.deepEqual(
-      readCredits().filter((row) => row.payer === payer.address && row.challengeId === id),
+      readCredits()
+        .filter((row) => row.payer === payer.address && row.challengeId === id)
+        .map(withoutReference),
       [{ payer: payer.address, amount: "750", challengeId: id, reason: "HTTP 200" }],
     );
     degradedPaidStops++;

@@ -16,10 +16,10 @@ const twzrdMpp = createTwzrdMppIntegration({
 
 // Tempo (needs `mppx`); alternatively use createSolanaMppFetch with the same hooks.
 const payFetch = createMppFetch(account, fetch, { spend, integration: twzrdMpp });
+const proxy = await startProxy({ spendControl: spend, payFetch /* ... */ });
 
-await startProxy({ spendControl: spend, payFetch /* ... */ });
-// On orderly shutdown, flush pending local ledger rows:
-await payFetch.flush?.();
+// proxy.close() closes the listener, then drains the rail's pending ledger writes.
+await proxy.close();
 ```
 
 The supported setup uses the integration helper returned by `createTwzrdMppIntegration`.
@@ -33,9 +33,10 @@ hooks before loading payment SDKs.
 The integration writes the pre-sign decision durably to `.twzrd/decisions.jsonl` before allowing
 credential creation, then appends the projected MPP receipt to that same file. Fulfillment writes
 run asynchronously so they do not hold the response stream. `payFetch.flush?.()` waits for pending
-records and fsyncs the local ledger during orderly shutdown. It waits for active SSE responses too,
-so drain or cancel them before flushing; an open stream can keep the flush pending. The integration
-also flushes on `beforeExit`; network contribution remains off unless separately enabled. It blocks unscored
+records and fsyncs the local ledger during orderly shutdown. `startProxy` calls the rail's flush hook
+after closing its listener, and direct rail users must call `payFetch.flush()` themselves. It waits for
+active SSE responses too, so drain or cancel them before flushing; an open stream can keep the flush
+pending. Network contribution remains off unless separately enabled. It blocks unscored
 networks by default, including Tempo mainnet and Moderato, until TWZRD has a reputation corpus for
 them. The default provider also fails closed on outages; the ledger sink itself makes no network
 call. An explicit `allowUnscoredNetwork: true` requires `policy.maxAmountUsd` and returns

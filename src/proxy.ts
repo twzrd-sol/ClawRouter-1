@@ -2709,9 +2709,7 @@ function withSessionSpendBudget(
     const context: PayFetchBudgetContext = {
       assertPaymentAllowed(quoteMicros) {
         if (quoteMicros === undefined) {
-          if (spend.isStrict)
-            throw new CostCapError("ClawRouter cost cap: MPP quote cannot be normalized to USD");
-          return;
+          throw new CostCapError("ClawRouter cost cap: MPP quote cannot be normalized to USD");
         }
         if (!spend.coverPayment(quoteMicros)) {
           throw new CostCapError("ClawRouter cost cap: MPP quote exceeds remaining session budget");
@@ -2730,6 +2728,7 @@ function withSessionSpendBudget(
   wrapped.supportsNativeStreaming = inner.supportsNativeStreaming;
   wrapped.isPaidResponse = inner.isPaidResponse;
   wrapped.onNoCompletion = inner.onNoCompletion;
+  wrapped.flush = inner.flush;
   return wrapped;
 }
 
@@ -5074,29 +5073,54 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
     authMode,
     ...(apiKey ? { apiKeyLabel: maskApiKey(apiKey) } : {}),
     balanceMonitor,
-    close: () =>
-      new Promise<void>((res, rej) => {
-        const timeout = setTimeout(() => {
-          rej(new Error("[ClawRouter] Close timeout after 4s"));
-        }, 4000);
+    close: async () => {
+      const closeServer = () =>
+        new Promise<void>((res, rej) => {
+          const timeout = setTimeout(() => {
+            rej(new Error("[ClawRouter] Close timeout after 4s"));
+          }, 4000);
 
-        catalogClosed = true;
-        clearInterval(catalogTimer);
-        sessionStore.close();
-        // Destroy all active connections before closing server
-        for (const socket of connections) {
-          socket.destroy();
-        }
-        connections.clear();
-        server.close((err) => {
-          clearTimeout(timeout);
-          if (err) {
-            rej(err);
-          } else {
-            res();
+          catalogClosed = true;
+          clearInterval(catalogTimer);
+          sessionStore.close();
+          // Destroy all active connections before closing server
+          for (const socket of connections) {
+            socket.destroy();
           }
+          connections.clear();
+          server.close((err) => {
+            clearTimeout(timeout);
+            if (err) {
+              rej(err);
+            } else {
+              res();
+            }
+          });
         });
-      }),
+
+      let closeError: unknown;
+      try {
+        await closeServer();
+      } catch (err) {
+        closeError = err;
+      }
+
+      let flushError: unknown;
+      try {
+        await payFetch.flush?.();
+      } catch (err) {
+        flushError = err;
+      }
+
+      if (closeError && flushError) {
+        throw new AggregateError(
+          [closeError, flushError],
+          "Proxy close and payment rail flush failed",
+        );
+      }
+      if (closeError) throw closeError;
+      if (flushError) throw flushError;
+    },
   };
 }
 

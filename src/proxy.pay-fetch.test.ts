@@ -88,6 +88,79 @@ describe("proxy: custom payFetch that does not enforce spend limits", () => {
   });
 });
 
+describe("proxy: custom payFetch shutdown", () => {
+  it("flushes the rail after the server closes", async () => {
+    const flush = vi.fn(async () => {});
+    const payFetch = Object.assign(
+      vi.fn(async () => new Response("ok")),
+      {
+        enforcesSpend: true,
+        flush,
+      },
+    ) as unknown as PayFetch;
+    const proxy = await startProxy(baseOptions(newControl(), payFetch));
+
+    await proxy.close();
+
+    expect(flush).toHaveBeenCalledOnce();
+  });
+
+  it("reports rail flush failures to the orderly shutdown caller", async () => {
+    const flush = vi.fn(async () => {
+      throw new Error("ledger flush failed");
+    });
+    const payFetch = Object.assign(
+      vi.fn(async () => new Response("ok")),
+      {
+        enforcesSpend: true,
+        flush,
+      },
+    ) as unknown as PayFetch;
+    const proxy = await startProxy(baseOptions(newControl(), payFetch));
+
+    await expect(proxy.close()).rejects.toThrow("ledger flush failed");
+    expect(flush).toHaveBeenCalledOnce();
+  });
+});
+
+describe("proxy: unpriceable MPP quote with a session cap", () => {
+  it("refuses to sign in graceful mode when the quote cannot be normalized", async () => {
+    const budgetKey = Symbol.for("twzrd.clawrouter.pay-fetch-budget.v1");
+    let signed = false;
+    const payFetch = Object.assign(
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const context = (init as (RequestInit & { [key: symbol]: unknown }) | undefined)?.[
+          budgetKey
+        ] as { assertPaymentAllowed: (quoteMicros: bigint | undefined) => void } | undefined;
+        context?.assertPaymentAllowed(undefined);
+        signed = true;
+        return new Response("ok");
+      }),
+      { enforcesSpend: true },
+    ) as unknown as PayFetch;
+    const proxy = await startProxy({
+      ...baseOptions(newControl(), payFetch),
+      maxCostPerRunUsd: 0.25,
+      maxCostPerRunMode: "graceful",
+    });
+
+    const response = await fetch(`${proxy.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-session-id": "unpriced-graceful-cap" },
+      body: JSON.stringify({
+        model: "acme/not-in-catalog",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    await response.text();
+    await proxy.close();
+
+    expect(response.status).toBe(429);
+    expect(signed).toBe(false);
+  });
+});
+
 const chatBody = JSON.stringify({
   model: "blockrun/auto",
   max_tokens: 8,

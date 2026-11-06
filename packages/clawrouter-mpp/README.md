@@ -36,10 +36,13 @@ run asynchronously so they do not hold the response stream. `payFetch.flush?.()`
 records and fsyncs the local ledger during orderly shutdown. `startProxy` calls the rail's flush hook
 after closing its listener, and direct rail users must call `payFetch.flush()` themselves. It waits for
 active SSE responses too, so drain or cancel them before flushing; an open stream can keep the flush
-pending. `payFetch.flush({ timeoutMs })` bounds that wait: at the deadline it still flushes the ledger,
-then rejects with an `AggregateError` holding an `MppFlushTimeoutError` (`pending` counts records not
-yet written). It never cancels or reads a response body, so a late reader still gets the whole paid
-response, and its record lands when that body is drained. Network contribution remains off unless separately enabled. It blocks unscored
+pending. `payFetch.flush({ timeoutMs })` bounds the entire wait for records and ledger persistence
+(0 through 2,147,483,647 ms). At the deadline it still attempts the ledger flush in the background,
+then rejects with an `AggregateError` holding an `MppFlushTimeoutError`. Its `pending` field counts
+unfinished records; `ledgerPending` indicates whether ledger flushing is still in progress.
+Late ledger failures are retained for the next explicit flush. A timeout does not confirm durability.
+It never cancels or reads a response body, so a late reader still gets the whole paid response,
+and its record lands when that body is drained. Network contribution remains off unless separately enabled. It blocks unscored
 networks by default, including Tempo mainnet and Moderato, until TWZRD has a reputation corpus for
 them. The default provider also fails closed on outages; the ledger sink itself makes no network
 call. An explicit `allowUnscoredNetwork: true` requires `policy.maxAmountUsd` and returns

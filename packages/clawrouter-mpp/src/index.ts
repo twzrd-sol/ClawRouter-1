@@ -13,7 +13,10 @@ export type { MppFetchOptions, PayFetch } from "./mpp-fetch.js";
 export { MppFlushTimeoutError } from "./mpp-flush.js";
 export type { MppFlushOptions, MppPayFetch } from "./mpp-flush.js";
 export { createSolanaMppFetch, DEFAULT_SOLANA_USD_MINTS } from "./mpp-solana-fetch.js";
-export type { SolanaMppFetchOptions } from "./mpp-solana-fetch.js";
+export type {
+  SolanaMppFetchOptions,
+  SolanaReceiptVerificationOptions,
+} from "./mpp-solana-fetch.js";
 export { MppGateError } from "./mpp-gate.js";
 export type {
   MppGateChallenge,
@@ -24,12 +27,14 @@ export type {
 export {
   MPP_FULFILLMENT_MAX_BODY_BYTES,
   MPP_FULFILLMENT_RECORD_SCHEMA,
+  RECEIPT_REFERENCE_NOT_EVALUATED,
 } from "./mpp-fulfillment-record.js";
 export type {
   MppBodyDigest,
   MppFulfillmentRecord,
   MppFulfillmentSink,
   MppPaymentFacts,
+  MppReceiptReferenceVerification,
 } from "./mpp-fulfillment-record.js";
 export {
   MppPaidNoCompletionError,
@@ -52,6 +57,7 @@ export type {
   GetFinalizedTransaction,
   ReceiptChainVerification,
   ReceiptChainVerifierConfig,
+  ReceiptChainVerify,
   ReceiptChainVerifyInput,
   ReceiptReferenceIndex,
   RpcTransaction,

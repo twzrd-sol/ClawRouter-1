@@ -66,7 +66,9 @@ export type ChainUnverifiedReason =
   | "no_signed_transaction"
   | "splits_unsupported"
   | "unnormalized_terms"
-  | "unsupported_message_format";
+  | "unsupported_message_format"
+  /** The verifier itself threw; recorded by the fulfillment hook, never returned by `verify`. */
+  | "verifier_error";
 
 export type ReceiptChainVerification = {
   receipt_reference_chain_verified: boolean | null;
@@ -190,8 +192,13 @@ function clusterOf(network: string): SolanaCluster | undefined {
   return undefined;
 }
 
+/** A built verifier. `cluster` lets a rail refuse a verifier configured for another cluster. */
+export type ReceiptChainVerify = ((
+  input: ReceiptChainVerifyInput,
+) => Promise<ReceiptChainVerification>) & { readonly cluster: SolanaCluster };
+
 /** Build a verifier. Throws when the age policy cannot hold an honest payment. */
-export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
+export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig): ReceiptChainVerify {
   const maxAge = config.maxAgeSeconds ?? 600;
   const skew = config.maxClockSkewSeconds ?? 60;
   if (!Number.isFinite(maxAge) || !Number.isFinite(skew) || skew < 0) {
@@ -207,7 +214,7 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
   const cluster = config.cluster;
   if (!(cluster in CLUSTER_IDS)) throw new TypeError(`unknown cluster ${String(cluster)}`);
 
-  return async function verify(input: ReceiptChainVerifyInput): Promise<ReceiptChainVerification> {
+  async function verify(input: ReceiptChainVerifyInput): Promise<ReceiptChainVerification> {
     const chain = await chainFacts(input);
     const verified = chain.receipt_reference_chain_verified;
     const purchase: Pick<
@@ -253,7 +260,7 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
       receipt_reference_local_acceptance: acceptance,
       receipt_reference_refusal_reason: refusal,
     };
-  };
+  }
 
   type Chain = Pick<
     ReceiptChainVerification,
@@ -430,6 +437,8 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
     if (source !== expectedSource) return at(false, "payer_mismatch");
     return at(true, null);
   }
+
+  return Object.freeze(Object.assign(verify, { cluster }));
 }
 
 function decodeWire(

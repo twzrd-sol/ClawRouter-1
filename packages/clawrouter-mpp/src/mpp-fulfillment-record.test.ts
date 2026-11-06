@@ -300,8 +300,8 @@ describe("MPP fulfillment records", () => {
       );
     }
 
-    it("uses the v2 schema string", () => {
-      expect(MPP_FULFILLMENT_RECORD_SCHEMA).toBe("twzrd.mpp.fulfillment.v2");
+    it("uses the v3 schema string", () => {
+      expect(MPP_FULFILLMENT_RECORD_SCHEMA).toBe("twzrd.mpp.fulfillment.v3");
     });
 
     it("records byte count and sha256 of a known JSON body without consuming it", async () => {
@@ -451,5 +451,148 @@ describe("MPP fulfillment records", () => {
       await expect(response.text()).rejects.toThrow("upstream reset");
       expect(await pending.result).toMatchObject({ response_bytes: null, body_sha256: null });
     });
+  });
+});
+
+describe("MPP fulfillment record: receipt reference verification (v3)", () => {
+  const VERIFIED = {
+    receipt_reference_chain_verified: true,
+    receipt_reference_finalized_slot: 42,
+    receipt_reference_mismatch: null,
+    receipt_reference_unverified_reason: null,
+    receipt_reference_purchase_bound: null,
+    receipt_reference_purchase_bound_reason: "no_buyer_nonce",
+    receipt_reference_local_acceptance: "accepted",
+    receipt_reference_refusal_reason: null,
+  } as const;
+  const json = (headers: Record<string, string>) =>
+    new Response("{}", {
+      status: 200,
+      headers: { "content-type": "application/json", ...headers },
+    });
+
+  it("leaves every verification field null when no verifier is supplied", async () => {
+    const pending = nextRecord();
+    recordMppFulfillment(
+      {
+        input: "https://seller.example/x",
+        response: json({ "Payment-Receipt": receipt("0xa") }),
+        payment,
+      },
+      pending.resolve,
+    );
+    const row = await pending.result;
+    expect(row).toMatchObject({
+      schema: "twzrd.mpp.fulfillment.v3",
+      receipt_reference: "0xa",
+      receipt_reference_chain_verified: null,
+      receipt_reference_finalized_slot: null,
+      receipt_reference_mismatch: null,
+      receipt_reference_unverified_reason: null,
+      receipt_reference_purchase_bound: null,
+      receipt_reference_purchase_bound_reason: null,
+      receipt_reference_local_acceptance: null,
+      receipt_reference_refusal_reason: null,
+    });
+  });
+
+  it("verifies a valid-format reference once and copies only the named fields", async () => {
+    const pending = nextRecord();
+    const calls: string[] = [];
+    const response = json({ "Payment-Receipt": receipt("0xref") });
+    const returned = recordMppFulfillment(
+      {
+        input: "https://seller.example/x",
+        response,
+        payment,
+        verifyReceiptReference: async (reference) => {
+          calls.push(reference);
+          return { ...VERIFIED, injected: "not copied" } as typeof VERIFIED;
+        },
+      },
+      pending.resolve,
+    );
+    expect(returned).toBe(response);
+    const row = await pending.result;
+    expect(calls).toEqual(["0xref"]);
+    expect(row).toMatchObject(VERIFIED);
+    expect(row).not.toHaveProperty("injected");
+  });
+
+  it.each([
+    ["missing", {}],
+    ["invalid_format", { "Payment-Receipt": "not-base64-json" }],
+  ])("does not verify when the receipt is %s", async (state, headers) => {
+    const pending = nextRecord();
+    let called = false;
+    recordMppFulfillment(
+      {
+        input: "https://seller.example/x",
+        response: json(headers),
+        payment,
+        verifyReceiptReference: async () => {
+          called = true;
+          return VERIFIED;
+        },
+      },
+      pending.resolve,
+    );
+    const row = await pending.result;
+    expect(row.receipt_state).toBe(state);
+    expect(called).toBe(false);
+    expect(row.receipt_reference_chain_verified).toBeNull();
+    expect(row.receipt_reference_unverified_reason).toBeNull();
+  });
+
+  it("still writes the row, marked verifier_error, when the verifier throws", async () => {
+    const pending = nextRecord();
+    recordMppFulfillment(
+      {
+        input: "https://seller.example/x",
+        response: json({ "Payment-Receipt": receipt("0xref") }),
+        payment,
+        verifyReceiptReference: async () => {
+          throw new Error("rpc exploded");
+        },
+      },
+      pending.resolve,
+    );
+    expect(await pending.result).toMatchObject({
+      receipt_reference: "0xref",
+      receipt_reference_chain_verified: null,
+      receipt_reference_mismatch: null,
+      receipt_reference_unverified_reason: "verifier_error",
+      receipt_reference_local_acceptance: null,
+    });
+  });
+
+  it("verifies a receipt carried in an SSE payment-receipt event after the stream ends", async () => {
+    const pending = nextRecord();
+    const calls: string[] = [];
+    const sse = `data: {"model":"m"}\n\nevent: payment-receipt\ndata: ${JSON.stringify({
+      method: "tempo",
+      reference: "0xsse",
+      status: "success",
+      timestamp: "2026-11-05T00:00:00.000Z",
+    })}\n\n`;
+    const response = new Response(sse, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+    const wrapped = recordMppFulfillment(
+      {
+        input: "https://seller.example/x",
+        response,
+        payment,
+        verifyReceiptReference: async (reference) => {
+          calls.push(reference);
+          return VERIFIED;
+        },
+      },
+      pending.resolve,
+    );
+    expect(await wrapped.text()).toBe(sse);
+    expect(await pending.result).toMatchObject({ receipt_reference: "0xsse", ...VERIFIED });
+    expect(calls).toEqual(["0xsse"]);
   });
 });

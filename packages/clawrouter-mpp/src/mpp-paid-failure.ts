@@ -23,6 +23,8 @@ import {
   type SpendRecord,
 } from "@twzrd1111/clawrouter";
 import { CreditLedger, type CreditEntry } from "./credit-record.js";
+import type { MppGateDecision } from "./mpp-gate.js";
+import type { MppPaymentFacts } from "./mpp-fulfillment-record.js";
 
 export class MppPaidNoCompletionError extends Error {
   readonly reference: string;
@@ -65,6 +67,9 @@ export type PaidCall = {
   record?: SpendRecord;
   /** Payer, amount, and challenge known before the model runs. Reason is filled on failure. */
   credit?: Pick<CreditEntry, "payer" | "amount" | "challengeId">;
+  /** Optional pre-sign policy decision; no raw challenge or signed token is retained. */
+  gate?: MppGateDecision;
+  payment?: MppPaymentFacts;
 };
 
 const credits = new CreditLedger();
@@ -103,9 +108,37 @@ export function isPaidResponse(response: Response): boolean {
   return paidResponses.has(response);
 }
 
+/** Safe payment facts associated with this exact response, if it was paid by this rail. */
+export function readPaidCallEvidence(
+  response: Response,
+): Pick<PaidCall, "payer" | "reference" | "credit" | "gate" | "payment"> | undefined {
+  const paid = paidResponses.get(response);
+  if (!paid) return undefined;
+  const { payer, reference, credit, gate, payment } = paid.call;
+  return {
+    payer,
+    ...(reference ? { reference } : {}),
+    ...(credit ? { credit } : {}),
+    ...(gate ? { gate } : {}),
+    ...(payment ? { payment } : {}),
+  };
+}
+
 /** The current call's payment state; undefined outside `guardPaid`. */
 export function currentPaidCall(): PaidCall | undefined {
   return storage.getStore();
+}
+
+/** Associate a policy decision with the current call before the signer runs. */
+export function markGateEvaluated(decision: MppGateDecision | undefined): void {
+  const call = storage.getStore();
+  if (call && decision) call.gate = decision;
+}
+
+/** Keep only the normalized challenge terms needed to link the later receipt. */
+export function markPaymentChallenge(payment: MppPaymentFacts): void {
+  const call = storage.getStore();
+  if (call) call.payment = payment;
 }
 
 /** Short hash of the signed payload: identifies the payment without exposing it. */

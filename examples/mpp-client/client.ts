@@ -8,6 +8,7 @@
 import net from "node:net";
 import { startProxy, SpendControl, InMemorySpendControlStorage } from "@twzrd1111/clawrouter";
 import { createMppFetch } from "@twzrd1111/clawrouter-mpp";
+import { createLocalDecisionSigner, createTwzrdMppIntegration } from "twzrd-x402-gate";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 
 const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -81,7 +82,14 @@ function memoryFetch(): Promise<Response> {
 
 const account = privateKeyToAccount(generatePrivateKey());
 const spend = new SpendControl({ storage: new InMemorySpendControlStorage() });
-const payFetch = createMppFetch(account, memoryFetch as unknown as typeof fetch, { spend });
+const integration = createTwzrdMppIntegration({
+  signer: createLocalDecisionSigner(),
+  policy: { maxAmountUsd: "0.01" },
+});
+const payFetch = createMppFetch(account, memoryFetch as unknown as typeof fetch, {
+  spend,
+  integration,
+});
 
 const proxy = await startProxy({
   spendControl: spend,
@@ -120,5 +128,6 @@ try {
   }
 } finally {
   await proxy.close();
+  await payFetch.flush?.();
 }
 process.exit(exitCode);

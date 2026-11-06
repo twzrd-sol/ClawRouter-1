@@ -2,11 +2,48 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
-import { createMppFetch } from "./mpp-fetch.js";
+import { Mppx as ServerMppx, tempo as serverTempo } from "mppx/server";
+import {
+  createMppFetch as createMppFetchRail,
+  mppxClientDeps,
+  type MppFetchOptions,
+} from "./mpp-fetch.js";
+import { MppGateError, type MppIntegration } from "./mpp-gate.js";
+import { runWithMppPaymentBudget } from "./mpp-payment-budget.js";
 
 const account = privateKeyToAccount(generatePrivateKey());
+const allowIntegration: MppIntegration = {
+  twzrdMppIntegration: true,
+  gate: async () => ({ disposition: "allow" }),
+  onFulfillment: async () => {},
+  flush: async () => {},
+};
+const createMppFetch = (
+  payer: typeof account,
+  base?: typeof fetch,
+  opts: Partial<MppFetchOptions> = {},
+) =>
+  createMppFetchRail(payer, base, {
+    ...opts,
+    integration: { ...allowIntegration, ...opts.integration },
+  });
 
 describe("createMppFetch", () => {
+  it("refuses factory construction without the marked integration", () => {
+    const base = vi.fn() as unknown as typeof fetch;
+    expect(() => createMppFetchRail(account, base, {} as MppFetchOptions)).toThrow(
+      /requires the MPP integration marker/,
+    );
+    expect(() =>
+      createMppFetchRail(account, base, {
+        integration: {
+          gate: allowIntegration.gate,
+          onFulfillment: allowIntegration.onFulfillment,
+          flush: allowIntegration.flush,
+        },
+      } as MppFetchOptions),
+    ).toThrow(/refusing unmarked hooks/);
+  });
   it("passes a non-402 response through untouched", async () => {
     const base = vi.fn(async () => new Response("ok", { status: 200 })) as unknown as typeof fetch;
     const res = await createMppFetch(account, base)("http://127.0.0.1:1/x");
@@ -57,9 +94,146 @@ describe("createMppFetch", () => {
     createMppFetch(account, vi.fn() as unknown as typeof fetch);
     expect(globalThis.fetch).toBe(before);
   });
+
+  it("blocks a real Tempo challenge before the payment method signs", async () => {
+    const server = ServerMppx.create({
+      methods: [serverTempo.charge({ recipient: RECIPIENT, currency: PATHUSD, testnet: true })],
+      realm: "test.local",
+      secretKey: "test-secret-key-test-secret-key-12345",
+    });
+    const seller: typeof fetch = async (input, init) => {
+      const r = await server.charge({ amount: "0.00075" })(new Request(input as string, init));
+      return r.status === 402 ? r.challenge : new Response("paid", { status: 200 });
+    };
+    const seen: unknown[] = [];
+    const pay = createMppFetch(account, seller, {
+      integration: {
+        ...allowIntegration,
+        gate: async (challenge) => {
+          seen.push(challenge);
+          return {
+            disposition: "block",
+            decisionId: "decision-blocked",
+            intentHash: "intent-hash",
+            reasonCodes: ["seller_blocked"],
+          };
+        },
+      },
+    });
+    await expect(pay("https://test.local/x", { method: "POST", body: "{}" })).rejects.toMatchObject(
+      {
+        name: "MppGateError",
+        code: "MPP_GATE_BLOCKED",
+        decisionId: "decision-blocked",
+      } satisfies Partial<MppGateError>,
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      method: "tempo",
+      intent: "charge",
+      request: { amount: "750" },
+    });
+  });
+
+  it("flush waits for the asynchronous fulfillment sink and the local ledger", async () => {
+    const challengeRequest = {
+      amount: "750",
+      currency: "0x20c0000000000000000000000000000000000000",
+      recipient: "0x000000000000000000000000000000000000dEaD",
+      methodDetails: { chainId: 42431 },
+    };
+    const request = Buffer.from(JSON.stringify(challengeRequest)).toString("base64url");
+    const challenge = `Payment id="flush-fixture", realm="tempo.test", method="tempo", intent="charge", request="${request}"`;
+    const receipt = Buffer.from(
+      JSON.stringify({
+        method: "tempo",
+        reference: `0x${"a".repeat(64)}`,
+        status: "success",
+        timestamp: "2026-11-06T00:00:00.000Z",
+      }),
+    ).toString("base64url");
+    const base: typeof fetch = async (input, init) => {
+      const headers = new Headers(input instanceof Request ? input.headers : undefined);
+      new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+      if (!headers.has("authorization")) {
+        return new Response("", { status: 402, headers: { "www-authenticate": challenge } });
+      }
+      return new Response(JSON.stringify({ model: "seller-claims-7b" }), {
+        headers: { "content-type": "application/json", "payment-receipt": receipt },
+      });
+    };
+    const originalLoad = mppxClientDeps.load;
+    let beginSink!: () => void;
+    let releaseSink!: () => void;
+    const sinkStarted = new Promise<void>((resolve) => (beginSink = resolve));
+    const sinkBlocked = new Promise<void>((resolve) => (releaseSink = resolve));
+    const rows: unknown[] = [];
+    const flushLedger = vi.fn(async () => {});
+    mppxClientDeps.load = async () =>
+      ({
+        Mppx: {
+          create: (options: {
+            methods: Array<{
+              createCredential: (options: {
+                challenge: ReturnType<typeof parseTempoChargeHeader>;
+              }) => Promise<string>;
+            }>;
+            fetch: typeof fetch;
+          }) => ({
+            fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+              const { methods, fetch: recording } = options;
+              const first = await recording(input, init);
+              if (first.status !== 402) return first;
+              const parsed = parseTempoChargeHeader(first.headers.get("www-authenticate")!);
+              const authorization = await methods[0].createCredential({ challenge: parsed });
+              const headers = new Headers(input instanceof Request ? input.headers : undefined);
+              new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+              headers.set("authorization", authorization);
+              return recording(input, { ...init, headers });
+            },
+          }),
+        },
+        tempo: () => [
+          {
+            createCredential: async () => "Payment fixture-credential",
+          },
+        ],
+      }) as unknown as Awaited<ReturnType<typeof originalLoad>>;
+    try {
+      const pay = createMppFetch(account, base, {
+        integration: {
+          ...allowIntegration,
+          gate: async () => ({ disposition: "allow", decisionId: "fixture-decision" }),
+          onFulfillment: async (row) => {
+            beginSink();
+            await sinkBlocked;
+            rows.push(row);
+          },
+          flush: flushLedger,
+        },
+      });
+
+      const response = await pay("https://tempo.fixture.invalid/v1/chat/completions");
+      expect(await response.json()).toEqual({ model: "seller-claims-7b" });
+      const flushed = pay.flush!();
+      await sinkStarted;
+      releaseSink();
+      await flushed;
+      expect(rows).toMatchObject([
+        {
+          receipt_state: "valid_format",
+          requested_model: null,
+          seller_reported_model: "seller-claims-7b",
+          gate: { disposition: "allow", decisionId: "fixture-decision" },
+        },
+      ]);
+      expect(flushLedger).toHaveBeenCalledOnce();
+    } finally {
+      mppxClientDeps.load = originalLoad;
+    }
+  });
 });
 
-import { Mppx as ServerMppx, tempo as serverTempo } from "mppx/server";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
 import { MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
 import {
@@ -74,6 +248,9 @@ const RECIPIENT = "0x000000000000000000000000000000000000dEaD";
 
 const challenge = (id: string, over: Record<string, unknown> = {}) => ({
   id,
+  realm: "tempo.test",
+  method: "tempo",
+  intent: "charge",
   request: {
     amount: "750",
     currency: PATHUSD,
@@ -108,6 +285,125 @@ function guarded(configure: (c: SpendControl) => void, fail = false) {
 }
 
 describe("MPP spend controls (guardMethod)", () => {
+  it("evaluates an immutable challenge and refuses a mutating gate callback", async () => {
+    const f = fakeMethod();
+    const original = challenge("immutable");
+    const method = guardMethod(f.method, undefined, undefined, async (seen) => {
+      expect(seen).not.toBe(original);
+      (seen.request as Record<string, unknown>).amount = "1";
+      return { disposition: "allow" };
+    });
+    await expect(method.createCredential({ challenge: original })).rejects.toThrow();
+    expect(original.request.amount).toBe("750");
+    expect(f.signed).toEqual([]);
+  });
+
+  it("coalesces concurrent gate evaluation and Tempo signing for one challenge", async () => {
+    let release!: () => void;
+    const signing = new Promise<void>((resolve) => (release = resolve));
+    const created: string[] = [];
+    const method = {
+      name: "tempo",
+      intent: "charge",
+      createCredential: async ({ challenge: c }: { challenge: { id: string } }) => {
+        created.push(c.id);
+        await signing;
+        return `Payment ${c.id}`;
+      },
+    };
+    const gate = vi.fn(async () => ({ disposition: "allow" as const }));
+    const budget1 = { assertPaymentAllowed: vi.fn(), recordSigned: vi.fn() };
+    const budget2 = { assertPaymentAllowed: vi.fn(), recordSigned: vi.fn() };
+    const guardedMethod = guardMethod(method, undefined, undefined, gate);
+    const first = runWithMppPaymentBudget(budget1, () =>
+      guardedMethod.createCredential({ challenge: challenge("concurrent") }),
+    );
+    const second = runWithMppPaymentBudget(budget2, () =>
+      guardedMethod.createCredential({ challenge: challenge("concurrent") }),
+    );
+    await vi.waitFor(() => expect(created).toHaveLength(1));
+    release();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      "Payment concurrent",
+      "Payment concurrent",
+    ]);
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(created).toEqual(["concurrent"]);
+    expect(budget1.recordSigned).toHaveBeenCalledTimes(1);
+    expect(budget2.recordSigned).not.toHaveBeenCalled();
+    await expect(
+      guardedMethod.createCredential({ challenge: challenge("concurrent") }),
+    ).resolves.toBe("Payment concurrent");
+    expect(gate).toHaveBeenCalledTimes(2);
+    expect(created).toEqual(["concurrent"]);
+  });
+
+  it("rejects a non-string disposition even when its string form is allowed", async () => {
+    const f = fakeMethod();
+    const invalid = guardMethod(
+      f.method,
+      undefined,
+      undefined,
+      async () =>
+        ({
+          disposition: { toString: () => "allow" },
+        }) as unknown as { disposition: "allow" },
+    );
+    await expect(
+      invalid.createCredential({ challenge: challenge("invalid-result") }),
+    ).rejects.toMatchObject({
+      name: "MppGateError",
+      code: "MPP_GATE_INVALID_RESULT",
+    });
+    expect(f.signed).toEqual([]);
+  });
+
+  it("checks the exact six-decimal quote against the session cap before signing", async () => {
+    const f = fakeMethod();
+    const method = guardMethod(f.method, undefined);
+    const seen: bigint[] = [];
+    await expect(
+      runWithMppPaymentBudget(
+        {
+          assertPaymentAllowed(amount) {
+            expect(amount).toBe(750n);
+            seen.push(amount!);
+            throw new Error("session cap refused quote");
+          },
+          recordSigned() {
+            throw new Error("must not record a refusal");
+          },
+        },
+        () => method.createCredential({ challenge: challenge("cap") }),
+      ),
+    ).rejects.toThrow("session cap refused quote");
+    expect(seen).toEqual([750n]);
+    expect(f.signed).toEqual([]);
+  });
+
+  it("allows a warn decision and refuses a block before the credential method", async () => {
+    const f = fakeMethod();
+    const warn = guardMethod(f.method, undefined, undefined, async () => ({ disposition: "warn" }));
+    await expect(warn.createCredential({ challenge: challenge("warn") })).resolves.toBe(
+      "Payment warn",
+    );
+    expect(f.signed).toEqual(["warn"]);
+
+    const blockedMethod = fakeMethod();
+    const blocked = guardMethod(blockedMethod.method, undefined, undefined, async () => ({
+      disposition: "block",
+      reasonCodes: ["seller_blocked"],
+    }));
+    await expect(
+      blocked.createCredential({ challenge: challenge("blocked") }),
+    ).rejects.toMatchObject({
+      name: "MppGateError",
+      code: "MPP_GATE_BLOCKED",
+      challengeId: "blocked",
+    });
+    expect(blockedMethod.signed).toEqual([]);
+  });
+
   it("prices the quote for a known 6-decimal asset and requires an amount", () => {
     expect(quoteFromChallenge(challenge("a"))).toMatchObject({
       payTo: RECIPIENT,
@@ -125,6 +421,11 @@ describe("MPP spend controls (guardMethod)", () => {
       SpendPolicyError,
     );
     expect(g.signed).toEqual([]);
+    g.control.setLimit("perRequest", 0.001);
+    await expect(g.method.createCredential({ challenge: challenge("a") })).resolves.toBe(
+      "Payment a",
+    );
+    expect(g.signed).toEqual(["a"]);
   });
 
   it("signs under the limit and records the spend", async () => {

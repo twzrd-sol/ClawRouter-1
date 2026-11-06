@@ -6,16 +6,56 @@ pay an MPP seller over **Tempo** or **Solana** instead of x402, under ClawRouter
 ```ts
 import { startProxy, SpendControl, FileSpendControlStorage } from "@twzrd1111/clawrouter";
 import { createMppFetch, createSolanaMppFetch } from "@twzrd1111/clawrouter-mpp";
+import { createTwzrdMppIntegration, createLocalDecisionSigner } from "twzrd-x402-gate";
 
 const spend = new SpendControl({ storage: new FileSpendControlStorage() });
+const twzrdMpp = createTwzrdMppIntegration({
+  signer: createLocalDecisionSigner(),
+  policy: { maxAmountUsd: "1.00" },
+});
 
-// Tempo (needs `mppx`)
-const payFetch = createMppFetch(account, fetch, { spend });
-// or Solana (needs `@solana/mpp@~0.7.0` and `mppx@~0.17.0`)
-// const payFetch = await createSolanaMppFetch({ signer, rpcUrl, network: "devnet", spend });
+// Tempo (needs `mppx`); alternatively use createSolanaMppFetch with the same hooks.
+const payFetch = createMppFetch(account, fetch, { spend, integration: twzrdMpp });
+const proxy = await startProxy({ spendControl: spend, payFetch /* ... */ });
 
-await startProxy({ spendControl: spend, payFetch /* ... */ });
+// proxy.close() closes the listener, then drains the rail's pending ledger writes.
+await proxy.close();
 ```
+
+The supported setup uses the integration helper returned by `createTwzrdMppIntegration`.
+The `twzrdMppIntegration` marker is a wiring check only; it is forgeable and does not authenticate
+the origin of the hooks. Its gate receives the full MPP charge challenge before credential
+creation and returns
+`{ disposition: "allow" | "warn" | "block" }`; `block` and callback errors refuse payment before
+signing, while `warn` proceeds. The MPP rail rejects integrations without the marker or required
+hooks before loading payment SDKs.
+
+The integration writes the pre-sign decision durably to `.twzrd/decisions.jsonl` before allowing
+credential creation, then appends the projected MPP receipt to that same file. Fulfillment writes
+run asynchronously so they do not hold the response stream. `payFetch.flush?.()` waits for pending
+records and fsyncs the local ledger during orderly shutdown. `startProxy` calls the rail's flush hook
+after closing its listener, and direct rail users must call `payFetch.flush()` themselves. It waits for
+active SSE responses too, so drain or cancel them before flushing; an open stream can keep the flush
+pending. Network contribution remains off unless separately enabled. It blocks unscored
+networks by default, including Tempo mainnet and Moderato, until TWZRD has a reputation corpus for
+them. The default provider also fails closed on outages; the ledger sink itself makes no network
+call. An explicit `allowUnscoredNetwork: true` requires `policy.maxAmountUsd` and returns
+`reputation_unchecked` as a warning; warnings proceed unless `treatWarnAsBlock` is set. The
+fulfillment row omits prompts, responses, credentials, and raw receipt headers; its seller model
+field is explicitly a seller claim. Network contribution remains a separate opt-in.
+
+This integration requires `twzrd-x402-gate@0.17.0`, which is not published yet. npm's current
+`0.16.1` does not include Tempo charge evaluation or this shared-ledger adapter.
+
+Receipt-safe payment metadata is available through `readPaidCallEvidence(response)` for a paid
+response from this rail. The
+fulfillment hook records the decoded receipt reference, never the raw base64 receipt or payment
+credential. Tempo session receipts emitted in an SSE `payment-receipt` event are captured when the
+response stream completes; the stream bytes are forwarded unchanged, including the seller-reported
+model label from its first JSON data event. A `valid_format` receipt means its structure, method, and
+intent match the challenge; it is not an on-chain verification. `seller_reported_model_matches_request`
+compares labels only and does not verify model identity. A failed local write does not change an
+already-paid response; `payFetch.flush()` surfaces persistence failures to the shutdown caller.
 
 This candidate requires `@twzrd1111/clawrouter >=0.12.309`, including deferred streaming headers.
 The fork is the release target. Upstream PRs #545 and #546 are independent of this release.

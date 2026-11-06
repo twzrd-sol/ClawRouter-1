@@ -29,11 +29,34 @@ import {
   guardPaid,
   isPaidResponse,
   markSigned,
+  markGateEvaluated,
+  markPaymentChallenge,
   rejectPaidNoCompletion,
 } from "./mpp-paid-failure.js";
 import { loadOptional, MPPX_RANGE } from "./mpp-optional.js";
+import {
+  assertMppIntegration,
+  evaluateMppGate,
+  paymentFactsFromMppChallenge,
+  type MppIntegration,
+  type MppGateEvaluator,
+} from "./mpp-gate.js";
+import { recordMppFulfillment } from "./mpp-fulfillment-record.js";
+import {
+  currentMppPaymentBudget,
+  paymentBudgetFromInit,
+  runWithMppPaymentBudget,
+  stripPaymentBudgetFromInit,
+} from "./mpp-payment-budget.js";
 
 export type { PayFetch };
+
+/** Injectable optional client boundary for offline tests; production uses mppx/client. */
+export const mppxClientDeps: {
+  load: () => Promise<typeof import("mppx/client")>;
+} = {
+  load: () => loadOptional("mppx", MPPX_RANGE, () => import("mppx/client")),
+};
 
 /**
  * Tempo TIP-20 USD stablecoins priced here, lower-case, all 6 decimals (the challenge carries no
@@ -53,9 +76,19 @@ export type MppFetchOptions = {
   spend?: SpendControl;
   /** Override the assets treated as 6-decimal USD (lower-case addresses). */
   usdAssets?: ReadonlySet<string>;
+  /** Required branded object from createTwzrdMppIntegration. */
+  integration: MppIntegration;
 };
 
-type ChallengeLike = { id: string; request?: Record<string, unknown> };
+type ChallengeLike = {
+  id: string;
+  realm?: string;
+  method: string;
+  intent: string;
+  request: Record<string, unknown>;
+  expires?: string;
+  description?: string;
+};
 
 /** The quote as the spend-control layer understands it. `amount` stays undefined if unpriceable. */
 export function quoteFromChallenge(
@@ -98,60 +131,94 @@ export function guardMethod<M extends MethodLike>(
   method: M,
   control: SpendControl | undefined,
   usdAssets: ReadonlySet<string> = DEFAULT_TEMPO_USD_ASSETS,
+  gate?: MppGateEvaluator,
 ): M {
-  // One signed credential per challenge quote. A second call resends it and does not reserve or sign again.
-  const signedOnce = new Map<
-    string,
-    { credential: string; record?: ReturnType<SpendControl["settleReservation"]> }
-  >();
-  const reuseKey = (challenge: ChallengeLike) => {
-    const req = (challenge.request ?? {}) as {
-      amount?: unknown;
-      currency?: unknown;
-      recipient?: unknown;
-      methodDetails?: { chainId?: unknown };
-    };
-    const currency = typeof req.currency === "string" ? req.currency.toLowerCase() : "";
-    const recipient = typeof req.recipient === "string" ? req.recipient.toLowerCase() : "";
-    const chainId = req.methodDetails?.chainId;
-    return `${challenge.id}|${req.amount ?? ""}|${currency}|${recipient}|${chainId ?? ""}`;
+  type Signed = {
+    credential: string;
+    record?: ReturnType<SpendControl["settleReservation"]>;
   };
+  // Cache in-flight promises too: overlapping calls for one challenge must
+  // never create two Tempo credentials.
+  const signedOnce = new Map<string, { promise: Promise<Signed>; signingStarted: boolean }>();
+  const gateOnce = new Map<string, Promise<Awaited<ReturnType<typeof evaluateMppGate>>>>();
+  const reuseKey = (challenge: ChallengeLike) => JSON.stringify(challenge);
   const guarded: MethodLike = {
     createCredential: async (options: { challenge: ChallengeLike }) => {
-      const cached = signedOnce.get(reuseKey(options.challenge));
-      const call = currentPaidCall();
-      const credit = creditFromChallenge(options.challenge, call?.payer ?? "");
-      if (call && !credit)
-        throw new Error("challenge is missing amount or id, or payer is missing");
-      if (cached) {
-        markSigned(cached.credential, credit, cached.record);
-        return cached.credential;
+      const challenge = options.challenge;
+      markPaymentChallenge(paymentFactsFromMppChallenge(challenge));
+      const key = reuseKey(challenge);
+      let gatePending = gateOnce.get(key);
+      if (!gatePending) {
+        gatePending = evaluateMppGate(gate, challenge);
+        gateOnce.set(key, gatePending);
       }
-      let reservationId: string | undefined;
-      if (control) {
-        const quote = quoteFromChallenge(options.challenge, usdAssets);
-        if (!quote.priceable && control.hasAmountLimits()) {
-          // An amount we cannot convert to USD cannot be compared to a configured cap.
-          throw new SpendPolicyError(
-            `MPP quote is in an asset or shape ClawRouter cannot price (${quote.asset ?? "none"}); refusing to pay against a configured spend limit`,
-          );
-        }
-        reservationId = assertSpendPolicyAllows(control, quote);
-      }
-      let credential: string;
+      let gateDecision: Awaited<ReturnType<typeof evaluateMppGate>>;
       try {
-        credential = await method.createCredential(options);
+        gateDecision = await gatePending;
       } catch (err) {
-        if (control && reservationId !== undefined) control.releaseReservation(reservationId);
+        if (gateOnce.get(key) === gatePending) gateOnce.delete(key);
         throw err;
       }
-      const record =
-        control && reservationId !== undefined
-          ? control.settleReservation(reservationId, { action: "mpp tempo charge" })
+      if (gateOnce.get(key) === gatePending) gateOnce.delete(key);
+      markGateEvaluated(gateDecision);
+      const quote = quoteFromChallenge(challenge, usdAssets);
+      const budget = currentMppPaymentBudget();
+      const quoteMicros =
+        quote.priceable && quote.amount && /^\d+$/.test(quote.amount)
+          ? BigInt(quote.amount)
           : undefined;
-      signedOnce.set(reuseKey(options.challenge), { credential, record });
-      markSigned(credential, credit, record);
-      return credential;
+      budget?.assertPaymentAllowed(quoteMicros);
+      const call = currentPaidCall();
+      const credit = creditFromChallenge(challenge, call?.payer ?? "");
+      if (call && !credit)
+        throw new Error("challenge is missing amount or id, or payer is missing");
+      let attempt = signedOnce.get(key);
+      if (!attempt) {
+        const state: { promise: Promise<Signed>; signingStarted: boolean } = {
+          promise: Promise.resolve({ credential: "" }),
+          signingStarted: false,
+        };
+        state.promise = (async (): Promise<Signed> => {
+          let reservationId: string | undefined;
+          if (control) {
+            if (!quote.priceable && control.hasAmountLimits()) {
+              // An amount we cannot convert to USD cannot be compared to a configured cap.
+              throw new SpendPolicyError(
+                `MPP quote is in an asset or shape ClawRouter cannot price (${quote.asset ?? "none"}); refusing to pay against a configured spend limit`,
+              );
+            }
+            reservationId = assertSpendPolicyAllows(control, quote);
+          }
+          let credential: string;
+          try {
+            state.signingStarted = true;
+            credential = await method.createCredential(options);
+          } catch (err) {
+            if (control && reservationId !== undefined) control.releaseReservation(reservationId);
+            throw err;
+          }
+          const record =
+            control && reservationId !== undefined
+              ? control.settleReservation(reservationId, { action: "mpp tempo charge" })
+              : undefined;
+          budget?.recordSigned(quoteMicros);
+          return { credential, record };
+        })();
+        signedOnce.set(key, state);
+        attempt = state;
+      }
+      let signed: Signed;
+      try {
+        signed = await attempt.promise;
+      } catch (err) {
+        // A failed policy reservation is known to precede signing; let a later
+        // attempt re-check the changed spend state. Once the method started,
+        // keep the rejection because signing may be ambiguous.
+        if (!attempt.signingStarted && signedOnce.get(key) === attempt) signedOnce.delete(key);
+        throw err;
+      }
+      markSigned(signed.credential, credit, signed.record);
+      return signed.credential;
     },
   };
   return { ...method, ...guarded } as M;
@@ -160,17 +227,42 @@ export function guardMethod<M extends MethodLike>(
 export function createMppFetch(
   account: Account,
   base: typeof fetch = fetch,
-  opts: MppFetchOptions = {},
+  opts: MppFetchOptions,
 ): PayFetch {
+  assertMppIntegration(opts?.integration, "Tempo");
+  const integration = Object.freeze({ ...opts.integration });
   // Remember the last 402 the upstream sent. mppx throws "No method found for challenges" when a 402
   // offers nothing this client can pay (e.g. a non-MPP gateway); callers expect to see that 402, not
   // an exception, so the proxy can classify it as a payment error like the other rails do.
   // Kept per call (AsyncLocalStorage), not per fetch instance: concurrent requests share this fetch.
   const calls = new AsyncLocalStorage<{ last402?: Response }>();
+  const pendingFulfillments = new Set<Promise<void>>();
+  const fulfillmentFailures: unknown[] = [];
+  const trackFulfillment = (task: Promise<void>) => {
+    let tracked!: Promise<void>;
+    tracked = task.then(
+      () => {
+        pendingFulfillments.delete(tracked);
+      },
+      (error) => {
+        fulfillmentFailures.push(error);
+        pendingFulfillments.delete(tracked);
+      },
+    );
+    pendingFulfillments.add(tracked);
+  };
   const recording: typeof fetch = async (input, init) => {
     const res = await base(input, init);
     const call = calls.getStore();
     if (call) call.last402 = res.status === 402 ? res.clone() : undefined;
+    const paid = currentPaidCall();
+    if (res.status !== 402 && paid?.signed && paid.payment) {
+      return recordMppFulfillment(
+        { input, init, response: res, payment: paid.payment, gate: paid.gate },
+        integration.onFulfillment,
+        trackFulfillment,
+      );
+    }
     return res;
   };
   // polyfill:false keeps globalThis.fetch untouched: only calls routed through this wrapper can pay.
@@ -178,22 +270,25 @@ export function createMppFetch(
   const { spend, usdAssets } = opts;
   let mppxPromise: Promise<ReturnType<typeof MppxClient.create>> | undefined;
   const getMppx = () =>
-    (mppxPromise ??= loadOptional("mppx", MPPX_RANGE, () => import("mppx/client")).then(
-      ({ Mppx, tempo }) =>
-        Mppx.create({
-          methods: tempo({ account }).map((m) => guardMethod(m, spend, usdAssets)),
-          polyfill: false,
-          fetch: recording,
-        }),
+    (mppxPromise ??= mppxClientDeps.load().then(({ Mppx, tempo }) =>
+      Mppx.create({
+        methods: tempo({ account }).map((m) => guardMethod(m, spend, usdAssets, integration.gate)),
+        polyfill: false,
+        fetch: recording,
+      }),
     ));
 
   const payFetch: PayFetch = async (input, init) => {
     const call: { last402?: Response } = {};
     const mppx = await getMppx();
+    const budget = paymentBudgetFromInit(init);
+    const cleanInit = stripPaymentBudgetFromInit(init);
     try {
       // After a credential is signed, a failed or non-2xx result ends in MppPaidNoCompletionError.
-      return await calls.run(call, () =>
-        guardPaid(spend, () => mppx.fetch(input, init), account.address),
+      return await runWithMppPaymentBudget(budget, () =>
+        calls.run(call, () =>
+          guardPaid(spend, () => mppx.fetch(input, cleanInit), account.address),
+        ),
       );
     } catch (e) {
       if (call.last402 && /No method found for challenges/.test((e as Error).message)) {
@@ -207,6 +302,16 @@ export function createMppFetch(
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   payFetch.isPaidResponse = isPaidResponse;
+  payFetch.flush = async () => {
+    await Promise.all([...pendingFulfillments]);
+    const errors = fulfillmentFailures.splice(0);
+    try {
+      await integration.flush();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length) throw new AggregateError(errors, "MPP fulfillment records did not flush");
+  };
   return payFetch;
 }
 

@@ -6,6 +6,15 @@ import { startProxy, SpendControl, InMemorySpendControlStorage } from "@twzrd111
 import { createMppFetch, createSolanaMppFetch } from "./index.js";
 import { readCredits } from "./mpp-paid-failure.js";
 
+const trustHooks = {
+  integration: {
+    twzrdMppIntegration: true as const,
+    gate: async () => ({ disposition: "allow" as const }),
+    onFulfillment: async () => {},
+    flush: async () => {},
+  },
+};
+
 describe("factory-produced rails through the streaming proxy", () => {
   it.each([
     [false, false],
@@ -51,6 +60,7 @@ describe("factory-produced rails through the streaming proxy", () => {
         rpcUrl: "http://127.0.0.1:1",
         network: "devnet",
         spend,
+        ...trustHooks,
         fetch: base,
       });
       const proxy = await startProxy({
@@ -106,11 +116,12 @@ describe("factory-produced rails through the streaming proxy", () => {
       }) as unknown as typeof fetch;
       const payFetch =
         rail === "tempo"
-          ? createMppFetch(privateKeyToAccount(generatePrivateKey()), base)
+          ? createMppFetch(privateKeyToAccount(generatePrivateKey()), base, trustHooks)
           : await createSolanaMppFetch({
               signer: await generateKeyPairSigner(),
               rpcUrl: "http://127.0.0.1:1",
               network: "devnet",
+              ...trustHooks,
               fetch: base,
             });
       const proxy = await startProxy({

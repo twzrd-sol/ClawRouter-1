@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import * as publicApi from "./index.js";
 import {
   CreditLedger,
   creditPaidNoCompletion,
@@ -10,6 +11,10 @@ import {
 } from "./index.js";
 
 describe("public replay and credit APIs", () => {
+  it("does not expose the low-level Tempo signing wrapper outside the gated rail", () => {
+    expect("guardMethod" in publicApi).toBe(false);
+  });
+
   it("rejects concurrent reuse before the model and exposes the specified error", async () => {
     const ledger = new SpentProofLedger();
     const model = vi.fn(async () => "completion");

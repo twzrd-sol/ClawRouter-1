@@ -215,8 +215,18 @@ describe("createMppFetch", () => {
 
       const response = await pay("https://tempo.fixture.invalid/v1/chat/completions");
       expect(await response.json()).toEqual({ model: "seller-claims-7b" });
-      const flushed = pay.flush!();
+      const flushed = pay.flush();
       await sinkStarted;
+      // A bounded flush stops at its deadline while the sink is blocked, and still flushes the ledger.
+      const bounded = await pay.flush({ timeoutMs: 50 }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(bounded).toBeInstanceOf(AggregateError);
+      const timeout = (bounded as AggregateError).errors[0] as MppFlushTimeoutError;
+      expect(timeout).toBeInstanceOf(MppFlushTimeoutError);
+      expect(timeout.pending).toBe(1);
+      expect(flushLedger).toHaveBeenCalledOnce();
       releaseSink();
       await flushed;
       expect(rows).toMatchObject([
@@ -227,7 +237,7 @@ describe("createMppFetch", () => {
           gate: { disposition: "allow", decisionId: "fixture-decision" },
         },
       ]);
-      expect(flushLedger).toHaveBeenCalledOnce();
+      expect(flushLedger).toHaveBeenCalledTimes(2);
     } finally {
       mppxClientDeps.load = originalLoad;
     }
@@ -236,6 +246,7 @@ describe("createMppFetch", () => {
 
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
 import { MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
+import { MppFlushTimeoutError } from "./mpp-flush.js";
 import {
   createTempoFixtureFetch,
   guardMethod,
@@ -664,6 +675,7 @@ describe("OpenRouter Tempo fixture, no network", () => {
         amount: "750",
         challengeId: "fixture-challenge-id",
         reason: "HTTP 502",
+        reference: (err as MppPaidNoCompletionError).reference,
       },
     ]);
     expect(calls.length).toBeGreaterThanOrEqual(2);

@@ -48,6 +48,7 @@ import {
   runWithMppPaymentBudget,
   stripPaymentBudgetFromInit,
 } from "./mpp-payment-budget.js";
+import { flushFulfillments, type MppFlushOptions, type MppPayFetch } from "./mpp-flush.js";
 
 export type { PayFetch };
 
@@ -228,7 +229,7 @@ export function createMppFetch(
   account: Account,
   base: typeof fetch = fetch,
   opts: MppFetchOptions,
-): PayFetch {
+): MppPayFetch {
   assertMppIntegration(opts?.integration, "Tempo");
   const integration = Object.freeze({ ...opts.integration });
   // Remember the last 402 the upstream sent. mppx throws "No method found for challenges" when a 402
@@ -302,17 +303,9 @@ export function createMppFetch(
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   payFetch.isPaidResponse = isPaidResponse;
-  payFetch.flush = async () => {
-    await Promise.all([...pendingFulfillments]);
-    const errors = fulfillmentFailures.splice(0);
-    try {
-      await integration.flush();
-    } catch (error) {
-      errors.push(error);
-    }
-    if (errors.length) throw new AggregateError(errors, "MPP fulfillment records did not flush");
-  };
-  return payFetch;
+  payFetch.flush = (options?: MppFlushOptions) =>
+    flushFulfillments(pendingFulfillments, fulfillmentFailures, () => integration.flush(), options);
+  return payFetch as MppPayFetch;
 }
 
 export type TempoChargeChallenge = {

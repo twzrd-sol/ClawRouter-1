@@ -10,6 +10,8 @@
  */
 export { createMppFetch, DEFAULT_TEMPO_USD_ASSETS, quoteFromChallenge } from "./mpp-fetch.js";
 export type { MppFetchOptions, PayFetch } from "./mpp-fetch.js";
+export { MppFlushTimeoutError } from "./mpp-flush.js";
+export type { MppFlushOptions, MppPayFetch } from "./mpp-flush.js";
 export { createSolanaMppFetch, DEFAULT_SOLANA_USD_MINTS } from "./mpp-solana-fetch.js";
 export type { SolanaMppFetchOptions } from "./mpp-solana-fetch.js";
 export { MppGateError } from "./mpp-gate.js";
@@ -24,6 +26,7 @@ export {
   MPP_FULFILLMENT_RECORD_SCHEMA,
 } from "./mpp-fulfillment-record.js";
 export type {
+  MppBodyDigest,
   MppFulfillmentRecord,
   MppFulfillmentSink,
   MppPaymentFacts,

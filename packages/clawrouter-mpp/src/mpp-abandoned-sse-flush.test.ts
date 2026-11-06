@@ -75,9 +75,12 @@ describe("abandoned SSE fulfillment and flush deadline", () => {
     expect(rows[0]!.receipt_state).toBe("unavailable");
   });
 
-  // KNOWN GAP (it.fails): flush() has no deadline. When the caller neither reads nor cancels the
-  // SSE body, the tracked promise never settles, so this assertion times out and it.fails passes.
-  // When a flush deadline (or abandonment handling) lands, this flips red: change it.fails to it.
+  // CHARACTERIZATION (it.fails): when the caller neither reads nor cancels the SSE body, the tracked
+  // recording promise never settles, so this assertion times out and it.fails passes. This test races
+  // the recording promise, not the rails' flush() API. A bounded flush (#14) stops waiting but does
+  // not settle this promise, so this case stays as it is; the flush deadline has its own tests.
+  // Settling the record would require reading or cancelling the caller's paid body, which a
+  // recorder must not do.
   it.fails(
     "an unread, uncancelled SSE body settles the pending record within the deadline",
     async () => {

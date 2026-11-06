@@ -33,7 +33,7 @@ separate expectations and cannot share a cached credential across nonces.
 Read `X-Buyer-Nonce` on the request that earns the 402. If it matches `^[0-9a-fA-F]{32}$`, set
 `challenge.request.externalId` to `twzrd:p:<exact-header-value>` before issuing/signing the challenge.
 Preserve the value's case. Missing or invalid headers must not be reflected; the seller may omit
-`externalId`. A seller-issued unrelated `externalId` is incompatible with Echo mode and is refused.
+`externalId`. A seller-issued unrelated `externalId` is paid unbound in offer mode and refused only when `requireBinding` is true.
 
 For example, the challenge request includes:
 
@@ -53,8 +53,8 @@ allowlist can validate it. This is Solana-only; infer-mpp's Tempo route is not i
 ## Two checks
 
 Before signing, an exact reflected `externalId` is accepted. A missing value proceeds unbound
-unless `requireBinding` is true (`REJECTED_UNBOUND_CHALLENGE`). Any present mismatch, including an
-empty string, produces `SECURITY_VIOLATION` with zero signatures. Existing gate and spending
+unless `requireBinding` is true (`REJECTED_UNBOUND_CHALLENGE`). A present mismatch, including an empty string, proceeds unbound in offer mode. Under
+`requireBinding`, it produces `SECURITY_VIOLATION` with zero signatures. Existing gate and spending
 checks still apply before signing.
 
 After a finalized receipt passes all chain checks, including equality with the retained buyer
@@ -67,8 +67,10 @@ message, the verifier inspects the message's top-level SPL Memo instructions:
 | Different bytes, malformed UTF-8, or multiple memos      | false          | nonce_mismatch   |
 | Chain not verified                                       | null           | chain_unverified |
 
-The decoder rejects malformed UTF-8 and preserves a leading BOM so it cannot silently make
-different bytes match. The memo program is `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`.
+The verifier counts both Memo v2 (`MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`) and
+Memo v1 (`Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo`). One of each is two memos and
+cannot bind. It validates UTF-8 with a fatal decoder, then compares the raw payload to the UTF-8
+bytes of the expected value. A BOM or any other byte difference cannot silently match.
 
 Chain facts, purchase binding, and local acceptance remain separate fields. The reference index
 still enforces local reuse policy and must be durable and atomic across workers if required.

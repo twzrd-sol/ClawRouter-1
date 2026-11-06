@@ -59,6 +59,7 @@ export {
   InMemoryReceiptReferenceIndex,
   LANDING_WINDOW_SECONDS,
   MEMO_PROGRAM_ID,
+  MEMO_V1_PROGRAM_ID,
   evaluatePurchaseBinding,
 } from "./receipt-chain-verify.js";
 export type {

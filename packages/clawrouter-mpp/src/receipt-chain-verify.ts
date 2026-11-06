@@ -10,6 +10,8 @@ import { loadOptional } from "./mpp-optional.js";
 
 export const SOLANA_KIT_RANGE = "~6.10.0";
 export const MEMO_PROGRAM_ID = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+export const MEMO_V1_PROGRAM_ID = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
+const MEMO_PROGRAMS = new Set([MEMO_PROGRAM_ID, MEMO_V1_PROGRAM_ID]);
 
 type BindingInstruction = { program: string; data: Uint8Array };
 export type PurchaseBoundOutcome = {
@@ -25,16 +27,15 @@ export function evaluatePurchaseBinding(
   const unbound = { purchase_bound: null, purchase_bound_reason: "no_buyer_nonce" } as const;
   const mismatch = { purchase_bound: false, purchase_bound_reason: "nonce_mismatch" } as const;
   if (!expectedExternalId) return unbound;
-  const memos = instructions.filter((ix) => ix.program === MEMO_PROGRAM_ID);
+  const memos = instructions.filter((ix) => MEMO_PROGRAMS.has(ix.program));
   if (memos.length === 0) return unbound;
   if (memos.length !== 1) return mismatch;
-  let memoText: string;
   try {
-    memoText = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(memos[0].data);
+    new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(memos[0].data);
   } catch {
     return mismatch;
   }
-  return memoText === expectedExternalId
+  return bytesEqual(memos[0].data, new TextEncoder().encode(expectedExternalId))
     ? { purchase_bound: true, purchase_bound_reason: null }
     : mismatch;
 }

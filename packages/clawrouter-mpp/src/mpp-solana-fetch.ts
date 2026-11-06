@@ -71,8 +71,11 @@ export function assertEchoPreSign(
       throw new SpendPolicyError("REJECTED_UNBOUND_CHALLENGE: Seller failed to echo buyer nonce");
     return "unbound";
   }
-  if (challengeExternalId !== context.expectedExternalId)
-    throw new SpendPolicyError("SECURITY_VIOLATION: Challenge externalId mismatch");
+  if (challengeExternalId !== context.expectedExternalId) {
+    if (policy.requireBinding)
+      throw new SpendPolicyError("SECURITY_VIOLATION: Challenge externalId mismatch");
+    return "unbound";
+  }
   return "bound";
 }
 const CAIP2: Record<SolanaNetwork, string> = {
@@ -396,7 +399,11 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
                         signedTransaction: result.signedTransaction,
                         signedAtUnix: result.signedAtUnix,
                         purchaseId: result.purchaseId,
-                        expectedExternalId: result.expectedExternalId,
+                        // Binding belongs to this call, not merely a cached credential.
+                        expectedExternalId:
+                          result.expectedExternalId === echoContext?.expectedExternalId
+                            ? result.expectedExternalId
+                            : null,
                       }),
                     verification.waitMs,
                     verification.pollMs,

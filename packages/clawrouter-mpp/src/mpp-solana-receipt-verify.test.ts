@@ -60,13 +60,15 @@ async function fixture(
       recentBlockhash: "11111111111111111111111111111111",
     },
   };
+  let repeatedExternalId: string | undefined;
   const header = (id: string, nonce: string | null) => {
     const externalId =
-      opts.echo === "match" && nonce
+      repeatedExternalId ??
+      (opts.echo === "match" && nonce
         ? `twzrd:p:${nonce}`
         : opts.echo === "mismatch"
           ? "twzrd:p:00000000000000000000000000000000"
-          : opts.sellerExternalId;
+          : opts.sellerExternalId);
     return `Payment id="${id}", realm="fixture", method="solana", intent="charge", request="${Buffer.from(JSON.stringify({ ...request, ...(externalId === undefined ? {} : { externalId }) })).toString("base64url")}"`;
   };
 
@@ -173,6 +175,7 @@ async function fixture(
     verify,
     setChallengeId: (id: string) => (challengeId = id),
     replay: (reference: string) => (replayReference = reference),
+    repeatExternalId: (externalId: string) => (repeatedExternalId = externalId),
     holdLookups: () => {
       let release!: () => void;
       hold = new Promise<void>((resolve) => (release = resolve));
@@ -438,7 +441,7 @@ describe("Solana Echo rail", () => {
             ? { sellerExternalId: "" }
             : {},
       );
-      const pay = await f.rail({ echo: { requireBinding: state === "missing" } });
+      const pay = await f.rail({ echo: { requireBinding: true } });
       await expect(send(pay)).rejects.toThrow(
         state === "missing" ? /REJECTED_UNBOUND_CHALLENGE/ : /externalId mismatch/,
       );
@@ -536,6 +539,43 @@ describe("Echo prevents borrowed-receipt binding", () => {
       receipt_reference_mismatch: "message_mismatch",
       receipt_reference_purchase_bound: null,
       receipt_reference_purchase_bound_reason: "chain_unverified",
+    });
+  });
+});
+
+describe("Echo offer compatibility", () => {
+  it.each(["twzrd-mpp-seller-random", "order-123", ""])(
+    "pays a seller-owned externalId (%s) unbound in offer mode",
+    async (externalId) => {
+      const f = await fixture({ sellerExternalId: externalId });
+      const pay = await f.rail({ echo: {} });
+      const response = await send(pay);
+      await pay.flush();
+      expect(response.status).toBe(200);
+      expect(f.signTransactions).toHaveBeenCalledTimes(1);
+      expect(f.inputs[0].expectedExternalId).toBeNull();
+      expect(f.rows[0]).toMatchObject({
+        receipt_reference_chain_verified: true,
+        receipt_reference_purchase_bound: null,
+        receipt_reference_purchase_bound_reason: "no_buyer_nonce",
+      });
+    },
+  );
+
+  it("checks reflection anew when a seller repeats the previous call's externalId", async () => {
+    const f = await fixture({ echo: "match" });
+    const pay = await f.rail({ echo: {} });
+    await send(pay);
+    await pay.flush();
+    expect(f.rows[0].receipt_reference_purchase_bound).toBe(true);
+    f.repeatExternalId(f.inputs[0].expectedExternalId!);
+    await send(pay);
+    await pay.flush();
+    expect(f.inputs[1].expectedExternalId).toBeNull();
+    expect(f.rows[1]).toMatchObject({
+      receipt_reference_chain_verified: true,
+      receipt_reference_purchase_bound: null,
+      receipt_reference_purchase_bound_reason: "no_buyer_nonce",
     });
   });
 });

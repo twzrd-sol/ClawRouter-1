@@ -28,6 +28,7 @@ import {
   LANDING_WINDOW_SECONDS,
   evaluatePurchaseBinding,
   MEMO_PROGRAM_ID,
+  MEMO_V1_PROGRAM_ID,
   type ReceiptChainVerifyInput,
   type RpcTransaction,
 } from "./receipt-chain-verify.js";
@@ -75,6 +76,7 @@ type Shape = {
   /** Token account the transfer debits; defaults to the authority's ATA. */
   source?: Address;
   memos?: Uint8Array[];
+  extraMemos?: { program: string; data: Uint8Array }[];
 };
 
 async function transferIx(buyer: Party, payTo: string, s: Shape): Promise<Instruction> {
@@ -111,6 +113,8 @@ async function payment(buyer: Party, sponsor: Party, payTo: string, s: Shape = {
   const ixs = [await transferIx(buyer, payTo, s)];
   for (const data of s.memos ?? [])
     ixs.push({ programAddress: address(MEMO_PROGRAM_ID), accounts: [], data });
+  for (const memo of s.extraMemos ?? [])
+    ixs.push({ programAddress: address(memo.program), accounts: [], data: memo.data });
   if (s.extraTransfer) ixs.push(await transferIx(buyer, payTo, { ...s, amount: 1n }));
   const message = pipe(
     createTransactionMessage({ version: 0 }),
@@ -700,5 +704,30 @@ describe("Echo purchase binding", () => {
     const result = await verify(input(buyer, payTo, p, { expectedExternalId: expected }));
     expect(result.receipt_reference_purchase_bound).toBeNull();
     expect(result.receipt_reference_purchase_bound_reason).toBe("chain_unverified");
+  });
+});
+
+describe("Echo counts every SPL Memo version", () => {
+  const expected = `twzrd:p:${"cd".repeat(16)}`;
+  const bytes = new TextEncoder().encode(expected);
+  it("rejects a matching v2 memo alongside a v1 memo", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo, {
+      memos: [bytes],
+      extraMemos: [{ program: MEMO_V1_PROGRAM_ID, data: bytes }],
+    });
+    const { verify } = verifier(rpc(p.onChain));
+    expect(await verify(input(buyer, payTo, p, { expectedExternalId: expected }))).toMatchObject({
+      receipt_reference_chain_verified: true,
+      receipt_reference_purchase_bound: false,
+      receipt_reference_purchase_bound_reason: "nonce_mismatch",
+    });
+  });
+  it("requires exactly one memo across v1 and v2", () => {
+    const v1 = { program: MEMO_V1_PROGRAM_ID, data: bytes };
+    const v2 = { program: MEMO_PROGRAM_ID, data: bytes };
+    expect(evaluatePurchaseBinding([v1], expected).purchase_bound).toBe(true);
+    expect(evaluatePurchaseBinding([v1, v1], expected).purchase_bound).toBe(false);
+    expect(evaluatePurchaseBinding([v2, v1], expected).purchase_bound).toBe(false);
   });
 });

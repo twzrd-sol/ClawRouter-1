@@ -133,6 +133,13 @@ synchronous claim gives concurrent duplicates one winner. The claim remains spen
 model fails. This helper does not verify a payment itself,
 and installing a buyer rail cannot add replay protection to a remote seller.
 
+`SpentProofLedger` keeps claims in memory, so a restart or a second process forgets spent
+proofs, and a proof can be redeemed again while its challenge is still valid. A seller with
+more than one process, or one that restarts, needs a durable, atomic uniqueness check shared by
+every worker (for example a unique key on network plus transaction signature, as an
+authoritative settlement table provides). Rejecting expired challenges narrows the window but
+does not close it on its own.
+
 ## Credits for signed calls with no completion
 
 ```ts

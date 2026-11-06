@@ -38,6 +38,7 @@ import {
   runWithMppPaymentBudget,
   stripPaymentBudgetFromInit,
 } from "./mpp-payment-budget.js";
+import { flushFulfillments, type MppFlushOptions, type MppPayFetch } from "./mpp-flush.js";
 
 export const DEFAULT_SOLANA_USD_MINTS: ReadonlySet<string> = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -69,7 +70,7 @@ export const solanaChargeDeps = {
   load: () => loadOptional("@solana/mpp", SOLANA_MPP_RANGE, () => import("@solana/mpp/client")),
 };
 
-export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise<PayFetch> {
+export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise<MppPayFetch> {
   assertMppIntegration(opts?.integration, "Solana");
   const integration = Object.freeze({ ...opts.integration });
   const { charge, selectSolanaChargeChallengeFromResponse, resolveStablecoinMint } =
@@ -275,17 +276,9 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   payFetch.isPaidResponse = isPaidResponse;
-  payFetch.flush = async () => {
-    await Promise.all([...pendingFulfillments]);
-    const errors = fulfillmentFailures.splice(0);
-    try {
-      await integration.flush();
-    } catch (error) {
-      errors.push(error);
-    }
-    if (errors.length) throw new AggregateError(errors, "MPP fulfillment records did not flush");
-  };
-  return payFetch;
+  payFetch.flush = (options?: MppFlushOptions) =>
+    flushFulfillments(pendingFulfillments, fulfillmentFailures, () => integration.flush(), options);
+  return payFetch as MppPayFetch;
 }
 
 /** USDC on Solana devnet. Priced as 6-decimal USD, same as `DEFAULT_SOLANA_USD_MINTS`. */

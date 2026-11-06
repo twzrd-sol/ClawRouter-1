@@ -85,6 +85,21 @@ describe("public replay and credit APIs", () => {
       reference: "caller-ref",
     });
     expect(row.reference).toBe("caller-ref");
+    // A caller-supplied placeholder is filtered too: it falls back to the error's reference...
+    const fallback = creditPaidNoCompletion(ledger, known, {
+      ...fields,
+      challengeId: "c3",
+      reference: "mpp-unknown",
+    });
+    expect(fallback.reference).toBe("err-ref");
+    // ...and with no real reference anywhere, the row carries none.
+    const none = creditPaidNoCompletion(ledger, unknown, {
+      ...fields,
+      challengeId: "c4",
+      reference: "mpp-unknown",
+    });
+    expect("reference" in none).toBe(false);
+    expect(JSON.stringify(readCredits(ledger))).not.toContain("mpp-unknown");
   });
 
   it("separates payers and refuses invalid credit errors", () => {

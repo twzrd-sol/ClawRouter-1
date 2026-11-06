@@ -57,9 +57,15 @@ export function creditPaidNoCompletion(
     throw new TypeError("credit requires MppPaidNoCompletionError");
   }
   void hooks;
-  const known = err.reference && err.reference !== UNKNOWN_REFERENCE ? err.reference : undefined;
-  const reference = fields.reference ?? known;
-  return ledger.recordOnce(reference ? { ...fields, reference } : fields);
+  // The placeholder filter applies to the caller's reference too: a caller placeholder falls back
+  // to the error's reference, and the placeholder itself is never written.
+  const reference = [fields.reference, err.reference].find(
+    (value): value is string =>
+      typeof value === "string" && value !== "" && value !== UNKNOWN_REFERENCE,
+  );
+  const { reference: _dropped, ...rest } = fields;
+  void _dropped;
+  return ledger.recordOnce(reference ? { ...rest, reference } : rest);
 }
 
 export type PaidCall = {

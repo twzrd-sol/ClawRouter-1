@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import type { MppGateDecision } from "./mpp-gate.js";
 
-export const MPP_FULFILLMENT_RECORD_SCHEMA = "twzrd.mpp.fulfillment.v1";
+export const MPP_FULFILLMENT_RECORD_SCHEMA = "twzrd.mpp.fulfillment.v2";
 export const MPP_FULFILLMENT_MAX_BODY_BYTES = 1024 * 1024;
 
 export type MppPaymentFacts = {
@@ -37,7 +38,19 @@ export type MppFulfillmentRecord = {
   /** Equality of seller-reported and requested labels only; this does not verify the served model. */
   seller_reported_model_matches_request: boolean | null;
   gate: MppGateDecision | null;
+  /**
+   * Byte length of the complete response body as received. null when the recorder did not read
+   * the body, it exceeded MPP_FULFILLMENT_MAX_BODY_BYTES, or it was cancelled or errored first.
+   */
+  response_bytes: number | null;
+  /** Lowercase hex SHA-256 of the same complete body; null under the same conditions. */
+  body_sha256: string | null;
 };
+
+/** Size and digest of a complete response body, or null fields when it was not fully read. */
+export type MppBodyDigest = { response_bytes: number | null; body_sha256: string | null };
+
+const NO_BODY_DIGEST: MppBodyDigest = { response_bytes: null, body_sha256: null };
 
 export type MppFulfillmentInput = {
   input: RequestInfo | URL;
@@ -147,6 +160,7 @@ function createSseReceiptParser(
   let unavailable = false;
   let receipt: DecodedReceipt | undefined;
   let sellerReportedModel: string | null = null;
+  const hash = createHash("sha256");
 
   const finishEvent = () => {
     if (data.length && eventName === "payment-receipt" && !receipt) {
@@ -184,6 +198,7 @@ function createSseReceiptParser(
   return {
     push(chunk: Uint8Array) {
       totalBytes += chunk.byteLength;
+      if (totalBytes <= MPP_FULFILLMENT_MAX_BODY_BYTES) hash.update(chunk);
       if (totalBytes > MPP_FULFILLMENT_MAX_BODY_BYTES) {
         unavailable = true;
         buffer = "";
@@ -203,6 +218,12 @@ function createSseReceiptParser(
         buffer = "";
       }
     },
+    /** Digest of every pushed byte; call only after the source stream reported done. */
+    digest(): MppBodyDigest {
+      return totalBytes > MPP_FULFILLMENT_MAX_BODY_BYTES
+        ? NO_BODY_DIGEST
+        : { response_bytes: totalBytes, body_sha256: hash.digest("hex") };
+    },
     finish(): { receipt: DecodedReceipt; sellerReportedModel: string | null } {
       if (!unavailable && !receipt) {
         buffer += decoder.decode();
@@ -217,8 +238,9 @@ function createSseReceiptParser(
   };
 }
 
-async function readJsonCapped(body: ReadableStream<Uint8Array> | null): Promise<unknown> {
-  if (!body) return undefined;
+/** Read a whole body up to the cap. null when absent, over the cap, or the read errored. */
+async function readBodyCapped(body: ReadableStream<Uint8Array> | null): Promise<Buffer | null> {
+  if (!body) return null;
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -229,14 +251,36 @@ async function readJsonCapped(body: ReadableStream<Uint8Array> | null): Promise<
       size += value.byteLength;
       if (size > MPP_FULFILLMENT_MAX_BODY_BYTES) {
         await reader.cancel().catch(() => undefined);
-        return undefined;
+        return null;
       }
       chunks.push(value);
     }
-    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+    return Buffer.concat(chunks);
+  } catch {
+    return null;
+  }
+}
+
+function parseJson(bytes: Buffer | null): unknown {
+  if (!bytes) return undefined;
+  try {
+    return JSON.parse(bytes.toString("utf8")) as unknown;
   } catch {
     return undefined;
   }
+}
+
+function digestOf(bytes: Buffer | null): MppBodyDigest {
+  return bytes
+    ? {
+        response_bytes: bytes.byteLength,
+        body_sha256: createHash("sha256").update(bytes).digest("hex"),
+      }
+    : NO_BODY_DIGEST;
+}
+
+async function readJsonCapped(body: ReadableStream<Uint8Array> | null): Promise<unknown> {
+  return parseJson(await readBodyCapped(body));
 }
 
 function bodyIsJson(headers: Headers): boolean {
@@ -285,6 +329,7 @@ async function emitRecord(
   requestValue: unknown,
   responseValue: unknown,
   sink: MppFulfillmentSink,
+  digest: MppBodyDigest,
   sellerModelOverride?: string | null,
 ): Promise<void> {
   const req = asRecord(requestValue);
@@ -315,6 +360,8 @@ async function emitRecord(
         ? requestedModel.toLowerCase() === sellerReportedModel.toLowerCase()
         : null,
     gate: input.gate ?? null,
+    response_bytes: digest.response_bytes,
+    body_sha256: digest.body_sha256,
   };
   await sink(row);
 }
@@ -362,11 +409,15 @@ export function recordMppFulfillment(
     });
     track(recording);
     let recordingStarted = false;
-    const finishRecord = (receipt: DecodedReceipt, sellerReportedModel: string | null) => {
+    const finishRecord = (
+      receipt: DecodedReceipt,
+      sellerReportedModel: string | null,
+      digest: MppBodyDigest,
+    ) => {
       if (recordingStarted) return;
       recordingStarted = true;
       const write = requestBody.then((request) =>
-        emitRecord(input, receipt, request, undefined, sink, sellerReportedModel),
+        emitRecord(input, receipt, request, undefined, sink, digest, sellerReportedModel),
       );
       void write.then(resolveRecording, rejectRecording);
       void write.catch(() => {
@@ -381,7 +432,7 @@ export function recordMppFulfillment(
           const { done, value } = await reader.read();
           if (done) {
             const parsed = parser.finish();
-            finishRecord(parsed.receipt, parsed.sellerReportedModel);
+            finishRecord(parsed.receipt, parsed.sellerReportedModel, parser.digest());
             controller.close();
             reader.releaseLock();
             return;
@@ -389,7 +440,7 @@ export function recordMppFulfillment(
           parser.push(value);
           controller.enqueue(value);
         } catch (error) {
-          finishRecord({ state: "unavailable", value: null }, null);
+          finishRecord({ state: "unavailable", value: null }, null, NO_BODY_DIGEST);
           controller.error(error);
         }
       },
@@ -400,16 +451,17 @@ export function recordMppFulfillment(
           parsed.receipt.state === "missing"
             ? { state: "unavailable" as const, value: null }
             : parsed.receipt;
-        finishRecord(receipt, parsed.sellerReportedModel);
+        // A cancelled stream never reached its end: no digest, even of the bytes seen so far.
+        finishRecord(receipt, parsed.sellerReportedModel, NO_BODY_DIGEST);
       },
     });
     return wrappedResponse(input.response, tapped);
   }
   const responseBody = bodyIsJson(input.response.headers)
-    ? readJsonCapped(input.response.clone().body)
-    : Promise.resolve(undefined);
-  const recording = Promise.all([requestBody, responseBody]).then(([request, response]) =>
-    emitRecord(input, receipt, request, response, sink),
+    ? readBodyCapped(input.response.clone().body)
+    : Promise.resolve(null);
+  const recording = Promise.all([requestBody, responseBody]).then(([request, bytes]) =>
+    emitRecord(input, receipt, request, parseJson(bytes), sink, digestOf(bytes)),
   );
   track(recording);
   void recording.catch(() => {

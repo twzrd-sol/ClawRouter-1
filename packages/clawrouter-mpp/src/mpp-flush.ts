@@ -65,24 +65,32 @@ export async function flushFulfillments(
   try {
     await wait(Promise.all([...pending]).then(() => undefined));
     let ledgerPending = true;
-    // Invoke even after expiration. Observe late failures so background persistence cannot
-    // cause an unhandled rejection, and the next explicit flush can report them.
+    // Invoke even after expiration. A ledger error that settles while this flush is still waiting
+    // belongs to this flush alone; it never enters the shared array, so an overlapping flush
+    // cannot drain it. Only an error that settles after this flush returned at its deadline is
+    // queued in `failures` for the next explicit flush (and observed, so it cannot go unhandled).
+    let returned = false;
+    const ownErrors: unknown[] = [];
     let ledger: Promise<void>;
     try {
       ledger = Promise.resolve(integrationFlush())
         .catch((error) => {
-          failures.push(error);
+          if (returned) failures.push(error);
+          else ownErrors.push(error);
         })
         .finally(() => {
           ledgerPending = false;
         });
     } catch (error) {
-      failures.push(error);
+      ownErrors.push(error);
       ledgerPending = false;
       ledger = Promise.resolve();
     }
     await wait(ledger);
-    const errors = failures.splice(0);
+    returned = true;
+    // Dedupe by identity: an overlapping flush that already returned may have queued the same
+    // late ledger error in `failures`; report it once, here.
+    const errors = [...new Set([...failures.splice(0), ...ownErrors])];
     if (expired) errors.push(new MppFlushTimeoutError(pending.size, timeoutMs!, ledgerPending));
     if (errors.length) throw new AggregateError(errors, "MPP fulfillment records did not flush");
   } finally {

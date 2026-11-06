@@ -233,4 +233,42 @@ describe("total flush deadline", () => {
     );
     expect(result.errors).toContain(failure);
   });
+
+  it("overlapping flushes: a ledger failure reaches the flush that was waiting on it", async () => {
+    // One shared integration ledger, as on the rails. A waits with no deadline; B times out first.
+    let rejectLedger!: (error: unknown) => void;
+    const shared = new Promise<void>((_, reject) => (rejectLedger = reject));
+    shared.catch(() => {});
+    const failures: unknown[] = [];
+    const ledgerError = new Error("fsync failed");
+    let aSettled = false;
+    const a = rejection(flushFulfillments(new Set(), failures, () => shared)).finally(
+      () => (aSettled = true),
+    );
+    const b = await rejection(
+      flushFulfillments(new Set(), failures, () => shared, { timeoutMs: 10 }),
+    );
+    expect(b.errors).toHaveLength(1);
+    expect(b.errors[0]).toMatchObject({ ledgerPending: true });
+    expect(aSettled).toBe(false);
+    rejectLedger(ledgerError);
+    // A was still waiting when its ledger failed: A must reject with it, exactly once, not resolve.
+    // B had already returned and queued the same late error; A's drain takes it, so it is not
+    // reported again by a later flush.
+    expect((await a).errors).toEqual([ledgerError]);
+    expect(failures).toHaveLength(0);
+    await expect(flushFulfillments(new Set(), failures, async () => {})).resolves.toBe(undefined);
+  });
+
+  it("a ledger failure during this flush is not drained by an overlapping flush", async () => {
+    let rejectA!: (error: unknown) => void;
+    const aLedger = new Promise<void>((_, reject) => (rejectA = reject));
+    const failures: unknown[] = [];
+    const aError = new Error("a ledger failed");
+    const a = rejection(flushFulfillments(new Set(), failures, () => aLedger));
+    rejectA(aError);
+    // B runs while A's rejection is settling; it must not take A's error.
+    await expect(flushFulfillments(new Set(), failures, async () => {})).resolves.toBe(undefined);
+    expect((await a).errors).toEqual([aError]);
+  });
 });

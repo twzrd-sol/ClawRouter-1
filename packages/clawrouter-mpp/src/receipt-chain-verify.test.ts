@@ -26,6 +26,8 @@ import {
   DEFAULT_RPC_TIMEOUT_MS,
   InMemoryReceiptReferenceIndex,
   LANDING_WINDOW_SECONDS,
+  evaluatePurchaseBinding,
+  MEMO_PROGRAM_ID,
   type ReceiptChainVerifyInput,
   type RpcTransaction,
 } from "./receipt-chain-verify.js";
@@ -72,6 +74,7 @@ type Shape = {
   feePayer?: Party;
   /** Token account the transfer debits; defaults to the authority's ATA. */
   source?: Address;
+  memos?: Uint8Array[];
 };
 
 async function transferIx(buyer: Party, payTo: string, s: Shape): Promise<Instruction> {
@@ -106,6 +109,8 @@ async function transferIx(buyer: Party, payTo: string, s: Shape): Promise<Instru
 /** Buyer partially signs (sponsor slot empty); seller adds the sponsor signature and broadcasts. */
 async function payment(buyer: Party, sponsor: Party, payTo: string, s: Shape = {}) {
   const ixs = [await transferIx(buyer, payTo, s)];
+  for (const data of s.memos ?? [])
+    ixs.push({ programAddress: address(MEMO_PROGRAM_ID), accounts: [], data });
   if (s.extraTransfer) ixs.push(await transferIx(buyer, payTo, { ...s, amount: 1n }));
   const message = pipe(
     createTransactionMessage({ version: 0 }),
@@ -616,5 +621,84 @@ describe("receipt chain verification", () => {
       const r = await verify(input(buyer, payTo, p, { asset }));
       expect(r.receipt_reference_unverified_reason).toBe("unnormalized_terms");
     }
+  });
+});
+
+describe("Echo purchase binding", () => {
+  const expected = `twzrd:p:${"ab".repeat(16)}`;
+  const memo = (value: string) => ({
+    program: MEMO_PROGRAM_ID,
+    data: new TextEncoder().encode(value),
+  });
+
+  it("requires exactly one matching memo and an expected buyer nonce", () => {
+    expect(evaluatePurchaseBinding([memo(expected)], expected)).toEqual({
+      purchase_bound: true,
+      purchase_bound_reason: null,
+    });
+    for (const [ixs, wanted] of [
+      [[], expected],
+      [[memo(expected)], null],
+    ] as const)
+      expect(evaluatePurchaseBinding(ixs, wanted)).toEqual({
+        purchase_bound: null,
+        purchase_bound_reason: "no_buyer_nonce",
+      });
+    for (const ixs of [[memo("other")], [memo(expected), memo(expected)]])
+      expect(evaluatePurchaseBinding(ixs, expected)).toEqual({
+        purchase_bound: false,
+        purchase_bound_reason: "nonce_mismatch",
+      });
+  });
+
+  it("rejects malformed UTF-8 rather than accepting replacement characters", () => {
+    expect(
+      evaluatePurchaseBinding(
+        [{ program: MEMO_PROGRAM_ID, data: new Uint8Array([0xff]) }],
+        "\ufffd",
+      ),
+    ).toEqual({ purchase_bound: false, purchase_bound_reason: "nonce_mismatch" });
+  });
+
+  it("does not silently discard a UTF-8 BOM", () => {
+    const data = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(expected)]);
+    expect(
+      evaluatePurchaseBinding([{ program: MEMO_PROGRAM_ID, data }], expected).purchase_bound,
+    ).toBe(false);
+  });
+
+  it.each(["match", "missing", "wrong", "multiple"] as const)(
+    "evaluates %s using a real signed transaction and finalized chain fixture",
+    async (state) => {
+      const { buyer, sponsor, payTo } = await setup();
+      const data = (s: string) => new TextEncoder().encode(s);
+      const memos =
+        state === "missing"
+          ? []
+          : state === "multiple"
+            ? [data(expected), data(expected)]
+            : [data(state === "wrong" ? "other" : expected)];
+      const p = await payment(buyer, sponsor, payTo, { memos });
+      const { verify } = verifier(rpc(p.onChain));
+      const result = await verify(input(buyer, payTo, p, { expectedExternalId: expected }));
+      expect(result.receipt_reference_chain_verified).toBe(true);
+      expect(result.receipt_reference_purchase_bound).toBe(
+        state === "match" ? true : state === "missing" ? null : false,
+      );
+      expect(result.receipt_reference_purchase_bound_reason).toBe(
+        state === "match" ? null : state === "missing" ? "no_buyer_nonce" : "nonce_mismatch",
+      );
+    },
+  );
+
+  it("never claims binding for a failed chain verification", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo, { memos: [new TextEncoder().encode(expected)] });
+    const { verify } = verifier(
+      rpc(p.onChain, { meta: { err: { failed: true }, innerInstructions: [] } }),
+    );
+    const result = await verify(input(buyer, payTo, p, { expectedExternalId: expected }));
+    expect(result.receipt_reference_purchase_bound).toBeNull();
+    expect(result.receipt_reference_purchase_bound_reason).toBe("chain_unverified");
   });
 });

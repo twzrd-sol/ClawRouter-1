@@ -13,6 +13,7 @@ import {
   partiallySignTransaction,
 } from "@solana/kit";
 import { Credential } from "mppx";
+import { SpendControl, InMemorySpendControlStorage } from "@twzrd1111/clawrouter";
 import {
   createSolanaMppFetch,
   solanaChargeDeps,
@@ -33,8 +34,17 @@ const DEAD_RPC = "http://127.0.0.1:1";
 const URL_ = "https://devnet.fixture.invalid/v1/chat/completions";
 type Party = Awaited<ReturnType<typeof generateKeyPairSigner>>;
 
-async function fixture(opts: { finalizeAfter?: number; rpcTimeoutMs?: number } = {}) {
+async function fixture(
+  opts: {
+    finalizeAfter?: number;
+    rpcTimeoutMs?: number;
+    echo?: "match" | "mismatch";
+    sellerExternalId?: string;
+  } = {},
+) {
   const buyer = await generateKeyPairSigner();
+  const signTransactions = vi.fn(buyer.signTransactions);
+  const observedBuyer = { ...buyer, signTransactions };
   const payee = await generateKeyPairSigner();
   const sponsor = await generateKeyPairSigner();
   const request = {
@@ -50,8 +60,15 @@ async function fixture(opts: { finalizeAfter?: number; rpcTimeoutMs?: number } =
       recentBlockhash: "11111111111111111111111111111111",
     },
   };
-  const header = (id: string) =>
-    `Payment id="${id}", realm="fixture", method="solana", intent="charge", request="${Buffer.from(JSON.stringify(request)).toString("base64url")}"`;
+  const header = (id: string, nonce: string | null) => {
+    const externalId =
+      opts.echo === "match" && nonce
+        ? `twzrd:p:${nonce}`
+        : opts.echo === "mismatch"
+          ? "twzrd:p:00000000000000000000000000000000"
+          : opts.sellerExternalId;
+    return `Payment id="${id}", realm="fixture", method="solana", intent="charge", request="${Buffer.from(JSON.stringify({ ...request, ...(externalId === undefined ? {} : { externalId }) })).toString("base64url")}"`;
+  };
 
   const broadcast = new Map<string, string>();
   const retainedByBuyer: string[] = [];
@@ -63,7 +80,9 @@ async function fixture(opts: { finalizeAfter?: number; rpcTimeoutMs?: number } =
     if (!authorization)
       return new Response("", {
         status: 402,
-        headers: { "www-authenticate": header(challengeId) },
+        headers: {
+          "www-authenticate": header(challengeId, (input as Request).headers.get("X-Buyer-Nonce")),
+        },
       });
     const proof = Credential.deserialize<{ type: string; transaction: string }>(authorization);
     retainedByBuyer.push(proof.payload.transaction);
@@ -133,7 +152,7 @@ async function fixture(opts: { finalizeAfter?: number; rpcTimeoutMs?: number } =
   };
   const rail = (over: Partial<SolanaMppFetchOptions> = {}) =>
     createSolanaMppFetch({
-      signer: buyer,
+      signer: observedBuyer,
       rpcUrl: DEAD_RPC,
       network: "devnet",
       integration,
@@ -143,6 +162,8 @@ async function fixture(opts: { finalizeAfter?: number; rpcTimeoutMs?: number } =
     });
   return {
     buyer: buyer as Party,
+    signTransactions,
+    seller,
     rail,
     rows,
     inputs,
@@ -371,6 +392,150 @@ describe("Solana rail: receipt reference chain verification (fulfillment v3)", (
       receipt_reference_chain_verified: null,
       receipt_reference_unverified_reason: null,
       receipt_reference_local_acceptance: null,
+    });
+  });
+});
+
+describe("Solana Echo rail", () => {
+  it("gets a real SDK memo from the reflected challenge and records bound fulfillment", async () => {
+    const f = await fixture({ echo: "match" });
+    const pay = await f.rail({ echo: { requireBinding: true } });
+    const response = await send(pay);
+    expect(response.status).toBe(200);
+    await pay.flush();
+    expect(f.signTransactions).toHaveBeenCalledTimes(1);
+    const probe = vi.mocked(f.seller).mock.calls[0][0] as Request;
+    const nonce = probe.headers.get("X-Buyer-Nonce");
+    expect(nonce).toMatch(/^[0-9a-f]{32}$/);
+    expect(f.inputs[0].expectedExternalId).toBe(`twzrd:p:${nonce}`);
+    expect(f.rows[0]).toMatchObject({
+      receipt_reference_chain_verified: true,
+      receipt_reference_purchase_bound: true,
+      receipt_reference_purchase_bound_reason: null,
+    });
+  });
+
+  it("falls back to unbound when an opted-in seller omits reflection", async () => {
+    const f = await fixture();
+    const pay = await f.rail({ echo: {} });
+    await send(pay);
+    await pay.flush();
+    expect(f.signTransactions).toHaveBeenCalledTimes(1);
+    expect(f.rows[0]).toMatchObject({
+      receipt_reference_chain_verified: true,
+      receipt_reference_purchase_bound: null,
+      receipt_reference_purchase_bound_reason: "no_buyer_nonce",
+    });
+  });
+
+  it.each(["missing", "mismatch", "empty"] as const)(
+    "refuses %s reflection with zero signatures",
+    async (state) => {
+      const f = await fixture(
+        state === "mismatch"
+          ? { echo: "mismatch" }
+          : state === "empty"
+            ? { sellerExternalId: "" }
+            : {},
+      );
+      const pay = await f.rail({ echo: { requireBinding: state === "missing" } });
+      await expect(send(pay)).rejects.toThrow(
+        state === "missing" ? /REJECTED_UNBOUND_CHALLENGE/ : /externalId mismatch/,
+      );
+      expect(f.signTransactions).not.toHaveBeenCalled();
+      expect(f.retainedByBuyer).toHaveLength(0);
+      expect(f.seller).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("leaves existing seller externalId and headers alone when Echo is off", async () => {
+    const f = await fixture({ sellerExternalId: "seller-owned-id" });
+    const pay = await f.rail();
+    await send(pay);
+    await pay.flush();
+    expect((vi.mocked(f.seller).mock.calls[0][0] as Request).headers.has("X-Buyer-Nonce")).toBe(
+      false,
+    );
+    expect(f.rows[0].receipt_reference_purchase_bound).toBeNull();
+    expect(f.signTransactions).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps fresh nonces and verification contexts separate for concurrent requests", async () => {
+    const f = await fixture({ echo: "match" });
+    const pay = await f.rail({ echo: {} });
+    await Promise.all([send(pay), send(pay)]);
+    await pay.flush();
+    const nonces = f.inputs.map((x) => x.expectedExternalId);
+    expect(new Set(nonces).size).toBe(2);
+    expect(f.rows.every((x) => x.receipt_reference_purchase_bound === true)).toBe(true);
+    expect(f.signTransactions).toHaveBeenCalledTimes(2);
+  });
+
+  it("replaces a caller nonce with fresh buyer entropy while preserving Request headers", async () => {
+    const f = await fixture({ echo: "match" });
+    const pay = await f.rail({ echo: {} });
+    const input = new Request(URL_, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Buyer-Nonce": "caller-selected",
+        "x-test": "preserved",
+      },
+      body: '{"model":"m"}',
+    });
+    await pay(input);
+    await pay.flush();
+    const probe = vi.mocked(f.seller).mock.calls[0][0] as Request;
+    expect(probe.headers.get("X-Buyer-Nonce")).toMatch(/^[0-9a-f]{32}$/);
+    expect(probe.headers.get("x-test")).toBe("preserved");
+    expect(input.headers.get("X-Buyer-Nonce")).toBe("caller-selected");
+  });
+});
+
+describe("Echo preserves existing payment vetoes", () => {
+  it("creates no signature when the TWZRD gate blocks a reflected challenge", async () => {
+    const f = await fixture({ echo: "match" });
+    const pay = await f.rail({
+      echo: { requireBinding: true },
+      integration: {
+        twzrdMppIntegration: true,
+        gate: async () => ({ disposition: "block" }),
+        onFulfillment: () => {},
+        flush: async () => {},
+      },
+    });
+    await expect(send(pay)).rejects.toThrow();
+    expect(f.signTransactions).not.toHaveBeenCalled();
+    expect(f.retainedByBuyer).toHaveLength(0);
+  });
+
+  it("creates no signature when a reflected challenge exceeds the buyer limit", async () => {
+    const f = await fixture({ echo: "match" });
+    const spend = new SpendControl({ storage: new InMemorySpendControlStorage() });
+    spend.setLimit("perRequest", 0.0005);
+    const pay = await f.rail({ echo: { requireBinding: true }, spend });
+    await expect(send(pay)).rejects.toThrow();
+    expect(f.signTransactions).not.toHaveBeenCalled();
+    expect(f.retainedByBuyer).toHaveLength(0);
+  });
+});
+
+describe("Echo prevents borrowed-receipt binding", () => {
+  it("rejects an earlier purchase's receipt even when the amount and payee match", async () => {
+    const f = await fixture({ echo: "match" });
+    const pay = await f.rail({ echo: { requireBinding: true } });
+    await send(pay);
+    await pay.flush();
+    expect(f.rows[0].receipt_reference_purchase_bound).toBe(true);
+    f.replay(f.rows[0].receipt_reference!);
+    await send(pay);
+    await pay.flush();
+    expect(f.inputs[0].expectedExternalId).not.toBe(f.inputs[1].expectedExternalId);
+    expect(f.rows[1]).toMatchObject({
+      receipt_reference_chain_verified: false,
+      receipt_reference_mismatch: "message_mismatch",
+      receipt_reference_purchase_bound: null,
+      receipt_reference_purchase_bound_reason: "chain_unverified",
     });
   });
 });

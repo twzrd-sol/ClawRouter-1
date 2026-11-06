@@ -3,7 +3,7 @@
  * challenge before signing; the SDK builds the transaction and the seller submits it.
  * No environment variables, key files, or global fetch patches.
  */
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { KeyPairSigner } from "@solana/kit";
 import {
   assertSpendPolicyAllows,
@@ -53,6 +53,28 @@ export const DEFAULT_SOLANA_USD_MINTS: ReadonlySet<string> = new Set([
 ]);
 
 type SolanaNetwork = "mainnet" | "devnet" | "localnet";
+export type EchoPolicy = { requireBinding?: boolean };
+export type EchoBindingContext = { buyerNonce: string; expectedExternalId: string };
+
+export function createEchoContext(): EchoBindingContext {
+  const buyerNonce = randomBytes(16).toString("hex");
+  return { buyerNonce, expectedExternalId: `twzrd:p:${buyerNonce}` };
+}
+
+export function assertEchoPreSign(
+  challengeExternalId: unknown,
+  context: EchoBindingContext,
+  policy: EchoPolicy = {},
+): "bound" | "unbound" {
+  if (challengeExternalId === undefined || challengeExternalId === null) {
+    if (policy.requireBinding)
+      throw new SpendPolicyError("REJECTED_UNBOUND_CHALLENGE: Seller failed to echo buyer nonce");
+    return "unbound";
+  }
+  if (challengeExternalId !== context.expectedExternalId)
+    throw new SpendPolicyError("SECURITY_VIOLATION: Challenge externalId mismatch");
+  return "bound";
+}
 const CAIP2: Record<SolanaNetwork, string> = {
   mainnet: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
   devnet: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
@@ -74,6 +96,8 @@ export type SolanaMppFetchOptions = {
    * omitted (the row's receipt_reference_* verification fields stay null). Never delays the response.
    */
   receiptVerification?: SolanaReceiptVerificationOptions;
+  /** Opt in to buyer nonce reflection. Omit to preserve existing seller externalId behavior. */
+  echo?: EchoPolicy;
 };
 
 export type SolanaReceiptVerificationOptions = {
@@ -160,6 +184,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
     /** Buyer-generated id of this logical purchase; shared by every send of the same credential. */
     purchaseId: string;
     hasSplits: boolean;
+    expectedExternalId: string | null;
   };
   // Share construction of the same credential, including overlapping requests.
   const signedOnce = new Map<string, Promise<Signed>>();
@@ -189,6 +214,9 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
         opts.spend,
         async () => {
           const request = new Request(input, cleanInit);
+          const echoContext = opts.echo === undefined ? undefined : createEchoContext();
+          // Always use fresh buyer entropy, never a caller-supplied header value.
+          if (echoContext) request.headers.set("X-Buyer-Nonce", echoContext.buyerNonce);
           const requestForRecord = request.clone();
           const probe = await base(request.clone());
           if (probe.status !== 402) return probe;
@@ -218,6 +246,11 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
           );
           const payment = paymentFactsFromMppChallenge(challenge);
           markPaymentChallenge(payment);
+          const expectedExternalId =
+            echoContext &&
+            assertEchoPreSign(challenge.request.externalId, echoContext, opts.echo) === "bound"
+              ? echoContext.expectedExternalId
+              : null;
           const key = JSON.stringify([
             challenge.id,
             challenge.realm,
@@ -225,6 +258,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
             challenge.intent,
             challenge.expires,
             challenge.request,
+            echoContext?.expectedExternalId,
           ]);
           let gatePending = gateOnce.get(key);
           if (!gatePending) {
@@ -311,6 +345,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
                   signedAtUnix,
                   purchaseId: randomUUID(),
                   hasSplits: Array.isArray(splits) && splits.length > 0,
+                  expectedExternalId,
                 };
               } catch (err) {
                 if (signed) {
@@ -361,6 +396,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
                         signedTransaction: result.signedTransaction,
                         signedAtUnix: result.signedAtUnix,
                         purchaseId: result.purchaseId,
+                        expectedExternalId: result.expectedExternalId,
                       }),
                     verification.waitMs,
                     verification.pollMs,

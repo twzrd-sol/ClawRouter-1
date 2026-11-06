@@ -9,6 +9,9 @@ import {
   getAddressEncoder,
   getBase58Decoder,
   getBase64EncodedWireTransaction,
+  getBase64Encoder,
+  getCompiledTransactionMessageDecoder,
+  getTransactionDecoder,
   getProgramDerivedAddress,
   partiallySignTransaction,
   pipe,
@@ -64,13 +67,15 @@ type Shape = {
   blockhash?: Blockhash;
   /** Fee payer; defaults to the sponsor. */
   feePayer?: Party;
+  /** Token account the transfer debits; defaults to the authority's ATA. */
+  source?: Address;
 };
 
 async function transferIx(buyer: Party, payTo: string, s: Shape): Promise<Instruction> {
   const program = s.program ?? TOKEN;
   const mint = s.mint ?? USDC;
   const authority = s.authority ?? buyer;
-  const source = await ata(authority.address, mint, program);
+  const source = s.source ?? (await ata(authority.address, mint, program));
   const dest = await ata(s.destOwner ?? payTo, mint, program);
   if (s.bare) {
     return {
@@ -448,6 +453,93 @@ describe("receipt chain verification", () => {
           (await verify(input(buyer, payTo, p, over))).receipt_reference_chain_verified,
         ).not.toBe(true);
       }
+    }
+  });
+
+  it("counts inner (CPI) token transfers", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo);
+    const message = getCompiledTransactionMessageDecoder().decode(
+      getTransactionDecoder().decode(getBase64Encoder().encode(p.onChain)).messageBytes,
+    );
+    if (message.version !== 0) throw new Error("fixture must be v0");
+    const outer = message.instructions[0];
+    const innerOf = (data: Uint8Array) => ({
+      programIdIndex: outer.programAddressIndex,
+      accounts: [...(outer.accountIndices ?? [])],
+      data: getBase58Decoder().decode(data),
+    });
+    const checked = new Uint8Array(outer.data ?? []);
+    const bare = new Uint8Array([3, ...u64(AMOUNT)]);
+    for (const [data, code] of [
+      [checked, "multiple_matching_transfers"],
+      [bare, "multiple_matching_transfers"],
+    ] as const) {
+      const { verify } = verifier(
+        rpc(p.onChain, {
+          meta: { err: null, innerInstructions: [{ index: 0, instructions: [innerOf(data)] }] },
+        }),
+      );
+      const r = await verify(input(buyer, payTo, p));
+      expect(r.receipt_reference_chain_verified).toBe(false);
+      expect(r.receipt_reference_mismatch).toBe(code);
+    }
+    // Inner data that is not base58 is an RPC fault, never a verdict.
+    const { verify } = verifier(
+      rpc(p.onChain, {
+        meta: {
+          err: null,
+          innerInstructions: [{ index: 0, instructions: [{ ...innerOf(checked), data: "0OIl" }] }],
+        },
+      }),
+    );
+    expect((await verify(input(buyer, payTo, p))).receipt_reference_unverified_reason).toBe(
+      "rpc_unavailable",
+    );
+  });
+
+  it("a result without innerInstructions is rpc_unavailable, not verified", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo);
+    for (const innerInstructions of [undefined, null]) {
+      const { verify } = verifier(rpc(p.onChain, { meta: { err: null, innerInstructions } }));
+      const r = await verify(input(buyer, payTo, p));
+      expect(r.receipt_reference_chain_verified).toBeNull();
+      expect(r.receipt_reference_unverified_reason).toBe("rpc_unavailable");
+    }
+  });
+
+  it("a transfer from a token account other than the buyer's ATA is payer_mismatch", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const third = await generateKeyPairSigner();
+    const p = await payment(buyer, sponsor, payTo, { source: await ata(third.address, USDC) });
+    const { verify } = verifier(rpc(p.onChain));
+    const r = await verify(input(buyer, payTo, p));
+    expect(r.receipt_reference_chain_verified).toBe(false);
+    expect(r.receipt_reference_mismatch).toBe("payer_mismatch");
+  });
+
+  it("a stale reference is refused without taking an index slot", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo);
+    const index = new InMemoryReceiptReferenceIndex();
+    const stale = createReceiptChainVerifier({
+      cluster: "mainnet",
+      index,
+      getTransaction: async () => rpc(p.onChain, { blockTime: SIGNED_AT - 601 }),
+    });
+    const r = await stale(input(buyer, payTo, p));
+    expect(r.receipt_reference_refusal_reason).toBe("stale_by_local_clock");
+    expect(await index.owner(p.reference)).toBeUndefined();
+  });
+
+  it("an inherited key is not a stablecoin symbol", async () => {
+    const { buyer, sponsor, payTo } = await setup();
+    const p = await payment(buyer, sponsor, payTo);
+    for (const asset of ["__proto__", "constructor", "toString"]) {
+      const { verify } = verifier(rpc(p.onChain));
+      const r = await verify(input(buyer, payTo, p, { asset }));
+      expect(r.receipt_reference_unverified_reason).toBe("unnormalized_terms");
     }
   });
 });

@@ -234,8 +234,9 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
     ) {
       refusal = "stale_by_local_clock";
     }
-    if (verified === true) {
-      // Bind only verified references, so an unverified one cannot occupy the index.
+    if (verified === true && refusal === null) {
+      // Bind only verified, otherwise-acceptable references, so neither an unverified nor a
+      // stale reference can occupy an index slot.
       const owns = await config.index.bind(input.reference, input.purchaseId);
       if (!owns) refusal = "reference_reused";
     } else {
@@ -299,7 +300,12 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
     if (!input.signedTransaction) return result(null, "no_signed_transaction");
 
     // Normalize seller terms with the rail's rules; keep raw terms out of the comparison.
-    const asset = input.asset ? (SYMBOL_MINTS[cluster][input.asset] ?? input.asset) : null;
+    const symbols = SYMBOL_MINTS[cluster];
+    const asset = input.asset
+      ? Object.prototype.hasOwnProperty.call(symbols, input.asset)
+        ? symbols[input.asset]
+        : input.asset
+      : null;
     if (!asset || !kit.isAddress(asset)) return result(null, "unnormalized_terms");
     if (!input.payTo || !kit.isAddress(input.payTo)) return result(null, "unnormalized_terms");
     if (!kit.isAddress(input.payer)) return result(null, "unnormalized_terms");
@@ -372,7 +378,9 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
       consider(ix.programAddressIndex, ix.accountIndices ?? [], new Uint8Array(ix.data ?? []));
     }
     const base58Bytes = kit.getBase58Encoder();
-    for (const group of tx.meta.innerInstructions ?? []) {
+    // A finalized base64 result always carries the field; its absence hides CPI transfers.
+    if (!Array.isArray(tx.meta.innerInstructions)) return at(null, "rpc_unavailable");
+    for (const group of tx.meta.innerInstructions) {
       for (const ix of group.instructions) {
         let data: Uint8Array;
         try {
@@ -391,7 +399,7 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
     const [transfer] = checked;
     if (transfer.data.length < 10 || transfer.accounts.length < 4)
       return at(false, "no_matching_transfer");
-    const [, mint, destination, authority] = transfer.accounts;
+    const [source, mint, destination, authority] = transfer.accounts;
     const trust = Object.prototype.hasOwnProperty.call(trusted, asset) ? trusted[asset] : undefined;
     if (!trust) return at(false, "untrusted_mint");
     if (!trust.tokenPrograms.includes(transfer.program))
@@ -410,6 +418,16 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig) {
     if (readU64(transfer.data, 1) !== BigInt(input.amountAtomic))
       return at(false, "amount_mismatch");
     if (authority !== input.payer) return at(false, "payer_mismatch");
+    // From the buyer's own token account, not one it is merely a delegate on.
+    const [expectedSource] = await kit.getProgramDerivedAddress({
+      programAddress: kit.address(ASSOCIATED_TOKEN_PROGRAM),
+      seeds: [
+        kit.getAddressEncoder().encode(kit.address(input.payer)),
+        kit.getAddressEncoder().encode(kit.address(transfer.program)),
+        kit.getAddressEncoder().encode(kit.address(asset)),
+      ],
+    });
+    if (source !== expectedSource) return at(false, "payer_mismatch");
     return at(true, null);
   }
 }

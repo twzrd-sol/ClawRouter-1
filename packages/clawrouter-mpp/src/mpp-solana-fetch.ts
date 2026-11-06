@@ -3,6 +3,7 @@
  * challenge before signing; the SDK builds the transaction and the seller submits it.
  * No environment variables, key files, or global fetch patches.
  */
+import { randomUUID } from "node:crypto";
 import type { KeyPairSigner } from "@solana/kit";
 import {
   assertSpendPolicyAllows,
@@ -31,7 +32,12 @@ import {
   type MppIntegration,
   type MppGateDecision,
 } from "./mpp-gate.js";
-import { recordMppFulfillment, type MppPaymentFacts } from "./mpp-fulfillment-record.js";
+import {
+  recordMppFulfillment,
+  type MppPaymentFacts,
+  type MppReceiptReferenceVerifier,
+} from "./mpp-fulfillment-record.js";
+import type { ReceiptChainVerification, ReceiptChainVerify } from "./receipt-chain-verify.js";
 import {
   currentMppPaymentBudget,
   paymentBudgetFromInit,
@@ -63,7 +69,69 @@ export type SolanaMppFetchOptions = {
   integration: MppIntegration;
   /** Injectable transport; defaults to fetch. The SDK's RPC transport is separate. */
   fetch?: typeof fetch;
+  /**
+   * Chain-verify each seller receipt reference before its fulfillment row is written. Off when
+   * omitted (the row's receipt_reference_* verification fields stay null). Never delays the response.
+   */
+  receiptVerification?: SolanaReceiptVerificationOptions;
 };
+
+export type SolanaReceiptVerificationOptions = {
+  /** From createReceiptChainVerifier, built for the same cluster as `network`. */
+  verify: ReceiptChainVerify;
+  /**
+   * How long to keep re-checking a reference that is not finalized yet, in ms. Default 0: one check,
+   * and a not-yet-finalized reference is recorded as null/not_finalized. This delays only the row
+   * (and flush()), never the response.
+   */
+  finalityWaitMs?: number;
+  /** Delay between finality re-checks, in ms. Default 2000. */
+  finalityPollMs?: number;
+};
+
+const MAX_TIMER_MS = 2_147_483_647;
+
+function verificationSettings(
+  options: SolanaReceiptVerificationOptions | undefined,
+  network: SolanaNetwork,
+) {
+  if (options === undefined) return undefined;
+  if (typeof options?.verify !== "function") {
+    throw new TypeError("receiptVerification.verify must come from createReceiptChainVerifier");
+  }
+  if (options.verify.cluster !== network) {
+    throw new TypeError(
+      `receiptVerification is built for ${String(options.verify.cluster)}, but the rail network is ${network}`,
+    );
+  }
+  const waitMs = options.finalityWaitMs ?? 0;
+  const pollMs = options.finalityPollMs ?? 2000;
+  for (const [name, value, min] of [
+    ["finalityWaitMs", waitMs, 0],
+    ["finalityPollMs", pollMs, 1],
+  ] as const) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > MAX_TIMER_MS)
+      throw new TypeError(
+        `receiptVerification.${name} must be a number from ${min} to ${MAX_TIMER_MS}`,
+      );
+  }
+  return { verify: options.verify, waitMs, pollMs };
+}
+
+/** Re-check while the reference is not finalized, until the wait elapses. */
+async function verifyUntilFinal(
+  verify: () => Promise<ReceiptChainVerification>,
+  waitMs: number,
+  pollMs: number,
+): Promise<ReceiptChainVerification> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const result = await verify();
+    if (result.receipt_reference_unverified_reason !== "not_finalized") return result;
+    if (Date.now() + pollMs > deadline) return result;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}
 
 /** Official charge-method entry point. Tests replace only transaction construction. */
 export const solanaChargeDeps = {
@@ -73,6 +141,7 @@ export const solanaChargeDeps = {
 export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise<MppPayFetch> {
   assertMppIntegration(opts?.integration, "Solana");
   const integration = Object.freeze({ ...opts.integration });
+  const verification = verificationSettings(opts.receiptVerification, opts.network);
   const { charge, selectSolanaChargeChallengeFromResponse, resolveStablecoinMint } =
     await solanaChargeDeps.load();
   const base = opts.fetch ?? fetch;
@@ -84,6 +153,13 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
     record?: SpendRecord;
     gate?: MppGateDecision;
     payment?: MppPaymentFacts;
+    /** Base64 wire transaction from the SDK's `signed` event; null when the method emitted none. */
+    signedTransaction: string | null;
+    /** Buyer clock, unix seconds, when the transaction was signed. */
+    signedAtUnix: number | null;
+    /** Buyer-generated id of this logical purchase; shared by every send of the same credential. */
+    purchaseId: string;
+    hasSplits: boolean;
   };
   // Share construction of the same credential, including overlapping requests.
   const signedOnce = new Map<string, Promise<Signed>>();
@@ -184,6 +260,8 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
               let sessionSpendRecorded = false;
               let record: SpendRecord | undefined;
               let payload = "";
+              let signedTransaction: string | null = null;
+              let signedAtUnix: number | null = null;
               try {
                 const method = charge({
                   signer: opts.signer,
@@ -194,6 +272,8 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
                     if (event.type !== "signed") return;
                     signed = true;
                     payload = event.transaction;
+                    signedTransaction = event.transaction;
+                    signedAtUnix = Math.floor(Date.now() / 1000);
                     if (!sessionSpendRecorded) {
                       budgetContext?.recordSigned(budgetQuoteMicros);
                       sessionSpendRecorded = true;
@@ -220,12 +300,17 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
                     });
                   }
                 }
+                const splits = (challenge.request.methodDetails as { splits?: unknown }).splits;
                 return {
                   credential,
                   payload,
                   record,
                   gate: gateDecision,
                   payment,
+                  signedTransaction,
+                  signedAtUnix,
+                  purchaseId: randomUUID(),
+                  hasSplits: Array.isArray(splits) && splits.length > 0,
                 };
               } catch (err) {
                 if (signed) {
@@ -259,8 +344,36 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
           const response = await base(new Request(request, { headers }));
           const paid = currentPaidCall();
           if (response.status !== 402 && paid?.signed && paid.payment) {
+            const terms = paid.payment;
+            const verifyReceiptReference: MppReceiptReferenceVerifier | undefined = verification
+              ? (reference) =>
+                  verifyUntilFinal(
+                    () =>
+                      verification.verify({
+                        reference,
+                        method: terms.method,
+                        network: terms.network,
+                        asset: terms.asset,
+                        payTo: terms.payTo,
+                        amountAtomic: terms.amountAtomic,
+                        hasSplits: result.hasSplits,
+                        payer: opts.signer.address,
+                        signedTransaction: result.signedTransaction,
+                        signedAtUnix: result.signedAtUnix,
+                        purchaseId: result.purchaseId,
+                      }),
+                    verification.waitMs,
+                    verification.pollMs,
+                  )
+              : undefined;
             return recordMppFulfillment(
-              { input: requestForRecord, response, payment: paid.payment, gate: paid.gate },
+              {
+                input: requestForRecord,
+                response,
+                payment: terms,
+                gate: paid.gate,
+                verifyReceiptReference,
+              },
               integration.onFulfillment,
               trackFulfillment,
             );

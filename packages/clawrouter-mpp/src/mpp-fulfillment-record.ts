@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { MppGateDecision } from "./mpp-gate.js";
+import type { ReceiptChainVerification } from "./receipt-chain-verify.js";
 
-export const MPP_FULFILLMENT_RECORD_SCHEMA = "twzrd.mpp.fulfillment.v2";
+export const MPP_FULFILLMENT_RECORD_SCHEMA = "twzrd.mpp.fulfillment.v3";
 export const MPP_FULFILLMENT_MAX_BODY_BYTES = 1024 * 1024;
 
 export type MppPaymentFacts = {
@@ -14,7 +15,36 @@ export type MppPaymentFacts = {
   amountAtomic: string | null;
 };
 
-export type MppFulfillmentRecord = {
+/**
+ * Chain verification of the seller's receipt reference. Every field is null when no verifier ran
+ * (none configured, a non-Solana rail, or no valid-format receipt): null means "not evaluated",
+ * never "clean". See docs/receipt-chain-verify.md for each field.
+ */
+export type MppReceiptReferenceVerification = ReceiptChainVerification;
+
+/** Verifies one seller receipt reference against the paid call it came from. Supplied by a rail. */
+export type MppReceiptReferenceVerifier = (
+  reference: string,
+) => Promise<MppReceiptReferenceVerification>;
+
+export const RECEIPT_REFERENCE_NOT_EVALUATED: Readonly<MppReceiptReferenceVerification> =
+  Object.freeze({
+    receipt_reference_chain_verified: null,
+    receipt_reference_finalized_slot: null,
+    receipt_reference_mismatch: null,
+    receipt_reference_unverified_reason: null,
+    receipt_reference_purchase_bound: null,
+    receipt_reference_purchase_bound_reason: null,
+    receipt_reference_local_acceptance: null,
+    receipt_reference_refusal_reason: null,
+  });
+
+const VERIFIER_ERROR: Readonly<MppReceiptReferenceVerification> = Object.freeze({
+  ...RECEIPT_REFERENCE_NOT_EVALUATED,
+  receipt_reference_unverified_reason: "verifier_error",
+});
+
+export type MppFulfillmentRecord = MppReceiptReferenceVerification & {
   schema: typeof MPP_FULFILLMENT_RECORD_SCHEMA;
   at_unix_ms: number;
   resource_origin: string | null;
@@ -29,7 +59,10 @@ export type MppFulfillmentRecord = {
   receipt_state: "valid_format" | "missing" | "invalid_format" | "unavailable";
   receipt_status: string | null;
   receipt_method: string | null;
-  /** Seller-supplied MPP receipt reference (EVM hash or Solana signature); not chain-verified here. */
+  /**
+   * Seller-supplied MPP receipt reference (EVM hash or Solana signature). Chain-verified only when
+   * the rail was given a verifier; see the receipt_reference_* verification fields.
+   */
   receipt_reference: string | null;
   receipt_timestamp: string | null;
   requested_model: string | null;
@@ -58,6 +91,8 @@ export type MppFulfillmentInput = {
   response: Response;
   payment: MppPaymentFacts;
   gate?: MppGateDecision;
+  /** Called once with a valid-format receipt reference before the row is written. */
+  verifyReceiptReference?: MppReceiptReferenceVerifier;
 };
 
 export type MppFulfillmentSink = (record: MppFulfillmentRecord) => void | Promise<void>;
@@ -336,6 +371,16 @@ async function emitRecord(
   const res = asRecord(responseValue);
   const requestedModel = string(req?.model);
   const sellerReportedModel = string(sellerModelOverride) ?? string(res?.model);
+  const reference = string(receipt.value?.reference);
+  let verification: MppReceiptReferenceVerification = RECEIPT_REFERENCE_NOT_EVALUATED;
+  if (receipt.state === "valid_format" && reference && input.verifyReceiptReference) {
+    try {
+      verification = await input.verifyReceiptReference(reference);
+    } catch {
+      // Verification is evidence, not a delivery condition: the row is still written.
+      verification = VERIFIER_ERROR;
+    }
+  }
   const row: MppFulfillmentRecord = {
     schema: MPP_FULFILLMENT_RECORD_SCHEMA,
     at_unix_ms: Date.now(),
@@ -351,7 +396,7 @@ async function emitRecord(
     receipt_state: receipt.state,
     receipt_status: string(receipt.value?.status),
     receipt_method: string(receipt.value?.method),
-    receipt_reference: string(receipt.value?.reference),
+    receipt_reference: reference,
     receipt_timestamp: string(receipt.value?.timestamp),
     requested_model: requestedModel,
     seller_reported_model: sellerReportedModel,
@@ -362,6 +407,14 @@ async function emitRecord(
     gate: input.gate ?? null,
     response_bytes: digest.response_bytes,
     body_sha256: digest.body_sha256,
+    receipt_reference_chain_verified: verification.receipt_reference_chain_verified,
+    receipt_reference_finalized_slot: verification.receipt_reference_finalized_slot,
+    receipt_reference_mismatch: verification.receipt_reference_mismatch,
+    receipt_reference_unverified_reason: verification.receipt_reference_unverified_reason,
+    receipt_reference_purchase_bound: verification.receipt_reference_purchase_bound,
+    receipt_reference_purchase_bound_reason: verification.receipt_reference_purchase_bound_reason,
+    receipt_reference_local_acceptance: verification.receipt_reference_local_acceptance,
+    receipt_reference_refusal_reason: verification.receipt_reference_refusal_reason,
   };
   await sink(row);
 }

@@ -3,6 +3,15 @@
 MPP (Machine Payments Protocol) payment rails for [ClawRouter](https://github.com/BlockRunAI/ClawRouter):
 pay an MPP seller over **Tempo** or **Solana** instead of x402, under ClawRouter's own spend limits.
 
+## Unreleased: upgrading from 0.3.0
+
+- Fulfillment rows now use `twzrd.mpp.fulfillment.v3`. v3 adds eight `receipt_reference_*`
+  verification fields (below); every other field is unchanged. Readers must accept the new schema.
+  The fields are null unless the Solana rail was given `receiptVerification`, so Tempo rows and
+  unconfigured Solana rows carry them as null ("not evaluated", never "clean").
+- `createSolanaMppFetch({ receiptVerification: { verify } })` retains the transaction the buyer
+  signed and chain-verifies the seller's receipt reference before writing the row.
+
 ## Upgrading from 0.2.0
 
 - Fulfillment rows now use `twzrd.mpp.fulfillment.v2`. Readers must accept the new schema to retain
@@ -74,11 +83,51 @@ intent match the challenge; it is not an on-chain verification. `seller_reported
 compares labels only and does not verify model identity. A failed local write does not change an
 already-paid response; `payFetch.flush()` surfaces persistence failures to the shutdown caller.
 
-Rows use schema `twzrd.mpp.fulfillment.v2`. `response_bytes` and `body_sha256` (lowercase hex
+Rows use schema `twzrd.mpp.fulfillment.v3`. `response_bytes` and `body_sha256` (lowercase hex
 SHA-256) describe the complete response body as the recorder read it: a JSON body read through its
 clone, or an SSE body tapped to its end. Both are `null` when the recorder did not read the body,
 it exceeded 1 MiB, or the stream was cancelled or errored before its end; a partial body is never
 hashed. The digest is of bytes the seller sent and is not a seller attestation.
+
+### Receipt reference chain verification (Solana, opt-in)
+
+```ts
+import { createReceiptChainVerifier, createSolanaMppFetch } from "@twzrd1111/clawrouter-mpp";
+
+const verify = createReceiptChainVerifier({
+  cluster: "mainnet", // must match the rail's network; a mismatch throws at construction
+  getTransaction, // your finalized getTransaction (base64, maxSupportedTransactionVersion 0)
+  index, // a durable ReceiptReferenceIndex with an atomic bind
+});
+const payFetch = await createSolanaMppFetch({
+  signer,
+  rpcUrl,
+  network: "mainnet",
+  spend,
+  integration,
+  receiptVerification: { verify, finalityWaitMs: 30_000 },
+});
+```
+
+The rail keeps the base64 wire transaction from the SDK's `signed` event, the buyer clock when it
+fired, and a buyer-generated purchase id (every send of one credential is one purchase). After a
+paid response, the recorder passes the seller's `valid_format` receipt reference with those facts to
+the verifier and writes its result into the row:
+
+- `receipt_reference_chain_verified` (`true`, `false`, or `null`), `receipt_reference_finalized_slot`,
+  `receipt_reference_mismatch` (why `false`), and `receipt_reference_unverified_reason` (why `null`;
+  `verifier_error` when the verifier threw).
+- `receipt_reference_purchase_bound` and its reason. It stays `null/no_buyer_nonce` until a seller
+  echoes a buyer nonce; `chain_verified: true` does not mean the payment belongs to this purchase alone.
+- `receipt_reference_local_acceptance` (`accepted`, `refused`, or `null`) and
+  `receipt_reference_refusal_reason` (`reference_reused`, `stale_by_local_clock`): this sink's
+  policy, which never changes a chain field.
+
+Verification never delays or changes the response. It delays only the row and `flush()`.
+`finalityWaitMs` (default 0) re-checks a reference that is not finalized yet every `finalityPollMs`
+(default 2000); with the default, an unfinalized reference is recorded as `null/not_finalized`.
+No RPC URL ships with the package. `InMemoryReceiptReferenceIndex` forgets on restart and is for
+tests. See `docs/receipt-chain-verify.md` for each check.
 
 This candidate requires `@twzrd1111/clawrouter >=0.12.309`, including deferred streaming headers.
 The fork is the release target. Upstream PRs #545 and #546 are independent of this release.

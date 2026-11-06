@@ -28,11 +28,14 @@ export class MppFlushTimeoutError extends Error {
   }
 }
 
+/** Largest delay setTimeout honours; Node clamps anything above it to 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
+
 function deadlineOf(options: MppFlushOptions | undefined): number | undefined {
   const value = options?.timeoutMs;
   if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new TypeError("flush timeoutMs must be a finite number >= 0");
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > MAX_TIMER_MS) {
+    throw new TypeError(`flush timeoutMs must be a number from 0 to ${MAX_TIMER_MS}`);
   }
   return value;
 }

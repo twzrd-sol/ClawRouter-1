@@ -92,7 +92,7 @@ describe("flushFulfillments deadline", () => {
     expect(failures).toHaveLength(0);
   });
 
-  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, "5" as unknown as number])(
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648, "5" as unknown as number])(
     "rejects timeoutMs %s",
     async (timeoutMs) => {
       await expect(

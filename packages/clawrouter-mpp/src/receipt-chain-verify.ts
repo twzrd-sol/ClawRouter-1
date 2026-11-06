@@ -99,9 +99,13 @@ export type RpcTransaction = {
 /**
  * Must call getTransaction(signature, {commitment: "finalized", encoding: "base64",
  * maxSupportedTransactionVersion: 0}) on the configured cluster and return its result (null when
- * not found or not finalized). Throw on transport failure.
+ * not found or not finalized). Throw on transport failure. `signal` aborts when the verifier's
+ * `rpcTimeoutMs` deadline passes; pass it to fetch() so the request is cancelled, not abandoned.
  */
-export type GetFinalizedTransaction = (signature: string) => Promise<RpcTransaction | null>;
+export type GetFinalizedTransaction = (
+  signature: string,
+  options?: { signal?: AbortSignal },
+) => Promise<RpcTransaction | null>;
 
 /**
  * Durable, atomic reference -> purchase_id index. `bind` returns true when this purchase owns the
@@ -139,7 +143,17 @@ export type ReceiptChainVerifierConfig = {
   maxAgeSeconds?: number;
   /** Default 60. */
   maxClockSkewSeconds?: number;
+  /**
+   * Deadline for one getTransaction call, in ms. Default 10000. When it passes, the fetcher's
+   * signal aborts and the reference is recorded as null/rpc_unavailable. The reference index is
+   * not covered: a durable index must bound its own calls.
+   */
+  rpcTimeoutMs?: number;
 };
+
+/** Default deadline for one getTransaction call. */
+export const DEFAULT_RPC_TIMEOUT_MS = 10_000;
+const MAX_TIMER_MS = 2_147_483_647;
 
 export type ReceiptChainVerifyInput = {
   /** Seller's receipt reference: the settled transaction signature. */
@@ -210,9 +224,42 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig): 
     );
   }
   if (!config.index) throw new TypeError("a ReceiptReferenceIndex is required");
+  const rpcTimeoutMs = config.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+  if (
+    typeof rpcTimeoutMs !== "number" ||
+    !Number.isFinite(rpcTimeoutMs) ||
+    rpcTimeoutMs < 1 ||
+    rpcTimeoutMs > MAX_TIMER_MS
+  ) {
+    throw new TypeError(`rpcTimeoutMs must be a number from 1 to ${MAX_TIMER_MS}`);
+  }
   const trusted = config.trustedMints ?? DEFAULT_TRUSTED_USD_MINTS;
   const cluster = config.cluster;
   if (!(cluster in CLUSTER_IDS)) throw new TypeError(`unknown cluster ${String(cluster)}`);
+
+  /** One getTransaction call, rejected and aborted once rpcTimeoutMs passes. */
+  async function fetchWithDeadline(
+    getTransaction: GetFinalizedTransaction,
+    reference: string,
+  ): Promise<RpcTransaction | null> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const reason = new Error(`getTransaction exceeded rpcTimeoutMs (${rpcTimeoutMs} ms)`);
+        controller.abort(reason);
+        reject(reason);
+      }, rpcTimeoutMs);
+    });
+    try {
+      return await Promise.race([
+        getTransaction(reference, { signal: controller.signal }),
+        expired,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
   async function verify(input: ReceiptChainVerifyInput): Promise<ReceiptChainVerification> {
     const chain = await chainFacts(input);
@@ -329,7 +376,7 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig): 
     if (!config.getTransaction) return result(null, "no_fetcher");
     let tx: RpcTransaction | null;
     try {
-      tx = await config.getTransaction(input.reference);
+      tx = await fetchWithDeadline(config.getTransaction, input.reference);
     } catch {
       return result(null, "rpc_unavailable");
     }

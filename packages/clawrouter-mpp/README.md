@@ -121,6 +121,9 @@ synchronous claim gives concurrent duplicates one winner. The claim remains spen
 model fails. This helper does not verify a payment itself,
 and installing a buyer rail cannot add replay protection to a remote seller.
 
+`SpentProofLedger` keeps claims in memory, so a restart or a second process forgets spent
+proofs. If that matters, persist claims or reject expired challenges at the seller.
+
 ## Credits for signed calls with no completion
 
 ```ts

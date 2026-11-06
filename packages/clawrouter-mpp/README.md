@@ -3,7 +3,12 @@
 MPP (Machine Payments Protocol) payment rails for [ClawRouter](https://github.com/BlockRunAI/ClawRouter):
 pay an MPP seller over **Tempo** or **Solana** instead of x402, under ClawRouter's own spend limits.
 
-## Unreleased: upgrading from 0.3.0
+## Upgrading to 0.4.0 from 0.3.0
+
+This release includes the standalone Solana receipt verifier (#16), fulfillment wiring (#18),
+and the per-RPC deadline (#19). Verification is opt-in and does not verify Tempo receipts.
+Purchase binding remains `null/no_buyer_nonce`; Echo and a durable reference index are not supplied
+by this release. The reference index is caller-supplied and its operations have no built-in timeout.
 
 - Fulfillment rows now use `twzrd.mpp.fulfillment.v3`. v3 adds eight `receipt_reference_*`
   verification fields (below); every other field is unchanged. Readers must accept the new schema.

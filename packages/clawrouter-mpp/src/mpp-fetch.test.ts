@@ -3,13 +3,47 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { Mppx as ServerMppx, tempo as serverTempo } from "mppx/server";
-import { createMppFetch } from "./mpp-fetch.js";
-import { MppGateError } from "./mpp-gate.js";
+import {
+  createMppFetch as createMppFetchRail,
+  mppxClientDeps,
+  type MppFetchOptions,
+} from "./mpp-fetch.js";
+import { MppGateError, type MppIntegration } from "./mpp-gate.js";
 import { runWithMppPaymentBudget } from "./mpp-payment-budget.js";
 
 const account = privateKeyToAccount(generatePrivateKey());
+const allowIntegration: MppIntegration = {
+  twzrdMppIntegration: true,
+  gate: async () => ({ disposition: "allow" }),
+  onFulfillment: async () => {},
+  flush: async () => {},
+};
+const createMppFetch = (
+  payer: typeof account,
+  base?: typeof fetch,
+  opts: Partial<MppFetchOptions> = {},
+) =>
+  createMppFetchRail(payer, base, {
+    ...opts,
+    integration: { ...allowIntegration, ...opts.integration },
+  });
 
 describe("createMppFetch", () => {
+  it("refuses factory construction without the marked integration", () => {
+    const base = vi.fn() as unknown as typeof fetch;
+    expect(() => createMppFetchRail(account, base, {} as MppFetchOptions)).toThrow(
+      /requires the MPP integration marker/,
+    );
+    expect(() =>
+      createMppFetchRail(account, base, {
+        integration: {
+          gate: allowIntegration.gate,
+          onFulfillment: allowIntegration.onFulfillment,
+          flush: allowIntegration.flush,
+        },
+      } as MppFetchOptions),
+    ).toThrow(/refusing unmarked hooks/);
+  });
   it("passes a non-402 response through untouched", async () => {
     const base = vi.fn(async () => new Response("ok", { status: 200 })) as unknown as typeof fetch;
     const res = await createMppFetch(account, base)("http://127.0.0.1:1/x");
@@ -73,14 +107,17 @@ describe("createMppFetch", () => {
     };
     const seen: unknown[] = [];
     const pay = createMppFetch(account, seller, {
-      gate: async (challenge) => {
-        seen.push(challenge);
-        return {
-          disposition: "block",
-          decisionId: "decision-blocked",
-          intentHash: "intent-hash",
-          reasonCodes: ["seller_blocked"],
-        };
+      integration: {
+        ...allowIntegration,
+        gate: async (challenge) => {
+          seen.push(challenge);
+          return {
+            disposition: "block",
+            decisionId: "decision-blocked",
+            intentHash: "intent-hash",
+            reasonCodes: ["seller_blocked"],
+          };
+        },
       },
     });
     await expect(pay("https://test.local/x", { method: "POST", body: "{}" })).rejects.toMatchObject(
@@ -96,6 +133,104 @@ describe("createMppFetch", () => {
       intent: "charge",
       request: { amount: "750" },
     });
+  });
+
+  it("flush waits for the asynchronous fulfillment sink and the local ledger", async () => {
+    const challengeRequest = {
+      amount: "750",
+      currency: "0x20c0000000000000000000000000000000000000",
+      recipient: "0x000000000000000000000000000000000000dEaD",
+      methodDetails: { chainId: 42431 },
+    };
+    const request = Buffer.from(JSON.stringify(challengeRequest)).toString("base64url");
+    const challenge = `Payment id="flush-fixture", realm="tempo.test", method="tempo", intent="charge", request="${request}"`;
+    const receipt = Buffer.from(
+      JSON.stringify({
+        method: "tempo",
+        reference: `0x${"a".repeat(64)}`,
+        status: "success",
+        timestamp: "2026-11-06T00:00:00.000Z",
+      }),
+    ).toString("base64url");
+    const base: typeof fetch = async (input, init) => {
+      const headers = new Headers(input instanceof Request ? input.headers : undefined);
+      new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+      if (!headers.has("authorization")) {
+        return new Response("", { status: 402, headers: { "www-authenticate": challenge } });
+      }
+      return new Response(JSON.stringify({ model: "seller-claims-7b" }), {
+        headers: { "content-type": "application/json", "payment-receipt": receipt },
+      });
+    };
+    const originalLoad = mppxClientDeps.load;
+    let beginSink!: () => void;
+    let releaseSink!: () => void;
+    const sinkStarted = new Promise<void>((resolve) => (beginSink = resolve));
+    const sinkBlocked = new Promise<void>((resolve) => (releaseSink = resolve));
+    const rows: unknown[] = [];
+    const flushLedger = vi.fn(async () => {});
+    mppxClientDeps.load = async () =>
+      ({
+        Mppx: {
+          create: (options: {
+            methods: Array<{
+              createCredential: (options: {
+                challenge: ReturnType<typeof parseTempoChargeHeader>;
+              }) => Promise<string>;
+            }>;
+            fetch: typeof fetch;
+          }) => ({
+            fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+              const { methods, fetch: recording } = options;
+              const first = await recording(input, init);
+              if (first.status !== 402) return first;
+              const parsed = parseTempoChargeHeader(first.headers.get("www-authenticate")!);
+              const authorization = await methods[0].createCredential({ challenge: parsed });
+              const headers = new Headers(input instanceof Request ? input.headers : undefined);
+              new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+              headers.set("authorization", authorization);
+              return recording(input, { ...init, headers });
+            },
+          }),
+        },
+        tempo: () => [
+          {
+            createCredential: async () => "Payment fixture-credential",
+          },
+        ],
+      }) as unknown as Awaited<ReturnType<typeof originalLoad>>;
+    try {
+      const pay = createMppFetch(account, base, {
+        integration: {
+          ...allowIntegration,
+          gate: async () => ({ disposition: "allow", decisionId: "fixture-decision" }),
+          onFulfillment: async (row) => {
+            beginSink();
+            await sinkBlocked;
+            rows.push(row);
+          },
+          flush: flushLedger,
+        },
+      });
+
+      const response = await pay("https://tempo.fixture.invalid/v1/chat/completions");
+      expect(await response.json()).toEqual({ model: "seller-claims-7b" });
+      const flushed = pay.flush!();
+      await sinkStarted;
+      releaseSink();
+      await flushed;
+      expect(rows).toMatchObject([
+        {
+          receipt_state: "valid_format",
+          requested_model: null,
+          seller_reported_model: "seller-claims-7b",
+          gate: { disposition: "allow", decisionId: "fixture-decision" },
+        },
+      ]);
+      expect(flushLedger).toHaveBeenCalledOnce();
+    } finally {
+      mppxClientDeps.load = originalLoad;
+    }
   });
 });
 

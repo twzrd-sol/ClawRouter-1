@@ -6,20 +6,32 @@ import { Credential } from "mppx";
 import { createPayKit, usd } from "@solana/pay-kit";
 import {
   createSolanaFixtureFetch,
-  createSolanaMppFetch,
+  createSolanaMppFetch as createSolanaMppFetchRail,
   parseSolanaChargeHeader,
   solanaChargeDeps,
   quoteFromSolanaChallenge,
   SOLANA_DEVNET_USDC_MINT,
   type SolanaChargeChallenge,
+  type SolanaMppFetchOptions,
 } from "./mpp-solana-fetch.js";
 import { InMemorySpendControlStorage, SpendControl, SpendPolicyError } from "@twzrd1111/clawrouter";
 import { MppPaidNoCompletionError, readCredits } from "./mpp-paid-failure.js";
-import { MppGateError } from "./mpp-gate.js";
+import { MppGateError, type MppIntegration } from "./mpp-gate.js";
 
 // A real pay-kit server emits real Solana MPP 402s without touching a chain. The payer's RPC points at a
 // closed port, so a veto that fails to hold would surface as a connection error, not SpendPolicyError.
 const DEAD_RPC = "http://127.0.0.1:1";
+const allowIntegration: MppIntegration = {
+  twzrdMppIntegration: true,
+  gate: async () => ({ disposition: "allow" }),
+  onFulfillment: async () => {},
+  flush: async () => {},
+};
+const createSolanaMppFetch = (opts: Partial<SolanaMppFetchOptions>) =>
+  createSolanaMppFetchRail({
+    ...opts,
+    integration: { ...allowIntegration, ...opts.integration },
+  } as SolanaMppFetchOptions);
 const servers: Server[] = [];
 afterEach(() => {
   for (const s of servers.splice(0)) s.close();
@@ -82,6 +94,24 @@ const call = (f: (u: string, i?: RequestInit) => Promise<Response>, url: string)
   f(url, { method: "POST", body: "{}" });
 
 describe("Solana MPP spend controls", () => {
+  it("refuses factory construction without the marked integration", async () => {
+    const signer = await payer();
+    await expect(
+      createSolanaMppFetchRail({
+        signer,
+        rpcUrl: DEAD_RPC,
+        network: "localnet",
+      } as unknown as SolanaMppFetchOptions),
+    ).rejects.toThrow(/requires the MPP integration marker/);
+    await expect(
+      createSolanaMppFetchRail({
+        signer,
+        rpcUrl: DEAD_RPC,
+        network: "localnet",
+        integration: { ...allowIntegration, gate: undefined },
+      } as unknown as SolanaMppFetchOptions),
+    ).rejects.toThrow(/requires a pre-payment gate/);
+  });
   it("refuses over the per-request limit before anything is signed", async () => {
     const s = await seller();
     const spend = control((c) => c.setLimit("perRequest", 0.0005));
@@ -159,9 +189,12 @@ describe("Solana MPP spend controls", () => {
       signer: watched.signer,
       rpcUrl: DEAD_RPC,
       network: "localnet",
-      gate: async (challenge) => {
-        seen.push(challenge);
-        return { disposition: "block", decisionId: "solana-block" };
+      integration: {
+        ...allowIntegration,
+        gate: async (challenge) => {
+          seen.push(challenge);
+          return { disposition: "block", decisionId: "solana-block" };
+        },
       },
     });
     await expect(call(f, s.url)).rejects.toMatchObject({
@@ -331,7 +364,7 @@ describe("createSolanaMppFetch paid failures", () => {
       rpcUrl: DEAD_RPC,
       network: "devnet",
       spend,
-      gate,
+      integration: { ...allowIntegration, gate },
       fetch: base,
     });
     const send = (budget: { assertPaymentAllowed: () => void; recordSigned: () => void }) => {

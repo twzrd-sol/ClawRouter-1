@@ -35,11 +35,13 @@ import {
 } from "./mpp-paid-failure.js";
 import { loadOptional, MPPX_RANGE } from "./mpp-optional.js";
 import {
+  assertMppIntegration,
   evaluateMppGate,
   paymentFactsFromMppChallenge,
+  type MppIntegration,
   type MppGateEvaluator,
 } from "./mpp-gate.js";
-import { recordMppFulfillment, type MppFulfillmentSink } from "./mpp-fulfillment-record.js";
+import { recordMppFulfillment } from "./mpp-fulfillment-record.js";
 import {
   currentMppPaymentBudget,
   paymentBudgetFromInit,
@@ -48,6 +50,13 @@ import {
 } from "./mpp-payment-budget.js";
 
 export type { PayFetch };
+
+/** Injectable optional client boundary for offline tests; production uses mppx/client. */
+export const mppxClientDeps: {
+  load: () => Promise<typeof import("mppx/client")>;
+} = {
+  load: () => loadOptional("mppx", MPPX_RANGE, () => import("mppx/client")),
+};
 
 /**
  * Tempo TIP-20 USD stablecoins priced here, lower-case, all 6 decimals (the challenge carries no
@@ -67,10 +76,8 @@ export type MppFetchOptions = {
   spend?: SpendControl;
   /** Override the assets treated as 6-decimal USD (lower-case addresses). */
   usdAssets?: ReadonlySet<string>;
-  /** Optional TWZRD pre-payment gate; block or evaluator errors abort before Tempo signs. */
-  gate?: MppGateEvaluator;
-  /** Optional local receipt/fulfillment record sink. Sink failures are ignored. */
-  onFulfillment?: MppFulfillmentSink;
+  /** Required branded object from createTwzrdMppIntegration. */
+  integration: MppIntegration;
 };
 
 type ChallengeLike = {
@@ -220,38 +227,55 @@ export function guardMethod<M extends MethodLike>(
 export function createMppFetch(
   account: Account,
   base: typeof fetch = fetch,
-  opts: MppFetchOptions = {},
+  opts: MppFetchOptions,
 ): PayFetch {
+  assertMppIntegration(opts?.integration, "Tempo");
+  const integration = Object.freeze({ ...opts.integration });
   // Remember the last 402 the upstream sent. mppx throws "No method found for challenges" when a 402
   // offers nothing this client can pay (e.g. a non-MPP gateway); callers expect to see that 402, not
   // an exception, so the proxy can classify it as a payment error like the other rails do.
   // Kept per call (AsyncLocalStorage), not per fetch instance: concurrent requests share this fetch.
   const calls = new AsyncLocalStorage<{ last402?: Response }>();
+  const pendingFulfillments = new Set<Promise<void>>();
+  const fulfillmentFailures: unknown[] = [];
+  const trackFulfillment = (task: Promise<void>) => {
+    let tracked!: Promise<void>;
+    tracked = task.then(
+      () => {
+        pendingFulfillments.delete(tracked);
+      },
+      (error) => {
+        fulfillmentFailures.push(error);
+        pendingFulfillments.delete(tracked);
+      },
+    );
+    pendingFulfillments.add(tracked);
+  };
   const recording: typeof fetch = async (input, init) => {
     const res = await base(input, init);
     const call = calls.getStore();
     if (call) call.last402 = res.status === 402 ? res.clone() : undefined;
     const paid = currentPaidCall();
-    if (res.status !== 402 && paid?.signed && paid.payment && opts.onFulfillment) {
+    if (res.status !== 402 && paid?.signed && paid.payment) {
       return recordMppFulfillment(
         { input, init, response: res, payment: paid.payment, gate: paid.gate },
-        opts.onFulfillment,
+        integration.onFulfillment,
+        trackFulfillment,
       );
     }
     return res;
   };
   // polyfill:false keeps globalThis.fetch untouched: only calls routed through this wrapper can pay.
   // `mppx` is an optional peer dependency, loaded on the first paid call (see mpp-optional.ts).
-  const { spend, usdAssets, gate } = opts;
+  const { spend, usdAssets } = opts;
   let mppxPromise: Promise<ReturnType<typeof MppxClient.create>> | undefined;
   const getMppx = () =>
-    (mppxPromise ??= loadOptional("mppx", MPPX_RANGE, () => import("mppx/client")).then(
-      ({ Mppx, tempo }) =>
-        Mppx.create({
-          methods: tempo({ account }).map((m) => guardMethod(m, spend, usdAssets, gate)),
-          polyfill: false,
-          fetch: recording,
-        }),
+    (mppxPromise ??= mppxClientDeps.load().then(({ Mppx, tempo }) =>
+      Mppx.create({
+        methods: tempo({ account }).map((m) => guardMethod(m, spend, usdAssets, integration.gate)),
+        polyfill: false,
+        fetch: recording,
+      }),
     ));
 
   const payFetch: PayFetch = async (input, init) => {
@@ -278,6 +302,16 @@ export function createMppFetch(
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   payFetch.isPaidResponse = isPaidResponse;
+  payFetch.flush = async () => {
+    await Promise.all([...pendingFulfillments]);
+    const errors = fulfillmentFailures.splice(0);
+    try {
+      await integration.flush();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length) throw new AggregateError(errors, "MPP fulfillment records did not flush");
+  };
   return payFetch;
 }
 

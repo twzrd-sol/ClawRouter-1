@@ -48,6 +48,7 @@ export type MppFulfillmentInput = {
 };
 
 export type MppFulfillmentSink = (record: MppFulfillmentRecord) => void | Promise<void>;
+export type MppFulfillmentPendingHook = (pending: Promise<void>) => void;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -315,18 +316,21 @@ async function emitRecord(
         : null,
     gate: input.gate ?? null,
   };
-  try {
-    await sink(row);
-  } catch {
-    // A record sink must never reach the payment path, including rejected promises.
-  }
+  await sink(row);
 }
 
 /** Capture receipt facts and seller-reported model metadata without consuming the response. */
 export function recordMppFulfillment(
   input: MppFulfillmentInput,
   sink: MppFulfillmentSink,
+  onPending?: MppFulfillmentPendingHook,
 ): Response {
+  const track = (pending: Promise<void>) => {
+    onPending?.(pending);
+    // The response path remains non-blocking. Rail.flush() can await this task
+    // and surface persistence failures to the orderly-shutdown caller.
+    void pending.catch(() => {});
+  };
   const receipt = decodeReceipt(
     input.response.headers.get("payment-receipt"),
     input.payment.challengeId,
@@ -349,41 +353,69 @@ export function recordMppFulfillment(
       input.payment.intent,
       input.payment.method,
     );
-    const requestValue = requestBody;
-    const tapped = input.response.body.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, controller) {
-          parser.push(chunk);
-          controller.enqueue(chunk);
-        },
-        flush() {
-          const parsed = parser.finish();
-          void requestValue
-            .then((request) =>
-              emitRecord(
-                input,
-                parsed.receipt,
-                request,
-                undefined,
-                sink,
-                parsed.sellerReportedModel,
-              ),
-            )
-            .catch(() => {
-              // Recording is detached from stream completion and payment behavior.
-            });
-        },
-      }),
-    );
+    const reader = input.response.body.getReader();
+    let resolveRecording!: () => void;
+    let rejectRecording!: (error: unknown) => void;
+    const recording = new Promise<void>((resolve, reject) => {
+      resolveRecording = resolve;
+      rejectRecording = reject;
+    });
+    track(recording);
+    let recordingStarted = false;
+    const finishRecord = (receipt: DecodedReceipt, sellerReportedModel: string | null) => {
+      if (recordingStarted) return;
+      recordingStarted = true;
+      const write = requestBody.then((request) =>
+        emitRecord(input, receipt, request, undefined, sink, sellerReportedModel),
+      );
+      void write.then(resolveRecording, rejectRecording);
+      void write.catch(() => {
+        process.emitWarning("MPP fulfillment record failed; call payFetch.flush() to inspect", {
+          code: "TWZRD_MPP_FULFILLMENT_RECORD_FAILED",
+        });
+      });
+    };
+    const tapped = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            const parsed = parser.finish();
+            finishRecord(parsed.receipt, parsed.sellerReportedModel);
+            controller.close();
+            reader.releaseLock();
+            return;
+          }
+          parser.push(value);
+          controller.enqueue(value);
+        } catch (error) {
+          finishRecord({ state: "unavailable", value: null }, null);
+          controller.error(error);
+        }
+      },
+      async cancel(reason) {
+        await reader.cancel(reason).catch(() => undefined);
+        const parsed = parser.finish();
+        const receipt =
+          parsed.receipt.state === "missing"
+            ? { state: "unavailable" as const, value: null }
+            : parsed.receipt;
+        finishRecord(receipt, parsed.sellerReportedModel);
+      },
+    });
     return wrappedResponse(input.response, tapped);
   }
   const responseBody = bodyIsJson(input.response.headers)
     ? readJsonCapped(input.response.clone().body)
     : Promise.resolve(undefined);
-  void Promise.all([requestBody, responseBody])
-    .then(([request, response]) => emitRecord(input, receipt, request, response, sink))
-    .catch(() => {
-      // A record read failure must never reach the payment path.
+  const recording = Promise.all([requestBody, responseBody]).then(([request, response]) =>
+    emitRecord(input, receipt, request, response, sink),
+  );
+  track(recording);
+  void recording.catch(() => {
+    process.emitWarning("MPP fulfillment record failed; call payFetch.flush() to inspect", {
+      code: "TWZRD_MPP_FULFILLMENT_RECORD_FAILED",
     });
+  });
   return input.response;
 }

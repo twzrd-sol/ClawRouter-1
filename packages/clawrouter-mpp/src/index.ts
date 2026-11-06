@@ -3,23 +3,22 @@
  *
  *   import { startProxy } from "@twzrd1111/clawrouter";
  *   import { createMppFetch } from "@twzrd1111/clawrouter-mpp";
- *   await startProxy({ ..., payFetch: createMppFetch(account, fetch, { spend }) });
+ *   await startProxy({ ..., payFetch: createMppFetch(account, fetch, { spend, integration }) });
  *
- * Two rails: Tempo (`createMppFetch`, needs `mppx`) and Solana (`createSolanaMppFetch`, needs
- * `@solana/mpp`). Both are optional peer dependencies; Tempo loads on first use,
- * Solana loads when its asynchronous factory is called.
+ * Both rails require the branded TWZRD MPP integration. Tempo (`createMppFetch`, needs
+ * `mppx`) and Solana (`createSolanaMppFetch`, needs `@solana/mpp`) remain optional peer dependencies.
  */
-export {
-  createMppFetch,
-  DEFAULT_TEMPO_USD_ASSETS,
-  guardMethod,
-  quoteFromChallenge,
-} from "./mpp-fetch.js";
+export { createMppFetch, DEFAULT_TEMPO_USD_ASSETS, quoteFromChallenge } from "./mpp-fetch.js";
 export type { MppFetchOptions, PayFetch } from "./mpp-fetch.js";
 export { createSolanaMppFetch, DEFAULT_SOLANA_USD_MINTS } from "./mpp-solana-fetch.js";
 export type { SolanaMppFetchOptions } from "./mpp-solana-fetch.js";
 export { MppGateError } from "./mpp-gate.js";
-export type { MppGateChallenge, MppGateDecision, MppGateEvaluator } from "./mpp-gate.js";
+export type {
+  MppGateChallenge,
+  MppGateDecision,
+  MppGateEvaluator,
+  MppIntegration,
+} from "./mpp-gate.js";
 export {
   MPP_FULFILLMENT_MAX_BODY_BYTES,
   MPP_FULFILLMENT_RECORD_SCHEMA,

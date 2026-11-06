@@ -185,6 +185,7 @@ describe("MPP fulfillment records", () => {
 
   it("does not let an async sink rejection break an SSE response", async () => {
     const receiptBody = `event: payment-receipt\ndata: ${JSON.stringify(sessionReceipt(payment.challengeId))}\n\n`;
+    let pending: Promise<void> | undefined;
     const response = recordMppFulfillment(
       {
         input: "https://seller.example/stream",
@@ -194,8 +195,35 @@ describe("MPP fulfillment records", () => {
       async () => {
         throw new Error("sink down");
       },
+      (task) => {
+        pending = task;
+      },
     );
     await expect(response.text()).resolves.toBe(receiptBody);
+    expect(pending).toBeInstanceOf(Promise);
+    await expect(pending!).rejects.toThrow("sink down");
+  });
+
+  it("tracks and records an SSE response canceled before its body completes", async () => {
+    const pending = nextRecord();
+    let recording: Promise<void> | undefined;
+    const response = recordMppFulfillment(
+      {
+        input: "https://seller.example/stream",
+        response: new Response(new ReadableStream<Uint8Array>(), {
+          headers: { "content-type": "text/event-stream" },
+        }),
+        payment: { ...payment, intent: "session" },
+      },
+      pending.resolve,
+      (task) => {
+        recording = task;
+      },
+    );
+    expect(recording).toBeInstanceOf(Promise);
+    await response.body!.cancel("client disconnected");
+    await recording;
+    expect(await pending.result).toMatchObject({ receipt_state: "unavailable" });
   });
 
   it("does not wait for a slow async sink before closing an SSE response", async () => {

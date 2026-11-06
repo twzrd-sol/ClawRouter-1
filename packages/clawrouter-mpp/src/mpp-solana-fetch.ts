@@ -25,16 +25,13 @@ import {
 } from "./mpp-paid-failure.js";
 import { loadOptional, SOLANA_MPP_RANGE } from "./mpp-optional.js";
 import {
+  assertMppIntegration,
   evaluateMppGate,
   paymentFactsFromMppChallenge,
+  type MppIntegration,
   type MppGateDecision,
-  type MppGateEvaluator,
 } from "./mpp-gate.js";
-import {
-  recordMppFulfillment,
-  type MppFulfillmentSink,
-  type MppPaymentFacts,
-} from "./mpp-fulfillment-record.js";
+import { recordMppFulfillment, type MppPaymentFacts } from "./mpp-fulfillment-record.js";
 import {
   currentMppPaymentBudget,
   paymentBudgetFromInit,
@@ -61,10 +58,8 @@ export type SolanaMppFetchOptions = {
   network: SolanaNetwork;
   spend?: SpendControl;
   usdMints?: Iterable<string>;
-  /** Optional TWZRD pre-payment gate; block or evaluator errors abort before Solana signs. */
-  gate?: MppGateEvaluator;
-  /** Optional local receipt/fulfillment record sink. Sink failures are ignored. */
-  onFulfillment?: MppFulfillmentSink;
+  /** Required branded object from createTwzrdMppIntegration. */
+  integration: MppIntegration;
   /** Injectable transport; defaults to fetch. The SDK's RPC transport is separate. */
   fetch?: typeof fetch;
 };
@@ -75,6 +70,8 @@ export const solanaChargeDeps = {
 };
 
 export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise<PayFetch> {
+  assertMppIntegration(opts?.integration, "Solana");
+  const integration = Object.freeze({ ...opts.integration });
   const { charge, selectSolanaChargeChallengeFromResponse, resolveStablecoinMint } =
     await solanaChargeDeps.load();
   const base = opts.fetch ?? fetch;
@@ -91,6 +88,21 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
   const signedOnce = new Map<string, Promise<Signed>>();
   // One policy evaluation for concurrent retries of the same complete challenge.
   const gateOnce = new Map<string, Promise<MppGateDecision | undefined>>();
+  const pendingFulfillments = new Set<Promise<void>>();
+  const fulfillmentFailures: unknown[] = [];
+  const trackFulfillment = (task: Promise<void>) => {
+    let tracked!: Promise<void>;
+    tracked = task.then(
+      () => {
+        pendingFulfillments.delete(tracked);
+      },
+      (error) => {
+        fulfillmentFailures.push(error);
+        pendingFulfillments.delete(tracked);
+      },
+    );
+    pendingFulfillments.add(tracked);
+  };
 
   const payFetch: PayFetch = async (input, init) => {
     const budget = paymentBudgetFromInit(init);
@@ -139,7 +151,7 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
           ]);
           let gatePending = gateOnce.get(key);
           if (!gatePending) {
-            gatePending = evaluateMppGate(opts.gate, challenge);
+            gatePending = evaluateMppGate(integration.gate, challenge);
             gateOnce.set(key, gatePending);
           }
           let gateDecision: MppGateDecision | undefined;
@@ -245,10 +257,11 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
           headers.set("authorization", result.credential);
           const response = await base(new Request(request, { headers }));
           const paid = currentPaidCall();
-          if (response.status !== 402 && paid?.signed && paid.payment && opts.onFulfillment) {
+          if (response.status !== 402 && paid?.signed && paid.payment) {
             return recordMppFulfillment(
               { input: requestForRecord, response, payment: paid.payment, gate: paid.gate },
-              opts.onFulfillment,
+              integration.onFulfillment,
+              trackFulfillment,
             );
           }
           return response;
@@ -262,6 +275,16 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
   payFetch.supportsNativeStreaming = true;
   payFetch.onNoCompletion = rejectPaidNoCompletion;
   payFetch.isPaidResponse = isPaidResponse;
+  payFetch.flush = async () => {
+    await Promise.all([...pendingFulfillments]);
+    const errors = fulfillmentFailures.splice(0);
+    try {
+      await integration.flush();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length) throw new AggregateError(errors, "MPP fulfillment records did not flush");
+  };
   return payFetch;
 }
 

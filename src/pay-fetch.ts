@@ -35,6 +35,8 @@ export type PayFetch = ((input: RequestInfo | URL, init?: RequestInit) => Promis
    * Leave unsigned responses alone so ordinary provider fallback still works.
    */
   onNoCompletion?: (response: Response, reason: string) => void;
+  /** Drain rail-owned asynchronous records and durable local ledgers during orderly shutdown. */
+  flush?: () => Promise<void>;
 };
 
 /** `Error.name` that marks "signed and sent, no completion". Matched by name so a rail in another package works. */

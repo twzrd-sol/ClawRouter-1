@@ -482,6 +482,49 @@ type ModelCatalogView = {
 };
 
 /**
+ * The upstream-fetch contract a payment rail implements.
+ *
+ * `startProxy({ payFetch })` replaces the built-in x402 / API-key rails with one of these, so a rail can
+ * live outside this package. Two obligations come with it:
+ *
+ *  1. Spend limits. A rail that signs payments must check them before it signs and say so by setting
+ *     `enforcesSpend = true`. The proxy refuses to start with a rail that leaves it unset while amount
+ *     limits are configured. Build the check on `assertSpendPolicyAllows` / `SpendControl`
+ *     (reserve, then `settleReservation` when signed, `releaseReservation` otherwise).
+ *  2. Payment in doubt. If a payment was signed and the call then fails, throw an error whose `name` is
+ *     `PaymentSettledNoCompletionError` (optionally with `reference` and `status`). The proxy answers 502
+ *     `payment_settled_no_completion` and stops: no retry and no fallback model, since either would pay twice.
+ */
+type PayFetch = ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) & {
+    /** True when this fetch checks the configured spend limits before signing. */
+    enforcesSpend?: boolean;
+    /**
+     * For `stream: true` callers, hold the final response headers until this fetch returns, so settlement
+     * metadata such as `Payment-Receipt` can ride on the final HTTP 200. While waiting the proxy sends HTTP 102
+     * (informational, commits nothing) instead of an early 200 plus SSE heartbeats, and errors keep their real
+     * status. Unset keeps the early-SSE behavior. Independent of `enforcesSpend`.
+     */
+    deferStreamingHeaders?: boolean;
+    /** Request native upstream SSE for streaming callers; JSON replies still work. */
+    supportsNativeStreaming?: boolean;
+    /** True when this exact successful Response was produced after a payment was signed. */
+    isPaidResponse?: (response: Response) => boolean;
+    /**
+     * The host found a provider error hidden in a successful HTTP response, or a
+     * paid response stream failed or ended without a completion. A rail that paid
+     * for this response must throw PaymentSettledNoCompletionError here so the
+     * host records the failure instead of paying a fallback model. The host must
+     * pass the original Response object returned by this fetch.
+     * Leave unsigned responses alone so ordinary provider fallback still works.
+     */
+    onNoCompletion?: (response: Response, reason: string) => void;
+    /** Drain rail-owned asynchronous records and durable local ledgers during orderly shutdown. */
+    flush?: () => Promise<void>;
+};
+/** `Error.name` that marks "signed and sent, no completion". Matched by name so a rail in another package works. */
+declare const PAYMENT_SETTLED_NO_COMPLETION = "PaymentSettledNoCompletionError";
+
+/**
  * Response Cache for LLM Completions
  *
  * Caches LLM responses by request hash (model + messages + params).
@@ -849,12 +892,20 @@ interface CounterpartyInfo {
     payTo?: string;
     network?: string;
     asset?: string;
+    /**
+     * The payee is not known yet and WILL be checked by a later check() call that carries `payTo`
+     * (before anything is signed). Skips only the payee lists; amount, network and asset still apply.
+     * Callers must fail closed if that later call never happens.
+     */
+    payeeDeferred?: boolean;
 }
 interface SpendRecord {
     timestamp: number;
     amount: number;
     model?: string;
     action?: string;
+    /** Free-text outcome added after the fact, e.g. "signed, no completion". Never read for policy. */
+    note?: string;
 }
 interface SpendingStatus {
     limits: SpendLimits;
@@ -1001,7 +1052,9 @@ declare class SpendControl {
     record(amount: number, metadata?: {
         model?: string;
         action?: string;
-    }): void;
+    }): SpendRecord;
+    /** Attach an outcome note to an entry returned by record()/settleReservation(), and persist it. */
+    annotateRecord(record: SpendRecord, note: string): void;
     /** True when any window that this module can compare an amount against is set. */
     hasAmountLimits(): boolean;
     /** True when a window spans more than one request, so reservations matter. */
@@ -1020,7 +1073,7 @@ declare class SpendControl {
     settleReservation(id: string, metadata?: {
         model?: string;
         action?: string;
-    }): void;
+    }): SpendRecord | undefined;
     /** Drop a reservation without recording spend (the payment was never signed). */
     releaseReservation(id: string): void;
     /** Total currently held but not yet settled. */
@@ -1065,6 +1118,24 @@ declare class SpendPolicyError extends Error {
         blockedByPolicy?: PolicyList;
     });
 }
+/** Requirements as they reach the pre-sign hook (v2 `amount`, v1 `maxAmountRequired`). */
+type QuotedRequirements = {
+    payTo?: string;
+    network?: string;
+    asset?: string;
+    amount?: string;
+    maxAmountRequired?: string;
+    /** See CounterpartyInfo.payeeDeferred. */
+    payeeDeferred?: boolean;
+};
+/**
+ * Evaluate policy and amount windows for a pending payment.
+ *
+ * Returns a reservation id when the payment may proceed and an aggregate
+ * window is configured; the caller must settle or release it. Throws
+ * `SpendPolicyError` when the payment must not be signed.
+ */
+declare function assertSpendPolicyAllows(control: SpendControl, selected: QuotedRequirements): string | undefined;
 /**
  * Register the fail-closed spend-policy hook on an x402 client.
  *
@@ -1305,6 +1376,12 @@ type ProxyOptions = {
      */
     apiKey?: string;
     apiBase?: string;
+    /**
+     * Replaces the rail's upstream fetch with one supplied by the caller (see `PayFetch` in pay-fetch.ts for
+     * the contract). When set, no x402 or API-key payment is attempted by this proxy. A rail that does not
+     * enforce spend limits is refused at startup while amount limits are configured.
+     */
+    payFetch?: PayFetch;
     /**
      * Payment chain: "base", "solana" or "arc". New installs persist "solana" at
      * wallet generation; absent config resolves to "base" for pre-existing
@@ -1595,6 +1672,11 @@ type CachedResponse = {
     body: Buffer;
     completedAt: number;
 };
+type StreamSubscriber = {
+    start(status: number, headers: Record<string, string>): void;
+    chunk(data: Buffer): void;
+    end(): void;
+};
 declare class RequestDeduplicator {
     private inflight;
     private completed;
@@ -1606,10 +1688,22 @@ declare class RequestDeduplicator {
     getCached(key: string): CachedResponse | undefined;
     /** Check if a request with this key is currently in-flight. Returns a promise to wait on. */
     getInflight(key: string): Promise<CachedResponse> | undefined;
-    /** Mark a request as in-flight. */
-    markInflight(key: string): void;
+    /** Mark a request as in-flight and return its shared upstream abort controller. */
+    markInflight(key: string): AbortController;
+    /**
+     * Keep shared upstream work alive while a producer or coalesced caller is
+     * still connected. Each release is idempotent; a late release after terminal
+     * completion cannot abort a finished request.
+     */
+    acquireInflightConsumer(key: string): (() => void) | undefined;
+    /** True when the keyed request still has at least one connected consumer. */
+    hasInflightConsumers(key: string): boolean;
     /** Complete an in-flight request — cache result and notify waiters. */
-    complete(key: string, result: CachedResponse): void;
+    complete(key: string, result: CachedResponse, cache?: boolean): void;
+    /** Join one paid stream, replaying already-delivered chunks before live ones. */
+    subscribeStream(key: string, subscriber: StreamSubscriber): (() => void) | undefined;
+    startStream(key: string, status: number, headers: Record<string, string>): void;
+    streamChunk(key: string, chunk: Buffer): void;
     /** Remove an in-flight entry on error (don't cache failures).
      *  Also rejects any waiters so they can retry independently. */
     removeInflight(key: string): void;
@@ -2014,5 +2108,5 @@ declare function buildImageGenerationProvider(): ImageGenerationProviderPlugin;
 
 declare const plugin: OpenClawPluginDefinition;
 
-export { BALANCE_THRESHOLDS, BLOCKRUN_MODELS, BLOCKRUN_PLUGIN_ID, BalanceMonitor, CAIP2_ARC, CAIP2_BASE, CAIP2_SOLANA_MAINNET, DEFAULT_RETRY_CONFIG, DEFAULT_SESSION_CONFIG, EmptyWalletError, FileSpendControlStorage, InMemorySpendControlStorage, InsufficientFundsError, MODEL_ALIASES, MalformedSpendPolicyError, OPENCLAW_MODELS, PARTNER_SERVICES, PAYABLE_NETWORKS, RequestDeduplicator, ResponseCache, RpcError, SessionStore, SolanaBalanceMonitor, SpendControl, SpendPolicyError, UnreadableSpendPolicyError, VISIBLE_OPENCLAW_MODELS, blockrunProvider, buildImageGenerationProvider, buildPartnerTools, buildProviderModels, clearStats, plugin as default, deriveAllKeys, deriveEvmKey, deriveSolanaKeyBytes, fetchWithRetry, formatDuration, formatStatsAscii, generateWalletMnemonic, getAgenticModels, getModelContextWindow, getPartnerService, getProxyPort, getSessionId, getStats, hashRequestContent, injectAuthProfile, injectModelsConfig, isAgenticModel, isBalanceError, isBlockrunWebSearchDisabled, isEmptyWalletError, isInsufficientFundsError, isRetryable, isRpcError, isValidMnemonic, loadPaymentChain, logUsage, parseCallArgs, registerSpendPolicyHook, removeRuntimeMcpConfig, resolveModelAlias, resolvePaymentChain, savePaymentChain, setRuntimeProviderConfig, setupSolana, startProxy, syncAgentModelCache };
-export type { AggregatedStats, BalanceInfo, CachedLLMResponse, CachedResponse, CheckResult, CounterpartyInfo, DailyStats, DerivedKeys, InsufficientFundsInfo, LowBalanceInfo, PartnerServiceDefinition, PartnerToolDefinition, PaymentChain, PolicyList, ProxyHandle, ProxyOptions, ResponseCacheConfig, RetryConfig, SessionConfig, SessionEntry, SolanaBalanceInfo, SpendControlOptions, SpendControlStorage, SpendLimits, SpendRecord, SpendWindow, SpendingStatus, SufficiencyResult, UsageEntry, WalletConfig, WalletResolution };
+export { BALANCE_THRESHOLDS, BLOCKRUN_MODELS, BLOCKRUN_PLUGIN_ID, BalanceMonitor, CAIP2_ARC, CAIP2_BASE, CAIP2_SOLANA_MAINNET, DEFAULT_RETRY_CONFIG, DEFAULT_SESSION_CONFIG, EmptyWalletError, FileSpendControlStorage, InMemorySpendControlStorage, InsufficientFundsError, MODEL_ALIASES, MalformedSpendPolicyError, OPENCLAW_MODELS, PARTNER_SERVICES, PAYABLE_NETWORKS, PAYMENT_SETTLED_NO_COMPLETION, RequestDeduplicator, ResponseCache, RpcError, SessionStore, SolanaBalanceMonitor, SpendControl, SpendPolicyError, UnreadableSpendPolicyError, VISIBLE_OPENCLAW_MODELS, assertSpendPolicyAllows, blockrunProvider, buildImageGenerationProvider, buildPartnerTools, buildProviderModels, clearStats, plugin as default, deriveAllKeys, deriveEvmKey, deriveSolanaKeyBytes, fetchWithRetry, formatDuration, formatStatsAscii, generateWalletMnemonic, getAgenticModels, getModelContextWindow, getPartnerService, getProxyPort, getSessionId, getStats, hashRequestContent, injectAuthProfile, injectModelsConfig, isAgenticModel, isBalanceError, isBlockrunWebSearchDisabled, isEmptyWalletError, isInsufficientFundsError, isRetryable, isRpcError, isValidMnemonic, loadPaymentChain, logUsage, parseCallArgs, registerSpendPolicyHook, removeRuntimeMcpConfig, resolveModelAlias, resolvePaymentChain, savePaymentChain, setRuntimeProviderConfig, setupSolana, startProxy, syncAgentModelCache };
+export type { AggregatedStats, BalanceInfo, CachedLLMResponse, CachedResponse, CheckResult, CounterpartyInfo, DailyStats, DerivedKeys, InsufficientFundsInfo, LowBalanceInfo, PartnerServiceDefinition, PartnerToolDefinition, PayFetch, PaymentChain, PolicyList, ProxyHandle, ProxyOptions, QuotedRequirements, ResponseCacheConfig, RetryConfig, SessionConfig, SessionEntry, SolanaBalanceInfo, SpendControlOptions, SpendControlStorage, SpendLimits, SpendRecord, SpendWindow, SpendingStatus, SufficiencyResult, UsageEntry, WalletConfig, WalletResolution };

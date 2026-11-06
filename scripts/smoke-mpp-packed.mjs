@@ -15,6 +15,16 @@ import {
   MppPaidNoCompletionError,
 } from "@twzrd1111/clawrouter-mpp";
 
+// Explicit test-only trust hooks; the smoke harness signs only fixture challenges.
+const trustHooks = {
+  integration: {
+    twzrdMppIntegration: true,
+    gate: async () => ({ disposition: "allow" }),
+    onFulfillment: async () => {},
+    flush: async () => {},
+  },
+};
+
 let networkCalls = 0;
 const realFetch = globalThis.fetch.bind(globalThis);
 const originalConnect = net.Socket.prototype.connect;
@@ -80,6 +90,7 @@ const pay = await createSolanaMppFetch({
   signer,
   rpcUrl: "http://127.0.0.1:1",
   network: "devnet",
+  ...trustHooks,
   fetch: base,
 });
 const send = () => pay("https://fixture.invalid/completions", { method: "POST", body: "{}" });
@@ -162,11 +173,12 @@ for (const rail of ["tempo", "solana"]) {
   };
   const payFetch =
     rail === "tempo"
-      ? createMppFetch(privateKeyToAccount(generatePrivateKey()), memory)
+      ? createMppFetch(privateKeyToAccount(generatePrivateKey()), memory, trustHooks)
       : await createSolanaMppFetch({
           signer: payer,
           rpcUrl: "http://127.0.0.1:1",
           network: "devnet",
+          ...trustHooks,
           fetch: memory,
         });
   assert.equal(payFetch.deferStreamingHeaders, true);
@@ -249,6 +261,7 @@ for (const [stream, native] of [
     signer: payer,
     rpcUrl: "http://127.0.0.1:1",
     network: "devnet",
+    ...trustHooks,
     fetch: base,
     spend,
   });

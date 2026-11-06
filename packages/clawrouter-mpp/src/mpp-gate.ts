@@ -1,3 +1,5 @@
+import type { MppFulfillmentSink } from "./mpp-fulfillment-record.js";
+
 /** Optional buyer-side policy hook evaluated on the exact MPP challenge before signing. */
 export type MppGateChallenge = {
   id: string;
@@ -44,6 +46,30 @@ export function paymentFactsFromMppChallenge(challenge: MppGateChallenge) {
 export type MppGateEvaluator = (
   challenge: MppGateChallenge,
 ) => MppGateDecision | Promise<MppGateDecision>;
+
+/** Integration contract accepted by the MPP factories. The marker is not an authenticity proof. */
+export type MppIntegration = Readonly<{
+  twzrdMppIntegration: true;
+  gate: MppGateEvaluator;
+  onFulfillment: MppFulfillmentSink;
+  flush: () => Promise<void>;
+}>;
+
+/** Reject incomplete or unmarked wiring before loading SDKs or accepting a payment challenge. */
+export function assertMppIntegration(
+  integration: Partial<MppIntegration> | undefined,
+  rail: "Tempo" | "Solana",
+): asserts integration is MppIntegration {
+  if (integration?.twzrdMppIntegration !== true) {
+    throw new TypeError(`${rail} MPP requires the MPP integration marker; refusing unmarked hooks`);
+  }
+  if (typeof integration.gate !== "function") {
+    throw new TypeError(`${rail} MPP requires a pre-payment gate; refusing an ungated rail`);
+  }
+  if (typeof integration.onFulfillment !== "function" || typeof integration.flush !== "function") {
+    throw new TypeError(`${rail} MPP requires fulfillment and flush callbacks`);
+  }
+}
 
 function freezeRecursively<T>(value: T): T {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {

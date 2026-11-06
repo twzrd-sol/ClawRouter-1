@@ -51,7 +51,7 @@ Chain facts (on-chain evidence only):
 - `receipt_reference_chain_verified`: `true | false | null` (payment-level, as defined above)
 - `receipt_reference_finalized_slot`: number or null (`slot` from getTransaction)
 - `receipt_reference_mismatch`: null, or one of `bad_reference_format`, `wrong_network`, `signature_mismatch`, `message_mismatch`, `buyer_signature_missing`, `untrusted_token_program`, `untrusted_mint`, `decimals_mismatch`, `tx_failed`, `no_matching_transfer`, `multiple_matching_transfers`, `amount_mismatch`, `mint_mismatch`, `payee_mismatch`, `payer_mismatch` (qualifies `chain_verified: false`)
-- `receipt_reference_unverified_reason`: null, or `rpc_unavailable`, `not_finalized`, `no_fetcher`, `non_solana`, `no_signed_transaction`, `splits_unsupported`, `unnormalized_terms` (qualifies `chain_verified: null`)
+- `receipt_reference_unverified_reason`: null, or `rpc_unavailable`, `not_finalized`, `no_fetcher`, `non_solana`, `no_signed_transaction`, `splits_unsupported`, `unnormalized_terms`, `unsupported_message_format` (a message version other than legacy or v0, or one using address lookup tables; the SDK builds v0 without them) (qualifies `chain_verified: null`)
 
 Purchase binding:
 
@@ -92,6 +92,11 @@ Rule: an RPC failure, a timeout, a null result, no configured fetcher, or a non-
 ## Open questions
 
 1. Can the buyer put its own nonce inside the signed message (for example its own memo derived from its `purchase_id` or fresh buyer entropy)? A nonce derived only from `challenge.id` is insufficient, because the seller controls that id and can repeat it. `@solana/mpp` 0.7.0 takes the memo `externalId` from the seller (`client/Charge.js:140-151`), so this needs SDK support. With it, `purchase_bound` can be `true`; without it, it cannot. TWZRD's seller already issues a fresh `externalId` per challenge (WF `server_http.py:4239`; flow comment `:4130-4133`).
+   **Answer (2026-11-06): not without an upstream protocol change.** A conforming `@solana/mpp` 0.7.0 seller rejects any memo the challenge did not ask for: `validateInstructionAllowlist` throws `Unexpected Memo Program instruction in payment transaction` (`server/Charge.js:430-446`), and `verifyMemoInstructionsPreBroadcast` accepts only the `externalId` and split memos (`:758-813`). A buyer-added memo would make every honest charge fail. Purchase binding therefore needs the protocol to admit a buyer nonce (for example a challenge flag allowing one extra buyer memo). Cost of the gap: a replay of a byte-identical message is the same transaction, so it cannot move the buyer's funds twice; what it can do is make one payment appear to settle two purchases, which the reference index refuses once either is recorded.
 2. Resolved by B1: the buyer's signature is required, and the message must equal the one it signed.
 3. Should `transferChecked`-only be relaxed for sellers whose WF parsers accept bare `transfer`?
 4. Where does the persistent `reference -> purchase_id` index live: in the caller's sink store, or in a package-provided durable store with an atomic bind? An in-memory map does not meet the requirement above.
+
+## Implementation
+
+`packages/clawrouter-mpp/src/receipt-chain-verify.ts` (`createReceiptChainVerifier`) implements checks 1-7, B1-B4, the three output groups and the precedence rule above. The caller injects `getTransaction` (no RPC URL ships) and a `ReceiptReferenceIndex`; `InMemoryReceiptReferenceIndex` is for tests and is not durable. The index binds only chain-verified references, so an unverified reference cannot occupy a slot, and an unverified reference already owned by another purchase is still refused. Retaining the signed transaction and `signed_at_unix` per call in the rail, and wiring the verifier into the fulfillment record, is a follow-up (it changes the record schema).

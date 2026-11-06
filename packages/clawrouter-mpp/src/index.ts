@@ -40,3 +40,21 @@ export { readPaidCallEvidence } from "./mpp-paid-failure.js";
 export { CreditLedger } from "./credit-record.js";
 export type { CreditEntry } from "./credit-record.js";
 export { SpentProofLedger, ReplayRejectedError, fulfillPaidProof } from "./spent-proof.js";
+export {
+  createReceiptChainVerifier,
+  DEFAULT_TRUSTED_USD_MINTS,
+  InMemoryReceiptReferenceIndex,
+  LANDING_WINDOW_SECONDS,
+} from "./receipt-chain-verify.js";
+export type {
+  ChainMismatch,
+  ChainUnverifiedReason,
+  GetFinalizedTransaction,
+  ReceiptChainVerification,
+  ReceiptChainVerifierConfig,
+  ReceiptChainVerifyInput,
+  ReceiptReferenceIndex,
+  RpcTransaction,
+  SolanaCluster,
+  TrustedMint,
+} from "./receipt-chain-verify.js";

@@ -3,6 +3,17 @@
 MPP (Machine Payments Protocol) payment rails for [ClawRouter](https://github.com/BlockRunAI/ClawRouter):
 pay an MPP seller over **Tempo** or **Solana** instead of x402, under ClawRouter's own spend limits.
 
+## Upgrading from 0.2.0
+
+- Fulfillment rows now use `twzrd.mpp.fulfillment.v2`. Readers must accept the new schema to retain
+  `response_bytes` and `body_sha256`; these fields are null when the recorder does not read a complete
+  body within its 1 MiB cap.
+- Credit rows carry an optional `reference` matching the error and spend record. It is a local
+  signed-payload hash, not a settlement signature.
+- `payFetch.flush({ timeoutMs })` bounds waiting for both records and ledger persistence. A timeout
+  leaves the paid response and background writes intact; an omitted timeout keeps the previous
+  unbounded wait. Values above 2,147,483,647 ms are rejected.
+
 ```ts
 import { startProxy, SpendControl, FileSpendControlStorage } from "@twzrd1111/clawrouter";
 import { createMppFetch, createSolanaMppFetch } from "@twzrd1111/clawrouter-mpp";

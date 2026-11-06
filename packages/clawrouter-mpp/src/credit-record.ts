@@ -5,7 +5,10 @@ export type CreditEntry = Readonly<{
   amount: string;
   challengeId: string;
   reason: string;
-  /** Payment reference from MppPaidNoCompletionError, when one is known. Joins the row to a chain tx. */
+  /**
+   * Payment reference from MppPaidNoCompletionError, when one is known: `mpp-` plus a short hash of
+   * the signed payload. Joins the row to the error and the spend record. Not a chain tx signature.
+   */
   reference?: string;
 }>;
 

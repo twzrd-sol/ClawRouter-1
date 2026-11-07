@@ -1,9 +1,19 @@
 > **`@twzrd1111/clawrouter` is a distribution of [BlockRunAI/ClawRouter](https://github.com/BlockRunAI/ClawRouter)** (MIT, © BlockRunAI).
-> It is upstream 0.12.309 plus one change: the payment-rail seam proposed in
-> [BlockRunAI/ClawRouter#546](https://github.com/BlockRunAI/ClawRouter/pull/546), which lets a rail such as
-> [`@twzrd1111/clawrouter-mpp`](https://www.npmjs.com/package/@twzrd1111/clawrouter-mpp) plug in. Version numbers mirror
-> upstream. It will be retired when the seam ships upstream. Not affiliated with or endorsed by BlockRun.
+> It is upstream 0.12.309 plus one change: the client-side payment-rail seam proposed in
+> [BlockRunAI/ClawRouter#546](https://github.com/BlockRunAI/ClawRouter/pull/546) (closed unmerged, 2026-11-04).
+> This fork is the production carrier for that seam and for the client-side MPP rails: the reference
+> integration for [`@twzrd1111/clawrouter-mpp`](https://www.npmjs.com/package/@twzrd1111/clawrouter-mpp),
+> pre-sign policy gating, and local receipt records — Solana chain-verification is opt-in; Tempo rows
+> are payload-hash records and are never chain-verified. Version numbers mirror
+> upstream. Not affiliated with or endorsed by BlockRun.
 > Do not install it alongside `@blockrun/clawrouter`: they share the OpenClaw plugin id.
+
+```sh
+npm i @twzrd1111/clawrouter-mpp @twzrd1111/clawrouter mppx viem
+```
+
+Optional Solana rail: `npm i @solana/mpp @solana/kit`. Optional `twzrd-x402-gate >=0.17.0` for the pre-sign MPP policy gate (it evaluates the charge challenge before credential creation; the Echo purchase binding ships in `clawrouter-mpp` itself, not in the gate).
+Importing `@twzrd1111/clawrouter-mpp` loads no payment SDKs; Tempo loads `mppx` and Solana loads `@solana/mpp` on the first paid call.
 
 <div align="center">
 

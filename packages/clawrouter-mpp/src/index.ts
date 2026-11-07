@@ -12,10 +12,17 @@ export { createMppFetch, DEFAULT_TEMPO_USD_ASSETS, quoteFromChallenge } from "./
 export type { MppFetchOptions, PayFetch } from "./mpp-fetch.js";
 export { MppFlushTimeoutError } from "./mpp-flush.js";
 export type { MppFlushOptions, MppPayFetch } from "./mpp-flush.js";
-export { createSolanaMppFetch, DEFAULT_SOLANA_USD_MINTS } from "./mpp-solana-fetch.js";
+export {
+  createSolanaMppFetch,
+  DEFAULT_SOLANA_USD_MINTS,
+  createEchoContext,
+  assertEchoPreSign,
+} from "./mpp-solana-fetch.js";
 export type {
   SolanaMppFetchOptions,
   SolanaReceiptVerificationOptions,
+  EchoPolicy,
+  EchoBindingContext,
 } from "./mpp-solana-fetch.js";
 export { MppGateError } from "./mpp-gate.js";
 export type {
@@ -51,6 +58,9 @@ export {
   DEFAULT_TRUSTED_USD_MINTS,
   InMemoryReceiptReferenceIndex,
   LANDING_WINDOW_SECONDS,
+  MEMO_PROGRAM_ID,
+  MEMO_V1_PROGRAM_ID,
+  evaluatePurchaseBinding,
 } from "./receipt-chain-verify.js";
 export type {
   ChainMismatch,
@@ -64,4 +74,5 @@ export type {
   RpcTransaction,
   SolanaCluster,
   TrustedMint,
+  PurchaseBoundOutcome,
 } from "./receipt-chain-verify.js";

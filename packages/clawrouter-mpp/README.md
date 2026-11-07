@@ -126,8 +126,10 @@ the verifier and writes its result into the row:
 - `receipt_reference_chain_verified` (`true`, `false`, or `null`), `receipt_reference_finalized_slot`,
   `receipt_reference_mismatch` (why `false`), and `receipt_reference_unverified_reason` (why `null`;
   `verifier_error` when the verifier threw).
-- `receipt_reference_purchase_bound` and its reason. It stays `null/no_buyer_nonce` until a seller
-  echoes a buyer nonce; `chain_verified: true` does not mean the payment belongs to this purchase alone.
+- `receipt_reference_purchase_bound` and its reason. With opt-in `echo: { requireBinding: true }`
+  and a cooperating seller, one exactly matching buyer memo can establish binding after chain
+  verification. Otherwise it remains unbound; see `docs/echo-protocol.md`. Chain verification alone
+  does not mean the payment belongs to this purchase alone.
 - `receipt_reference_local_acceptance` (`accepted`, `refused`, or `null`) and
   `receipt_reference_refusal_reason` (`reference_reused`, `stale_by_local_clock`): this sink's
   policy, which never changes a chain field.

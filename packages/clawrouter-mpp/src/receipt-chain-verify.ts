@@ -2,13 +2,43 @@
  * Buyer-side chain verification of a Solana MPP receipt reference (design: docs/receipt-chain-verify.md).
  *
  * Three independent results, each with its own reason: chain facts (from finalized chain bytes only),
- * purchase binding (always null/no_buyer_nonce today), and local acceptance (this sink's policy).
+ * purchase binding (an optional buyer nonce), and local acceptance (this sink's policy).
  * Local policy never changes a chain field. No RPC URL and no key ship here: the caller injects the
  * `getTransaction` fetcher and, for acceptance, a durable reference index.
  */
 import { loadOptional } from "./mpp-optional.js";
 
 export const SOLANA_KIT_RANGE = "~6.10.0";
+export const MEMO_PROGRAM_ID = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+export const MEMO_V1_PROGRAM_ID = "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo";
+const MEMO_PROGRAMS = new Set([MEMO_PROGRAM_ID, MEMO_V1_PROGRAM_ID]);
+
+type BindingInstruction = { program: string; data: Uint8Array };
+export type PurchaseBoundOutcome = {
+  purchase_bound: boolean | null;
+  purchase_bound_reason: "no_buyer_nonce" | "nonce_mismatch" | "chain_unverified" | null;
+};
+
+/** An expected buyer nonce binds only through one exactly matching, valid UTF-8 SPL Memo. */
+export function evaluatePurchaseBinding(
+  instructions: readonly BindingInstruction[],
+  expectedExternalId: string | null | undefined,
+): PurchaseBoundOutcome {
+  const unbound = { purchase_bound: null, purchase_bound_reason: "no_buyer_nonce" } as const;
+  const mismatch = { purchase_bound: false, purchase_bound_reason: "nonce_mismatch" } as const;
+  if (!expectedExternalId) return unbound;
+  const memos = instructions.filter((ix) => MEMO_PROGRAMS.has(ix.program));
+  if (memos.length === 0) return unbound;
+  if (memos.length !== 1) return mismatch;
+  try {
+    new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(memos[0].data);
+  } catch {
+    return mismatch;
+  }
+  return bytesEqual(memos[0].data, new TextEncoder().encode(expectedExternalId))
+    ? { purchase_bound: true, purchase_bound_reason: null }
+    : mismatch;
+}
 
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP7VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -175,6 +205,8 @@ export type ReceiptChainVerifyInput = {
   signedAtUnix: number | null;
   /** Buyer-generated id of the logical purchase (not the seller's challenge id). */
   purchaseId: string;
+  /** Buyer-generated Echo expectation, retained only after exact pre-sign reflection. */
+  expectedExternalId?: string | null;
 };
 
 type Kit = typeof import("@solana/kit");
@@ -264,19 +296,17 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig): 
   async function verify(input: ReceiptChainVerifyInput): Promise<ReceiptChainVerification> {
     const chain = await chainFacts(input);
     const verified = chain.receipt_reference_chain_verified;
+    const binding: PurchaseBoundOutcome =
+      verified === true
+        ? evaluatePurchaseBinding(chain.instructions ?? [], input.expectedExternalId)
+        : { purchase_bound: null, purchase_bound_reason: "chain_unverified" };
     const purchase: Pick<
       ReceiptChainVerification,
       "receipt_reference_purchase_bound" | "receipt_reference_purchase_bound_reason"
-    > =
-      verified === true
-        ? {
-            receipt_reference_purchase_bound: null,
-            receipt_reference_purchase_bound_reason: "no_buyer_nonce",
-          }
-        : {
-            receipt_reference_purchase_bound: null,
-            receipt_reference_purchase_bound_reason: "chain_unverified",
-          };
+    > = {
+      receipt_reference_purchase_bound: binding.purchase_bound,
+      receipt_reference_purchase_bound_reason: binding.purchase_bound_reason,
+    };
 
     // Local policy. It never changes a chain field.
     let refusal: ReceiptChainVerification["receipt_reference_refusal_reason"] = null;
@@ -315,7 +345,7 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig): 
     | "receipt_reference_finalized_slot"
     | "receipt_reference_mismatch"
     | "receipt_reference_unverified_reason"
-  > & { blockTime: number | null };
+  > & { blockTime: number | null; instructions?: BindingInstruction[] };
 
   function result(
     verified: boolean | null,
@@ -482,7 +512,13 @@ export function createReceiptChainVerifier(config: ReceiptChainVerifierConfig): 
       ],
     });
     if (source !== expectedSource) return at(false, "payer_mismatch");
-    return at(true, null);
+    return {
+      ...at(true, null),
+      instructions: message.instructions.map((ix) => ({
+        program: keys[ix.programAddressIndex],
+        data: new Uint8Array(ix.data ?? []),
+      })),
+    };
   }
 
   return Object.freeze(Object.assign(verify, { cluster }));

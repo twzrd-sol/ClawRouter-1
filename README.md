@@ -12,7 +12,7 @@
 npm i @twzrd1111/clawrouter-mpp @twzrd1111/clawrouter mppx viem
 ```
 
-Optional Solana rail: `npm i @solana/mpp @solana/kit`. Optional `twzrd-x402-gate >=0.17.0` for purchase binding.
+Optional Solana rail: `npm i @solana/mpp @solana/kit`. Optional `twzrd-x402-gate >=0.17.0` for the pre-sign MPP policy gate (it evaluates the charge challenge before credential creation; the Echo purchase binding ships in `clawrouter-mpp` itself, not in the gate).
 Importing `@twzrd1111/clawrouter-mpp` loads no payment SDKs; Tempo loads `mppx` and Solana loads `@solana/mpp` on the first paid call.
 
 <div align="center">

@@ -11,7 +11,11 @@ npm i @twzrd1111/clawrouter-mpp @twzrd1111/clawrouter mppx viem
 
 Peers: `@twzrd1111/clawrouter >=0.12.309`. Tempo rail: `mppx ~0.17.0` (optional, lazy-loaded on
 first paid call). Solana rail: `@solana/mpp ~0.7.0` and `@solana/kit` (optional, lazy-loaded).
-`twzrd-x402-gate >=0.17.0` for purchase binding. Importing this package loads no payment SDK.
+`twzrd-x402-gate >=0.17.0` for the pre-sign MPP policy gate (optional — the rails pay without it;
+it evaluates the charge challenge before credential creation). Importing this package loads no payment SDK.
+
+Purchase binding on Solana rides on this package's Echo support (`echo` / `echo: { requireBinding: true }`),
+not on the gate.
 
 ## Upgrading to 0.5.0 from 0.4.0
 

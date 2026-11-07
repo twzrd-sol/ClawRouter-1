@@ -3,7 +3,8 @@
 > [BlockRunAI/ClawRouter#546](https://github.com/BlockRunAI/ClawRouter/pull/546) (closed unmerged, 2026-11-04).
 > This fork is the production carrier for that seam and for the client-side MPP rails: the reference
 > integration for [`@twzrd1111/clawrouter-mpp`](https://www.npmjs.com/package/@twzrd1111/clawrouter-mpp),
-> pre-sign policy gating, and local receipt notarization across Solana and Tempo. Version numbers mirror
+> pre-sign policy gating, and local receipt records — Solana chain-verification is opt-in; Tempo rows
+> are payload-hash records and are never chain-verified. Version numbers mirror
 > upstream. Not affiliated with or endorsed by BlockRun.
 > Do not install it alongside `@blockrun/clawrouter`: they share the OpenClaw plugin id.
 

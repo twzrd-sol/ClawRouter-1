@@ -51,7 +51,10 @@
     "@solana/kit": "6.10.0",
     "@solana/mpp": "0.7.0",
     "@solana/pay-kit": "0.13.1",
-    "mppx": "0.17.0"
+    "mppx": "0.17.0",
+    "tsup": "^9.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^5.0.5"
   },
   "publishConfig": {
     "access": "public"

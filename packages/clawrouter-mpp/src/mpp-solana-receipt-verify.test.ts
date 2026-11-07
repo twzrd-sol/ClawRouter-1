@@ -579,3 +579,48 @@ describe("Echo offer compatibility", () => {
     });
   });
 });
+
+describe("Echo shared signing", () => {
+  it("signs and accounts once for concurrent non-echoing challenges", async () => {
+    const f = await fixture({ sellerExternalId: "twzrd-mpp-seller-order" });
+    const spend = new SpendControl({ storage: new InMemorySpendControlStorage() });
+    spend.setLimit("daily", 100);
+    const pay = await f.rail({ echo: {}, spend });
+    await Promise.all([send(pay), send(pay)]);
+    await pay.flush();
+    expect(f.signTransactions).toHaveBeenCalledTimes(1);
+    expect(spend.getHistory()).toHaveLength(1);
+    expect(spend.getSpending("session")).toBeCloseTo(0.00075);
+    expect(f.inputs[0].purchaseId).toBe(f.inputs[1].purchaseId);
+    expect(f.rows).toHaveLength(2);
+    for (const row of f.rows)
+      expect(row).toMatchObject({
+        receipt_reference_chain_verified: true,
+        receipt_reference_purchase_bound: null,
+        receipt_reference_local_acceptance: "accepted",
+      });
+  });
+
+  it("reuses the first call's signed challenge without reusing its binding", async () => {
+    const f = await fixture({ echo: "match" });
+    const spend = new SpendControl({ storage: new InMemorySpendControlStorage() });
+    spend.setLimit("daily", 100);
+    const pay = await f.rail({ echo: {}, spend });
+    await send(pay);
+    await pay.flush();
+    f.repeatExternalId(f.inputs[0].expectedExternalId!);
+    await send(pay);
+    await pay.flush();
+    expect(f.signTransactions).toHaveBeenCalledTimes(1);
+    expect(spend.getHistory()).toHaveLength(1);
+    expect(spend.getSpending("session")).toBeCloseTo(0.00075);
+    expect(f.inputs[0].purchaseId).toBe(f.inputs[1].purchaseId);
+    expect(f.rows[0].receipt_reference_purchase_bound).toBe(true);
+    expect(f.rows[1]).toMatchObject({
+      receipt_reference_chain_verified: true,
+      receipt_reference_purchase_bound: null,
+      receipt_reference_local_acceptance: "accepted",
+    });
+    expect(f.inputs[1].expectedExternalId).toBeNull();
+  });
+});

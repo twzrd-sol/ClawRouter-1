@@ -261,7 +261,6 @@ export async function createSolanaMppFetch(opts: SolanaMppFetchOptions): Promise
             challenge.intent,
             challenge.expires,
             challenge.request,
-            echoContext?.expectedExternalId,
           ]);
           let gatePending = gateOnce.get(key);
           if (!gatePending) {

@@ -26,7 +26,10 @@ verification. Neither option verifies a model or computation.
 Each call generates 16 cryptographically random bytes, represented by 32 lowercase hex characters,
 and sends them as `X-Buyer-Nonce`. It replaces any caller-provided nonce while preserving the other
 request headers. The same nonce travels with the authenticated retry. Concurrent calls have
-separate expectations and cannot share a cached credential across nonces.
+separate expectations. Identical complete challenges still share one credential and one spend
+record; binding is checked against each call's own nonce, so sharing cannot lend a prior call's
+binding to another call. An echoed nonce inside `request.externalId` is part of the challenge key;
+the independently generated call nonce is not.
 
 ## Seller reflection
 

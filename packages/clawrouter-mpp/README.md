@@ -3,6 +3,28 @@
 MPP (Machine Payments Protocol) payment rails for [ClawRouter](https://github.com/BlockRunAI/ClawRouter):
 pay an MPP seller over **Tempo** or **Solana** instead of x402, under ClawRouter's own spend limits.
 
+## Upgrading to 0.5.0 from 0.4.0
+
+This release adds opt-in Solana Echo purchase binding (#21). Omit `echo` to preserve existing
+behavior. `echo: {}` offers binding and pays unbound when a seller omits or changes the reflected
+ID; `echo: { requireBinding: true }` refuses those challenges before signing.
+
+- Each call sends fresh 16-byte buyer entropy as `X-Buyer-Nonce: <32 hex>`. A cooperating seller
+  reflects it as `request.externalId: "twzrd:p:<nonce>"`, which the existing SDK writes as a memo.
+- With `receiptVerification` enabled, a finalized payment passing all chain checks can set
+  `receipt_reference_purchase_bound: true` only when exactly one SPL Memo (v1 and v2 counted
+  together) matches the retained buyer expectation byte for byte. Malformed UTF-8, a leading BOM,
+  or multiple memos cannot silently match.
+- Identical complete challenges share one credential and one spend record; binding remains per
+  call. The local nonce is not part of the shared-signing cache key.
+- Fulfillment schema stays `twzrd.mpp.fulfillment.v3`; core peer floor stays `>=0.12.309`.
+  `response_bytes` and `body_sha256` are existing fields, first shipped in 0.3.0.
+
+Seller reflection is a separate integration. This release does not deploy a seller, verify Tempo
+receipts, prove model execution, or supply a durable replay index. The existing in-memory indexes
+forget on restart; cross-worker uniqueness requires caller-supplied durable, atomic storage.
+See the [seller wire contract](https://github.com/twzrd-sol/ClawRouter-1/blob/899295ef627032260dbff363bbb012d446c9ecc6/docs/echo-protocol.md).
+
 ## Upgrading to 0.4.0 from 0.3.0
 
 This release includes the standalone Solana receipt verifier (#16), fulfillment wiring (#18),

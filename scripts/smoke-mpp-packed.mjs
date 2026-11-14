@@ -13,6 +13,10 @@ import {
   fulfillPaidProof,
   createSolanaMppFetch,
   MppPaidNoCompletionError,
+  PostgresSpentProofStore,
+  RedisSpentProofStore,
+  PostgresReceiptReferenceIndex,
+  RedisReceiptReferenceIndex,
 } from "@twzrd1111/clawrouter-mpp";
 
 // Explicit test-only trust hooks; the smoke harness signs only fixture challenges.
@@ -132,6 +136,24 @@ assert(rejected instanceof ReplayRejectedError);
 assert.equal(rejected.status, 409);
 assert.equal(rejected.code, "proof_replayed");
 assert.equal(modelCalls, 1);
+
+// Durable stores ship in the tarball and take an injected driver; a scripted stand-in is enough here.
+const pgRows = new Set();
+const pgStore = new PostgresSpentProofStore({
+  query: async (_text, [network, tx, challenge]) => {
+    const keys = [`t:${network}:${tx}`, `c:${network}:${challenge}`];
+    if (keys.some((k) => pgRows.has(k))) return { rows: [] };
+    keys.forEach((k) => pgRows.add(k));
+    return { rows: [{ won: 1 }] };
+  },
+});
+assert.equal(await pgStore.claim("solana:mainnet-beta", "tx-a", "ch-a"), true);
+assert.equal(await pgStore.claim("solana:mainnet-beta", "tx-a", "ch-b"), false);
+assert.match(PostgresSpentProofStore.schema(), /UNIQUE \(network_id, challenge_id\)/);
+assert.equal(await new RedisSpentProofStore({ eval: async () => 1 }).claim("n", "t", "c"), true);
+assert.equal(await new RedisSpentProofStore({ eval: async () => 0 }).claim("n", "t", "c"), false);
+assert.equal(typeof PostgresReceiptReferenceIndex, "function");
+assert.equal(typeof RedisReceiptReferenceIndex, "function");
 
 const ledger = new CreditLedger();
 const error = new MppPaidNoCompletionError("no completion", "fixture-ref", 502);

@@ -179,7 +179,8 @@ the reference is recorded as `null/rpc_unavailable`. A row therefore waits at mo
 `finalityWaitMs + rpcTimeoutMs` on the chain. The reference index has no deadline, so a durable
 index must bound its own calls; `flush({ timeoutMs })` bounds only how long the caller waits.
 No RPC URL ships with the package. `InMemoryReceiptReferenceIndex` forgets on restart and is for
-tests. See `docs/receipt-chain-verify.md` for each check.
+tests; `PostgresReceiptReferenceIndex` and `RedisReceiptReferenceIndex` are durable (see
+[Durable stores](#durable-stores-postgres-or-redisvalkey)). See `docs/receipt-chain-verify.md` for each check.
 
 This candidate requires `@twzrd1111/clawrouter >=0.12.309`, including deferred streaming headers.
 The fork is the release target. Upstream PRs #545 and #546 are independent of this release.
@@ -241,16 +242,55 @@ const completion = await fulfillPaidProof({
 A reused transaction or challenge on the same network throws `ReplayRejectedError` with
 `status: 409` and `code: "proof_replayed"` before invoking `upstream`. Network scope allows
 the same signature text or challenge ID to exist independently on another chain. The
-synchronous claim gives concurrent duplicates one winner. The claim remains spent if the
+claim is atomic, so concurrent duplicates get one winner. The claim remains spent if the
 model fails. This helper does not verify a payment itself,
 and installing a buyer rail cannot add replay protection to a remote seller.
 
 `SpentProofLedger` keeps claims in memory, so a restart or a second process forgets spent
 proofs, and a proof can be redeemed again while its challenge is still valid. A seller with
-more than one process, or one that restarts, needs a durable, atomic uniqueness check shared by
-every worker (for example a unique key on network plus transaction signature, as an
-authoritative settlement table provides). Rejecting expired challenges narrows the window but
-does not close it on its own.
+more than one process, or one that restarts, should pass a durable store as `ledger` instead:
+`PostgresSpentProofStore` or `RedisSpentProofStore` (below). Rejecting expired challenges narrows
+the window but does not close it on its own.
+
+### Durable stores (Postgres or Redis/Valkey)
+
+```ts
+import pg from "pg";
+import { Redis } from "ioredis";
+import {
+  PostgresSpentProofStore,
+  RedisSpentProofStore,
+  PostgresReceiptReferenceIndex,
+} from "@twzrd1111/clawrouter-mpp";
+
+// Postgres: any function shaped like pool.query(text, params) works.
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const proofs = new PostgresSpentProofStore({ query: (text, params) => pool.query(text, params) });
+await proofs.ensureSchema(); // or apply PostgresSpentProofStore.schema() in your migrations
+
+// Redis or Valkey: any function that runs one EVAL works.
+const redis = new Redis(process.env.REDIS_URL);
+const proofs2 = new RedisSpentProofStore({
+  eval: (script, keys, args) => redis.eval(script, keys.length, ...keys, ...args),
+});
+
+// Buyer side: a durable index for createReceiptChainVerifier.
+const index = new PostgresReceiptReferenceIndex({
+  query: (text, params) => pool.query(text, params),
+});
+```
+
+No driver ships with the package; the caller injects the query or EVAL function. Each claim is one
+atomic statement or script, so exactly one concurrent claimant wins across every process that
+shares the database. In Postgres the primary key on (network, transaction) and the unique key on
+(network, challenge) refuse a second use of either; run claims outside a transaction you might roll
+back (`pool.query` autocommits). In Redis/Valkey, keys never expire, and claims survive a server
+restart only with `appendonly yes`; with the default `appendfsync everysec` a crash can lose up to
+the last second of claims, so use `appendfsync always` where that matters. In Redis Cluster put a
+hash tag in `keyPrefix` (for example `"{clawrouter-mpp}:spent:"`) so both keys share a slot. Keys are
+tagged (`tx:`, `challenge:`, `ref:`) and JSON-encoded, so the spent-proof store and the reference
+index cannot collide even under one prefix. A store that throws or answers
+anything but `true` is a lost claim: `fulfillPaidProof` rejects before calling `upstream`.
 
 ## Credits for signed calls with no completion
 

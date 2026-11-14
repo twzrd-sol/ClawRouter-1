@@ -52,6 +52,18 @@ export { readPaidCallEvidence } from "./mpp-paid-failure.js";
 export { CreditLedger } from "./credit-record.js";
 export type { CreditEntry } from "./credit-record.js";
 export { SpentProofLedger, ReplayRejectedError, fulfillPaidProof } from "./spent-proof.js";
+export type { SpentProofStore } from "./spent-proof.js";
+export {
+  DEFAULT_REFERENCE_PREFIX,
+  DEFAULT_REFERENCE_TABLE,
+  DEFAULT_SPENT_PROOF_PREFIX,
+  DEFAULT_SPENT_PROOF_TABLE,
+  PostgresReceiptReferenceIndex,
+  PostgresSpentProofStore,
+  RedisReceiptReferenceIndex,
+  RedisSpentProofStore,
+} from "./replay-store.js";
+export type { RedisEval, SqlQuery } from "./replay-store.js";
 export {
   createReceiptChainVerifier,
   DEFAULT_RPC_TIMEOUT_MS,

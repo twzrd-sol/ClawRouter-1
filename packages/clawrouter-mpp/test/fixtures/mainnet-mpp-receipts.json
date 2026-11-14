@@ -1,0 +1,173 @@
+{
+  "description": "Two settled Solana MPP charges on mainnet: GET intel.twzrd.xyz /v1/intel/quick answered 402 with a solana charge challenge, the payer signed, and the seller's fee payer co-signed and submitted. The Payment-Receipt reference of each is the transaction signature. getTransaction results are trimmed to the fields the verifier reads plus token balances.",
+  "payer_note": "The payer is the seller operator's own proof wallet, not an outside buyer.",
+  "rpc": "https://api.mainnet-beta.solana.com",
+  "rpc_params": {
+    "commitment": "finalized",
+    "encoding": "base64",
+    "maxSupportedTransactionVersion": 0
+  },
+  "recorded_at": "2026-11-14",
+  "receipts": [
+    {
+      "reference": "59S5ZzMoWHianPVF1yeqzeijvNjoHUedXdsKbGzFfunbrkQgtnuiadKhSuCGM7A7KEViDZykVwWyLPR2mNkXTy5q",
+      "paid_at": "2026-11-11T18:13:49Z",
+      "challenge_id": "ZNXay-GBPL7RiQtrcaeeTao1WHJgS6wAeJUiJih5JAI",
+      "terms": {
+        "method": "solana",
+        "network": "mainnet",
+        "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "payTo": "GFpLvocNdEjnSsLH3VJQL6wGcjGxTbUBrj6fqN3Qe1Gs",
+        "amountAtomic": "1000",
+        "feePayerKey": "GWRLgRB6diC2zG9BaoGJsan9T8JvJCk7usFruiefnfMP"
+      },
+      "payer": "64NsKhbNGZCEj6sgTtjzscfuXSZSEpD1GoBXbT45yv4J",
+      "getTransaction": {
+        "slot": 468219877,
+        "blockTime": 1794420828,
+        "version": 0,
+        "meta": {
+          "err": null,
+          "fee": 10001,
+          "innerInstructions": [],
+          "preTokenBalances": [
+            {
+              "accountIndex": 2,
+              "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "owner": "GFpLvocNdEjnSsLH3VJQL6wGcjGxTbUBrj6fqN3Qe1Gs",
+              "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "uiTokenAmount": {
+                "amount": "8886000",
+                "decimals": 6,
+                "uiAmount": 8.886,
+                "uiAmountString": "8.886"
+              }
+            },
+            {
+              "accountIndex": 3,
+              "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "owner": "64NsKhbNGZCEj6sgTtjzscfuXSZSEpD1GoBXbT45yv4J",
+              "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "uiTokenAmount": {
+                "amount": "480300",
+                "decimals": 6,
+                "uiAmount": 0.4803,
+                "uiAmountString": "0.4803"
+              }
+            }
+          ],
+          "postTokenBalances": [
+            {
+              "accountIndex": 2,
+              "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "owner": "GFpLvocNdEjnSsLH3VJQL6wGcjGxTbUBrj6fqN3Qe1Gs",
+              "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "uiTokenAmount": {
+                "amount": "8887000",
+                "decimals": 6,
+                "uiAmount": 8.887,
+                "uiAmountString": "8.887"
+              }
+            },
+            {
+              "accountIndex": 3,
+              "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "owner": "64NsKhbNGZCEj6sgTtjzscfuXSZSEpD1GoBXbT45yv4J",
+              "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "uiTokenAmount": {
+                "amount": "479300",
+                "decimals": 6,
+                "uiAmount": 0.4793,
+                "uiAmountString": "0.4793"
+              }
+            }
+          ]
+        },
+        "transaction": [
+          "As9W+xdSl1Oco41q8eq2uouDlnpmtHtKipiv4mhUWiGYI5CdTozfrx3YudwO92IRVF0moV5Q7lo8Fbc+8RugRQhuiWJW1S2QdSQaOxG1LK/Dqq7Fsmg+iTSn4QzY/SSceUePLVQM7u3LUqa9ZsrclTCur8wl+uX6oNn5/8hCjsYAgAIBBAjmaKr7RZ9wZMxpUn5eWQwOZZUoo+S/HU9sTJdEP4dIvksn5yIhmVg52tVU+bqp1phzBSBu3a4wWiuroBnI2YCTYHyEeoSoRcX6qcb9mwQNuVhotTGZLm4+GPSXKh8jPGqEvPcVjhIUdVnucyvNYzx94wsW3QpHjvMu3nXS3AZFlgMGRm/lIRcy/+ytunLDm+e8jOW7xfcSayxDmzpAAAAAxvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWEFSlNamSkhBk0k6HFg2jh8fDW13bySu4HkH6hAQQVEjQbd9uHXZaGT2cvhRs7reawctIXtX1s3kTqM9YV+/wCpT83rXpw6v92Q3gfIGE0whBf+SQHKsof9ICzdTq78K5wEBAAJAwEAAAAAAAAABAAFAkANAwAHBAMFAgEKDOgDAAAAAAAABgYAInR3enJkLW1wcC1FUG9YSFlFQkxXeTI3R05JSHpJUzctelcA",
+          "base64"
+        ]
+      }
+    },
+    {
+      "reference": "4yqjc82e6UcDcJeYEBLHzhSUVosjkge5JB3aaRvsjvkK7RE5hjsnqTZkLZHrwRpTYvZ7dt9Qzm1anFxqx7rsz2Q4",
+      "paid_at": "2026-11-11T21:10:41Z",
+      "challenge_id": null,
+      "terms": {
+        "method": "solana",
+        "network": "mainnet",
+        "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "payTo": "GFpLvocNdEjnSsLH3VJQL6wGcjGxTbUBrj6fqN3Qe1Gs",
+        "amountAtomic": "1000",
+        "feePayerKey": "GWRLgRB6diC2zG9BaoGJsan9T8JvJCk7usFruiefnfMP"
+      },
+      "payer": "64NsKhbNGZCEj6sgTtjzscfuXSZSEpD1GoBXbT45yv4J",
+      "getTransaction": {
+        "slot": 468269194,
+        "blockTime": 1794431443,
+        "version": 0,
+        "meta": {
+          "err": null,
+          "fee": 10001,
+          "innerInstructions": [],
+          "preTokenBalances": [
+            {
+              "accountIndex": 2,
+              "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "owner": "GFpLvocNdEjnSsLH3VJQL6wGcjGxTbUBrj6fqN3Qe1Gs",
+              "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "uiTokenAmount": {
+                "amount": "8887000",
+                "decimals": 6,
+                "uiAmount": 8.887,
+                "uiAmountString": "8.887"
+              }
+            },
+            {
+              "accountIndex": 3,
+              "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "owner": "64NsKhbNGZCEj6sgTtjzscfuXSZSEpD1GoBXbT45yv4J",
+              "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "uiTokenAmount": {
+                "amount": "479300",
+                "decimals": 6,
+                "uiAmount": 0.4793,
+                "uiAmountString": "0.4793"
+              }
+            }
+          ],
+          "postTokenBalances": [
+            {
+              "accountIndex": 2,
+              "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "owner": "GFpLvocNdEjnSsLH3VJQL6wGcjGxTbUBrj6fqN3Qe1Gs",
+              "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "uiTokenAmount": {
+                "amount": "8888000",
+                "decimals": 6,
+                "uiAmount": 8.888,
+                "uiAmountString": "8.888"
+              }
+            },
+            {
+              "accountIndex": 3,
+              "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "owner": "64NsKhbNGZCEj6sgTtjzscfuXSZSEpD1GoBXbT45yv4J",
+              "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+              "uiTokenAmount": {
+                "amount": "478300",
+                "decimals": 6,
+                "uiAmount": 0.4783,
+                "uiAmountString": "0.4783"
+              }
+            }
+          ]
+        },
+        "transaction": [
+          "AscRX/MIMdXzsqox80HPyPfupbsR4i3oSldZyWWHf9bSZuB3NlLZcd0gLpmEw7Lyk1kqhYubaxSytjlhrBiRUwWMg5wXQVTfkyGIM0mkGkTemB+3DEXk9jaCf03TWby6RJC/BtF8wnHf8CL3BUoA97VZJeKfVAd72mIN8zCoDKEBgAIBBAjmaKr7RZ9wZMxpUn5eWQwOZZUoo+S/HU9sTJdEP4dIvksn5yIhmVg52tVU+bqp1phzBSBu3a4wWiuroBnI2YCTYHyEeoSoRcX6qcb9mwQNuVhotTGZLm4+GPSXKh8jPGqEvPcVjhIUdVnucyvNYzx94wsW3QpHjvMu3nXS3AZFlgMGRm/lIRcy/+ytunLDm+e8jOW7xfcSayxDmzpAAAAAxvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWEFSlNamSkhBk0k6HFg2jh8fDW13bySu4HkH6hAQQVEjQbd9uHXZaGT2cvhRs7reawctIXtX1s3kTqM9YV+/wCpJpDndafAx+dFBVQ6aJo+zigyGF4QTXAVh/xhOST/VPsEBAAJAwEAAAAAAAAABAAFAkANAwAHBAMFAgEKDOgDAAAAAAAABgYAInR3enJkLW1wcC13bWdGd0h3WHNHdHN3Nk9hcWljXzBldjkA",
+          "base64"
+        ]
+      }
+    }
+  ]
+}

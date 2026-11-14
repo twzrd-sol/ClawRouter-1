@@ -97,11 +97,12 @@ jobs:
       - name: Upgrade npm for trusted publishing
         run: npm install -g npm@^11.5.1
 
+      # Both packages publish through npm Trusted Publishing (OIDC, id-token: write above); no
+      # NPM_TOKEN secret is used. Each package needs its Trusted Publisher entry on npmjs.com
+      # (twzrd-sol/ClawRouter-1, workflow publish.yml) before a run can publish it.
       - name: Publish core package
         if: steps.versions.outputs.publish_root == 'true'
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Skip core package (already published)
         if: steps.versions.outputs.publish_root != 'true'
@@ -111,8 +112,33 @@ jobs:
         if: steps.versions.outputs.publish_mpp == 'true'
         working-directory: packages/clawrouter-mpp
         run: npm publish --provenance --access public
+
+      # A publish that lands without a provenance attestation fails the run, so a token-based or
+      # misconfigured publish cannot pass as a provenance release.
+      - name: Verify provenance on what this run published
+        if: steps.versions.outputs.publish_root == 'true' || steps.versions.outputs.publish_mpp == 'true'
+        shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ROOT_SPEC: ${{ steps.versions.outputs.root_name }}@${{ steps.versions.outputs.root_version }}
+          MPP_SPEC: ${{ steps.versions.outputs.mpp_name }}@${{ steps.versions.outputs.mpp_version }}
+          PUBLISH_ROOT: ${{ steps.versions.outputs.publish_root }}
+          PUBLISH_MPP: ${{ steps.versions.outputs.publish_mpp }}
+        run: |
+          set -euo pipefail
+          check() {
+            local spec="$1" attempt
+            for attempt in $(seq 1 12); do
+              if npm view "$spec" dist.attestations.provenance.predicateType 2>/dev/null | grep -q 'slsa.dev/provenance'; then
+                echo "$spec: provenance attestation present"
+                return 0
+              fi
+              sleep 10
+            done
+            echo "::error::$spec has no provenance attestation on the registry" >&2
+            return 1
+          }
+          [ "$PUBLISH_ROOT" != true ] || check "$ROOT_SPEC"
+          [ "$PUBLISH_MPP" != true ] || check "$MPP_SPEC"
 
       - name: Skip MPP package (already published)
         if: steps.versions.outputs.publish_mpp != 'true'

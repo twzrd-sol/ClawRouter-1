@@ -17,6 +17,20 @@ it evaluates the charge challenge before credential creation). Importing this pa
 Purchase binding on Solana rides on this package's Echo support (`echo` / `echo: { requireBinding: true }`),
 not on the gate.
 
+## Upgrading to 0.6.0 from 0.5.0
+
+This release adds durable replay stores. Nothing changes unless you pass one: the in-memory
+`SpentProofLedger` and `InMemoryReceiptReferenceIndex` stay the defaults.
+
+- `PostgresSpentProofStore` and `RedisSpentProofStore` (Redis or Valkey) keep the seller's spent
+  proofs across restarts and processes. `PostgresReceiptReferenceIndex` and
+  `RedisReceiptReferenceIndex` do the same for the buyer's receipt references. You inject the
+  database client; no driver ships with this package. See [Durable stores](#durable-stores-postgres-or-redisvalkey).
+- `fulfillPaidProof` accepts any `SpentProofStore` and awaits its claim. Only `true` wins: a store
+  that throws, or answers anything else, rejects with `ReplayRejectedError` before `upstream` runs.
+- Releases publish through npm Trusted Publishing with a provenance attestation.
+- Fulfillment schema stays `twzrd.mpp.fulfillment.v3`; core peer floor stays `>=0.12.309`.
+
 ## Upgrading to 0.5.0 from 0.4.0
 
 This release adds opt-in Solana Echo purchase binding (#21). Omit `echo` to preserve existing

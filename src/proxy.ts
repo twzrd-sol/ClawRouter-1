@@ -5834,7 +5834,7 @@ async function proxyRequest(
 
         // Call upstream image generation API
         console.log(
-          `[ClawRouter] /imagegen command → ${imageModel} (${imageSize}): ${imagePrompt.slice(0, 80)}...`,
+          `[ClawRouter] /imagegen command → ${imageModel} (${imageSize})`,
         );
         // Stop upstream work (especially the slow-model poll loop below,
         // whose first `completed` poll settles the x402 payment) if the
@@ -6179,7 +6179,7 @@ async function proxyRequest(
         }
 
         console.log(
-          `[ClawRouter] /img2img → ${img2imgModel} (${img2imgSize}): ${img2imgPrompt.slice(0, 80)}`,
+          `[ClawRouter] /img2img → ${img2imgModel} (${img2imgSize})`,
         );
 
         // Same class as #251: abort the paid upstream call if the chat
@@ -8799,7 +8799,7 @@ async function proxyRequest(
       const sameCount = tailChars.filter((c) => c === firstChar).length;
       if (isPunct && sameCount >= 60) {
         console.warn(
-          `[ClawRouter] ⚠️  Degenerate output detected — model=${actualModelUsed || "unknown"} len=${accumulatedContent.length} head=${JSON.stringify(accumulatedContent.slice(0, 40))} tail_repeats_${JSON.stringify(firstChar)}=${sameCount}/80`,
+          `[ClawRouter] ⚠️  Degenerate output detected — model=${actualModelUsed || "unknown"} len=${accumulatedContent.length} tail_repeats=${sameCount}/80`,
         );
       }
     }

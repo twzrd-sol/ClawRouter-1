@@ -5833,9 +5833,7 @@ async function proxyRequest(
         }
 
         // Call upstream image generation API
-        console.log(
-          `[ClawRouter] /imagegen command → ${imageModel} (${imageSize})`,
-        );
+        console.log(`[ClawRouter] /imagegen command → ${imageModel} (${imageSize})`);
         // Stop upstream work (especially the slow-model poll loop below,
         // whose first `completed` poll settles the x402 payment) if the
         // chat client goes away mid-generation. Declared outside the try so
@@ -6178,9 +6176,7 @@ async function proxyRequest(
           return;
         }
 
-        console.log(
-          `[ClawRouter] /img2img → ${img2imgModel} (${img2imgSize})`,
-        );
+        console.log(`[ClawRouter] /img2img → ${img2imgModel} (${img2imgSize})`);
 
         // Same class as #251: abort the paid upstream call if the chat
         // client goes away, mirroring the /imagegen handler above.
